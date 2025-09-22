@@ -1,3 +1,6 @@
 pub mod raft;
 
-pub use raft::{RaftCluster, PlaceholderCommand, RaftCommand};
+// Type alias for our workflow-specific cluster
+pub type WorkflowCluster = raft::RaftCluster<raft::RaftCommand>;
+
+pub use raft::{RaftCluster, PlaceholderCommand, RaftCommand, RaftCommandType};

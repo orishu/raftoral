@@ -1,16 +1,16 @@
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 use raft::prelude::*;
-use crate::raft::message::{Message, RaftCommand, PlaceholderCommand};
-use crate::raft::node::RaftNode;
+use crate::raft::generic::message::{Message, RaftCommandType};
+use crate::raft::generic::node::RaftNode;
 
 #[derive(Clone)]
-pub struct RaftCluster {
-    node_senders: HashMap<u64, mpsc::UnboundedSender<Message>>,
+pub struct RaftCluster<C: RaftCommandType> {
+    node_senders: HashMap<u64, mpsc::UnboundedSender<Message<C>>>,
     node_count: usize,
 }
 
-impl RaftCluster {
+impl<C: RaftCommandType + 'static> RaftCluster<C> {
     pub async fn new_single_node(node_id: u64) -> Result<Self, Box<dyn std::error::Error>> {
         let mut node_senders = HashMap::new();
         let (sender, receiver) = mpsc::unbounded_channel();
@@ -27,7 +27,7 @@ impl RaftCluster {
 
         // Create and run the single node
         tokio::spawn(async move {
-            let mut node = match RaftNode::new_single_node(node_id, receiver, peers) {
+            let mut node = match RaftNode::<C>::new_single_node(node_id, receiver, peers) {
                 Ok(n) => n,
                 Err(e) => {
                     eprintln!("Failed to create RaftNode {}: {}", node_id, e);
@@ -75,7 +75,7 @@ impl RaftCluster {
             }
 
             tokio::spawn(async move {
-                let mut node = match RaftNode::new(node_id, receiver, peers) {
+                let mut node = match RaftNode::<C>::new(node_id, receiver, peers) {
                     Ok(n) => n,
                     Err(e) => {
                         eprintln!("Failed to create RaftNode {}: {}", node_id, e);
@@ -95,7 +95,8 @@ impl RaftCluster {
         Ok(cluster)
     }
 
-    pub async fn propose_placeholder_command(&self, cmd: PlaceholderCommand) -> Result<bool, Box<dyn std::error::Error>> {
+    /// Generic method to propose any command that implements RaftCommandType
+    pub async fn propose_command(&self, command: C) -> Result<bool, Box<dyn std::error::Error>> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
 
         // Send to the first available node (in a real implementation, you'd route to the leader)
@@ -103,7 +104,7 @@ impl RaftCluster {
             node_sender.send(Message::Propose {
                 id: 0,
                 callback: Some(sender),
-                command: RaftCommand::PlaceholderCmd(cmd),
+                command,
             })?;
 
             let result = receiver.await?;
@@ -113,56 +114,6 @@ impl RaftCluster {
         }
     }
 
-    pub async fn propose_workflow_start(&self, workflow_id: u64, payload: Vec<u8>) -> Result<bool, Box<dyn std::error::Error>> {
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-
-        if let Some(node_sender) = self.node_senders.values().next() {
-            node_sender.send(Message::Propose {
-                id: 0,
-                callback: Some(sender),
-                command: RaftCommand::WorkflowStart { workflow_id, payload },
-            })?;
-
-            let result = receiver.await?;
-            Ok(result)
-        } else {
-            Err("No nodes available in cluster".into())
-        }
-    }
-
-    pub async fn propose_workflow_end(&self, workflow_id: u64) -> Result<bool, Box<dyn std::error::Error>> {
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-
-        if let Some(node_sender) = self.node_senders.values().next() {
-            node_sender.send(Message::Propose {
-                id: 0,
-                callback: Some(sender),
-                command: RaftCommand::WorkflowEnd { workflow_id },
-            })?;
-
-            let result = receiver.await?;
-            Ok(result)
-        } else {
-            Err("No nodes available in cluster".into())
-        }
-    }
-
-    pub async fn propose_checkpoint(&self, workflow_id: u64, key: String, value: Vec<u8>) -> Result<bool, Box<dyn std::error::Error>> {
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-
-        if let Some(node_sender) = self.node_senders.values().next() {
-            node_sender.send(Message::Propose {
-                id: 0,
-                callback: Some(sender),
-                command: RaftCommand::SetCheckpoint { workflow_id, key, value },
-            })?;
-
-            let result = receiver.await?;
-            Ok(result)
-        } else {
-            Err("No nodes available in cluster".into())
-        }
-    }
 
     pub async fn add_node(&self, node_id: u64) -> Result<bool, Box<dyn std::error::Error>> {
         let (sender, receiver) = tokio::sync::oneshot::channel();

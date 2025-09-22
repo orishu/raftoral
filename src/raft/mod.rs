@@ -1,7 +1,8 @@
-pub mod node;
-pub mod cluster;
-pub mod message;
+pub mod generic;
+pub mod command;
 
-pub use node::RaftNode;
-pub use cluster::RaftCluster;
-pub use message::{Message, RaftCommand, PlaceholderCommand};
+// Re-export the generic infrastructure
+pub use generic::{RaftCluster, RaftNode, RaftCommandType};
+
+// Export our workflow-specific types
+pub use command::{RaftCommand, PlaceholderCommand};

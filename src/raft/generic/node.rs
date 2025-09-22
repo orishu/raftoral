@@ -5,30 +5,30 @@ use tokio::sync::{RwLock, mpsc};
 use raft::{prelude::*, storage::MemStorage};
 use slog::{Drain, Logger};
 use protobuf::Message as PbMessage;
-use crate::raft::message::{Message, RaftCommand};
+use crate::raft::generic::message::{Message, RaftCommandType};
 
 pub type ProposeCallback = tokio::sync::oneshot::Sender<bool>;
 
-pub struct RaftNode {
+pub struct RaftNode<C: RaftCommandType> {
     raft_group: RawNode<MemStorage>,
     storage: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     node_id: u64,
     logger: Logger,
 
     // For multi-node communication
-    mailbox: mpsc::UnboundedReceiver<Message>,
-    peers: HashMap<u64, mpsc::UnboundedSender<Message>>,
+    mailbox: mpsc::UnboundedReceiver<Message<C>>,
+    peers: HashMap<u64, mpsc::UnboundedSender<Message<C>>>,
 
     // Proposal tracking
     next_proposal_id: u8,
     proposals: HashMap<u8, ProposeCallback>,
 }
 
-impl RaftNode {
+impl<C: RaftCommandType + 'static> RaftNode<C> {
     pub fn new_single_node(
         node_id: u64,
-        mailbox: mpsc::UnboundedReceiver<Message>,
-        peers: HashMap<u64, mpsc::UnboundedSender<Message>>,
+        mailbox: mpsc::UnboundedReceiver<Message<C>>,
+        peers: HashMap<u64, mpsc::UnboundedSender<Message<C>>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let config = Config {
             id: node_id,
@@ -70,8 +70,8 @@ impl RaftNode {
 
     pub fn new(
         node_id: u64,
-        mailbox: mpsc::UnboundedReceiver<Message>,
-        peers: HashMap<u64, mpsc::UnboundedSender<Message>>,
+        mailbox: mpsc::UnboundedReceiver<Message<C>>,
+        peers: HashMap<u64, mpsc::UnboundedSender<Message<C>>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let config = Config {
             id: node_id,
@@ -106,7 +106,7 @@ impl RaftNode {
         })
     }
 
-    pub fn propose_command(&mut self, command: RaftCommand) -> Result<u8, Box<dyn std::error::Error>> {
+    pub fn propose_command(&mut self, command: C) -> Result<u8, Box<dyn std::error::Error>> {
         let data = serde_json::to_vec(&command)?;
         let proposal_id = self.next_proposal_id;
         self.next_proposal_id = self.next_proposal_id.wrapping_add(1);
@@ -214,7 +214,7 @@ impl RaftNode {
 
             match entry.entry_type {
                 EntryType::EntryNormal => {
-                    if let Ok(command) = serde_json::from_slice::<RaftCommand>(&entry.data) {
+                    if let Ok(command) = serde_json::from_slice::<C>(&entry.data) {
                         self.apply_command(&command)?;
                     }
                 },
@@ -235,25 +235,9 @@ impl RaftNode {
         Ok(())
     }
 
-    fn apply_command(&mut self, command: &RaftCommand) -> Result<(), Box<dyn std::error::Error>> {
-        match command {
-            RaftCommand::SetCheckpoint { key, value, workflow_id } => {
-                slog::info!(self.logger, "Applied checkpoint";
-                           "workflow_id" => workflow_id, "key" => key, "size" => value.len());
-            },
-            RaftCommand::PlaceholderCmd(cmd) => {
-                slog::info!(self.logger, "Applied placeholder command";
-                           "id" => cmd.id, "data" => &cmd.data);
-            },
-            RaftCommand::WorkflowStart { workflow_id, payload } => {
-                slog::info!(self.logger, "Started workflow";
-                           "workflow_id" => workflow_id, "payload_size" => payload.len());
-            },
-            RaftCommand::WorkflowEnd { workflow_id } => {
-                slog::info!(self.logger, "Ended workflow"; "workflow_id" => workflow_id);
-            },
-        }
-        Ok(())
+    fn apply_command(&mut self, command: &C) -> Result<(), Box<dyn std::error::Error>> {
+        // Use the trait method to apply the command
+        command.apply(&self.logger)
     }
 
 
