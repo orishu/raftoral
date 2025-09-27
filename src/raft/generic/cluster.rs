@@ -25,9 +25,9 @@ impl<C: RaftCommandType + 'static> RaftCluster<C> {
             node_count: 1,
         };
 
-        // Create and run the single node
+        // Create and run the single node using the multi-node constructor
         tokio::spawn(async move {
-            let mut node = match RaftNode::<C>::new_single_node(node_id, receiver, peers) {
+            let mut node = match RaftNode::<C>::new(node_id, receiver, peers) {
                 Ok(n) => n,
                 Err(e) => {
                     eprintln!("Failed to create RaftNode {}: {}", node_id, e);
@@ -41,7 +41,10 @@ impl<C: RaftCommandType + 'static> RaftCluster<C> {
         });
 
         // Give the node time to initialize
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // For single node, manually trigger campaign to become leader
+        cluster.campaign().await?;
 
         Ok(cluster)
     }
@@ -169,5 +172,232 @@ impl<C: RaftCommandType + 'static> RaftCluster<C> {
 
     pub fn get_node_ids(&self) -> Vec<u64> {
         self.node_senders.keys().copied().collect()
+    }
+
+    pub async fn campaign(&self) -> Result<bool, Box<dyn std::error::Error>> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+
+        if let Some(node_sender) = self.node_senders.values().next() {
+            node_sender.send(Message::Campaign {
+                callback: Some(sender),
+            })?;
+
+            let result = receiver.await?;
+            Ok(result)
+        } else {
+            Err("No nodes available in cluster".into())
+        }
+    }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    // Shared test state with key prefixes for test isolation
+    static TEST_STATE: std::sync::OnceLock<Arc<Mutex<HashMap<String, String>>>> = std::sync::OnceLock::new();
+
+    fn get_test_state() -> Arc<Mutex<HashMap<String, String>>> {
+        TEST_STATE.get_or_init(|| Arc::new(Mutex::new(HashMap::new()))).clone()
+    }
+
+    fn clear_test_state_for_prefix(prefix: &str) {
+        let state = get_test_state();
+        let mut map = state.lock().unwrap();
+        map.retain(|key, _| !key.starts_with(prefix));
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    enum TestCommand {
+        SetValue { key: String, value: String },
+        DeleteKey { key: String },
+        Noop,
+    }
+
+    impl RaftCommandType for TestCommand {
+        fn apply(&self, _logger: &slog::Logger) -> Result<(), Box<dyn std::error::Error>> {
+            let state = get_test_state();
+            match self {
+                TestCommand::SetValue { key, value } => {
+                    let mut map = state.lock().unwrap();
+                    map.insert(key.clone(), value.clone());
+                },
+                TestCommand::DeleteKey { key } => {
+                    let mut map = state.lock().unwrap();
+                    map.remove(key);
+                },
+                TestCommand::Noop => {
+                    // No-op command does nothing
+                },
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_single_node_cluster_creation() {
+        let cluster = RaftCluster::<TestCommand>::new_single_node(1).await;
+        assert!(cluster.is_ok());
+
+        let cluster = cluster.unwrap();
+        assert_eq!(cluster.node_count(), 1);
+        assert_eq!(cluster.get_node_ids(), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn test_single_node_propose_and_apply() {
+        const TEST_PREFIX: &str = "test1_";
+
+        // Clear any previous test state for this prefix
+        clear_test_state_for_prefix(TEST_PREFIX);
+
+        let cluster = RaftCluster::<TestCommand>::new_single_node(1).await
+            .expect("Failed to create single node cluster");
+
+        // Wait for leadership establishment
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let state = get_test_state();
+
+        // Test SetValue command
+        let set_command = TestCommand::SetValue {
+            key: format!("{}test_key", TEST_PREFIX),
+            value: "test_value".to_string(),
+        };
+
+        let result = cluster.propose_command(set_command).await;
+        assert!(result.is_ok(), "SetValue command proposal should succeed");
+        assert!(result.unwrap(), "SetValue command should be successfully applied");
+
+        // Wait for command to be applied
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Verify the state was modified
+        {
+            let map = state.lock().unwrap();
+            assert_eq!(map.get(&format!("{}test_key", TEST_PREFIX)), Some(&"test_value".to_string()),
+                      "SetValue command should have updated the state");
+        }
+
+        // Test another SetValue command
+        let set_command2 = TestCommand::SetValue {
+            key: format!("{}another_key", TEST_PREFIX),
+            value: "another_value".to_string(),
+        };
+
+        let result = cluster.propose_command(set_command2).await;
+        assert!(result.is_ok(), "Second SetValue command proposal should succeed");
+        assert!(result.unwrap(), "Second SetValue command should be successfully applied");
+
+        // Wait for command to be applied
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Verify both values exist (count only our test's keys)
+        {
+            let map = state.lock().unwrap();
+            assert_eq!(map.get(&format!("{}test_key", TEST_PREFIX)), Some(&"test_value".to_string()));
+            assert_eq!(map.get(&format!("{}another_key", TEST_PREFIX)), Some(&"another_value".to_string()));
+
+            let test_keys: Vec<_> = map.keys().filter(|k| k.starts_with(TEST_PREFIX)).collect();
+            assert_eq!(test_keys.len(), 2, "State should contain exactly 2 entries for this test");
+        }
+
+        // Test DeleteKey command
+        let delete_command = TestCommand::DeleteKey {
+            key: format!("{}test_key", TEST_PREFIX),
+        };
+
+        let result = cluster.propose_command(delete_command).await;
+        assert!(result.is_ok(), "DeleteKey command proposal should succeed");
+        assert!(result.unwrap(), "DeleteKey command should be successfully applied");
+
+        // Wait for command to be applied
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Verify the key was deleted
+        {
+            let map = state.lock().unwrap();
+            assert_eq!(map.get(&format!("{}test_key", TEST_PREFIX)), None, "test_key should have been deleted");
+            assert_eq!(map.get(&format!("{}another_key", TEST_PREFIX)), Some(&"another_value".to_string()),
+                      "another_key should still exist");
+
+            let test_keys: Vec<_> = map.keys().filter(|k| k.starts_with(TEST_PREFIX)).collect();
+            assert_eq!(test_keys.len(), 1, "State should contain exactly 1 entry for this test after deletion");
+        }
+
+        // Test Noop command
+        let noop_command = TestCommand::Noop;
+        let result = cluster.propose_command(noop_command).await;
+        assert!(result.is_ok(), "Noop command proposal should succeed");
+        assert!(result.unwrap(), "Noop command should be successfully applied");
+
+        // Wait for command to be applied
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Verify state unchanged by Noop
+        {
+            let map = state.lock().unwrap();
+            let test_keys: Vec<_> = map.keys().filter(|k| k.starts_with(TEST_PREFIX)).collect();
+            assert_eq!(test_keys.len(), 1, "Noop should not change state");
+            assert_eq!(map.get(&format!("{}another_key", TEST_PREFIX)), Some(&"another_value".to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_multiple_commands_sequential() {
+        const TEST_PREFIX: &str = "test2_";
+
+        // Clear any previous test state for this prefix
+        clear_test_state_for_prefix(TEST_PREFIX);
+
+        let cluster = RaftCluster::<TestCommand>::new_single_node(1).await
+            .expect("Failed to create single node cluster");
+
+        // Wait for leadership establishment
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let state = get_test_state();
+
+        let commands = vec![
+            TestCommand::SetValue {
+                key: format!("{}key1", TEST_PREFIX),
+                value: "value1".to_string(),
+            },
+            TestCommand::SetValue {
+                key: format!("{}key2", TEST_PREFIX),
+                value: "value2".to_string(),
+            },
+            TestCommand::SetValue {
+                key: format!("{}key1", TEST_PREFIX),
+                value: "updated_value1".to_string(),
+            },
+            TestCommand::DeleteKey {
+                key: format!("{}key2", TEST_PREFIX),
+            },
+        ];
+
+        for command in commands {
+            let result = cluster.propose_command(command).await;
+            assert!(result.is_ok(), "Command proposal should succeed");
+            assert!(result.unwrap(), "Command should be successfully applied");
+        }
+
+        // Wait for all commands to be applied
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Verify final state
+        {
+            let map = state.lock().unwrap();
+            assert_eq!(map.get(&format!("{}key1", TEST_PREFIX)), Some(&"updated_value1".to_string()),
+                      "key1 should have updated value");
+            assert_eq!(map.get(&format!("{}key2", TEST_PREFIX)), None, "key2 should have been deleted");
+
+            let test_keys: Vec<_> = map.keys().filter(|k| k.starts_with(TEST_PREFIX)).collect();
+            assert_eq!(test_keys.len(), 1, "State should contain exactly 1 entry for this test");
+        }
     }
 }

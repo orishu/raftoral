@@ -20,4 +20,7 @@ pub enum Message<C: RaftCommandType> {
         callback: Option<tokio::sync::oneshot::Sender<bool>>,
         change: raft::prelude::ConfChangeV2,
     },
+    Campaign {
+        callback: Option<tokio::sync::oneshot::Sender<bool>>,
+    },
 }

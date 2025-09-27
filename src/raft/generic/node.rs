@@ -38,6 +38,7 @@ impl<C: RaftCommandType + 'static> RaftNode<C> {
             max_size_per_msg: 1024 * 1024 * 1024,
             max_inflight_msgs: 256,
             check_quorum: false, // Important: disable for single node
+            pre_vote: false, // Disable pre-vote for single node
             ..Default::default()
         };
 
@@ -80,11 +81,18 @@ impl<C: RaftCommandType + 'static> RaftNode<C> {
             applied: 0,
             max_size_per_msg: 1024 * 1024 * 1024,
             max_inflight_msgs: 256,
-            check_quorum: true,
+            check_quorum: peers.len() > 0, // Disable quorum check for single-node
             ..Default::default()
         };
 
         let storage = MemStorage::new();
+
+        // If this is a single-node cluster, set up the initial configuration
+        if peers.is_empty() {
+            let mut initial_state = ConfState::default();
+            initial_state.voters.push(node_id);
+            storage.wl().set_conf_state(initial_state);
+        }
 
         // Create logger for this node
         let decorator = slog_term::TermDecorator::new().build();
@@ -112,8 +120,6 @@ impl<C: RaftCommandType + 'static> RaftNode<C> {
         self.next_proposal_id = self.next_proposal_id.wrapping_add(1);
 
         self.raft_group.propose(vec![], data)?;
-        slog::info!(self.logger, "Proposed command"; "proposal_id" => proposal_id);
-
         Ok(proposal_id)
     }
 
@@ -132,7 +138,6 @@ impl<C: RaftCommandType + 'static> RaftNode<C> {
             self.raft_group.propose_conf_change(vec![], legacy_change)?;
         }
 
-        slog::info!(self.logger, "Proposed conf change v2"; "proposal_id" => proposal_id);
 
         Ok(proposal_id)
     }
@@ -151,41 +156,66 @@ impl<C: RaftCommandType + 'static> RaftNode<C> {
             return Ok(());
         }
 
+        let store = self.raft_group.raft.raft_log.store.clone();
         let mut ready = self.raft_group.ready();
-
-        // Handle hard state changes
-        if let Some(hs) = ready.hs() {
-            slog::debug!(self.logger, "Hard state changed";
-                        "term" => hs.term, "vote" => hs.vote, "commit" => hs.commit);
-        }
-
-        // Handle soft state changes
-        if let Some(ss) = ready.ss() {
-            slog::info!(self.logger, "Soft state changed";
-                       "leader_id" => ss.leader_id, "raft_state" => ?ss.raft_state);
-        }
 
         // Send out messages to other nodes
         if !ready.messages().is_empty() {
             self.send_messages(ready.take_messages())?;
         }
 
-        // Handle committed entries
-        if !ready.committed_entries().is_empty() {
-            self.handle_committed_entries(ready.committed_entries())?;
+        // Handle snapshots first
+        if !ready.snapshot().is_empty() {
+            store.wl().apply_snapshot(ready.snapshot().clone())?;
         }
 
-        // Handle configuration changes through committed entries
-        // In raft-rs, conf changes come through committed entries with EntryConfChange type
-        // The apply_conf_change method will be called when we encounter EntryConfChange entries
+        // Handle committed entries BEFORE persisting new entries
+        let committed_entries = ready.committed_entries();
+        if !committed_entries.is_empty() {
+            self.handle_committed_entries(committed_entries)?;
+        }
 
-        // Advance the Raft state machine
+        // CRITICAL: Append entries to storage BEFORE calling advance()
+        if !ready.entries().is_empty() {
+            store.wl().append(ready.entries())?;
+        }
+
+        // Persist hard state changes
+        if let Some(hs) = ready.hs() {
+            store.wl().set_hardstate(hs.clone());
+        }
+
+        // Handle soft state changes (informational only)
+        if let Some(_ss) = ready.ss() {
+            // Soft state changes don't need special handling
+        }
+
+        // Send persisted messages
+        if !ready.persisted_messages().is_empty() {
+            self.send_messages(ready.take_persisted_messages())?;
+        }
+
+        // NOW it's safe to advance - entries are persisted
         let mut light_rd = self.raft_group.advance(ready);
 
-        // Handle any additional messages from advance
+        // Handle light Ready state
+        if let Some(commit) = light_rd.commit_index() {
+            store.wl().mut_hard_state().set_commit(commit);
+        }
+
+        // Handle any additional messages from light ready
         if !light_rd.messages().is_empty() {
             self.send_messages(light_rd.take_messages())?;
         }
+
+        // Handle additional committed entries from light ready
+        let light_committed_entries = light_rd.take_committed_entries();
+        if !light_committed_entries.is_empty() {
+            self.handle_committed_entries(&light_committed_entries)?;
+        }
+
+        // Advance apply index
+        self.raft_group.advance_apply();
 
         Ok(())
     }
@@ -205,10 +235,13 @@ impl<C: RaftCommandType + 'static> RaftNode<C> {
         Ok(())
     }
 
-    fn handle_committed_entries(&mut self, entries: &[Entry]) -> Result<(), Box<dyn std::error::Error>> {
+    fn handle_committed_entries(&mut self, entries: &[Entry]) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+        let mut last_applied_index = None;
+
         for entry in entries {
             if entry.data.is_empty() {
                 // Empty entry, usually a leadership change
+                last_applied_index = Some(entry.index);
                 continue;
             }
 
@@ -216,11 +249,13 @@ impl<C: RaftCommandType + 'static> RaftNode<C> {
                 EntryType::EntryNormal => {
                     if let Ok(command) = serde_json::from_slice::<C>(&entry.data) {
                         self.apply_command(&command)?;
+                        last_applied_index = Some(entry.index);
                     }
                 },
                 EntryType::EntryConfChange => {
                     slog::warn!(self.logger, "Legacy ConfChange not supported - use ConfChangeV2"; "index" => entry.index);
                     // We only support modern ConfChangeV2 for simplicity
+                    last_applied_index = Some(entry.index);
                 },
                 EntryType::EntryConfChangeV2 => {
                     slog::info!(self.logger, "Processing conf change v2 entry"; "index" => entry.index);
@@ -229,10 +264,11 @@ impl<C: RaftCommandType + 'static> RaftNode<C> {
                     } else {
                         slog::error!(self.logger, "Failed to parse conf change v2 from entry data");
                     }
+                    last_applied_index = Some(entry.index);
                 },
             }
         }
-        Ok(())
+        Ok(last_applied_index)
     }
 
     fn apply_command(&mut self, command: &C) -> Result<(), Box<dyn std::error::Error>> {
@@ -278,6 +314,12 @@ impl<C: RaftCommandType + 'static> RaftNode<C> {
     pub fn is_leader(&self) -> bool {
         self.raft_group.raft.state == raft::StateRole::Leader
     }
+
+    pub fn campaign(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.raft_group.campaign()?;
+        Ok(())
+    }
+
 
     pub fn node_id(&self) -> u64 {
         self.node_id
@@ -330,6 +372,21 @@ impl<C: RaftCommandType + 'static> RaftNode<C> {
                                 },
                                 Err(e) => {
                                     slog::error!(self.logger, "Failed to propose conf change v2"; "error" => %e);
+                                    if let Some(cb) = callback {
+                                        let _ = cb.send(false);
+                                    }
+                                }
+                            }
+                        },
+                        Some(Message::Campaign { callback }) => {
+                            match self.campaign() {
+                                Ok(_) => {
+                                    if let Some(cb) = callback {
+                                        let _ = cb.send(true);
+                                    }
+                                },
+                                Err(e) => {
+                                    slog::error!(self.logger, "Failed to start campaign"; "error" => %e);
                                     if let Some(cb) = callback {
                                         let _ = cb.send(false);
                                     }
