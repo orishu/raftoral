@@ -32,18 +32,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         value: b"checkpoint data for step 1".to_vec(),
     };
 
-    match cluster.propose_command(checkpoint_command).await {
-        Ok(success) => {
-            if success {
-                println!("Successfully set checkpoint");
-            } else {
-                println!("Failed to set checkpoint");
-            }
-        },
+    match cluster.propose_and_sync(checkpoint_command).await {
+        Ok(()) => println!("Successfully set checkpoint"),
         Err(e) => eprintln!("Error setting checkpoint: {}", e),
     }
-
-    sleep(Duration::from_millis(500)).await;
 
     // Test ending the workflow
     println!("Ending workflow: {}", workflow_id);

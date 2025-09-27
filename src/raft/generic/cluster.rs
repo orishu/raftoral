@@ -1,13 +1,27 @@
 use std::collections::HashMap;
-use tokio::sync::mpsc;
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
+use tokio::sync::{mpsc, broadcast};
 use raft::prelude::*;
 use crate::raft::generic::message::{Message, RaftCommandType};
 use crate::raft::generic::node::RaftNode;
+
+/// Role change event for leadership notifications
+#[derive(Debug, Clone, PartialEq)]
+pub enum RoleChange {
+    BecameLeader(u64),    // node_id that became leader
+    BecameFollower(u64),  // node_id that became follower
+    BecameCandidate(u64), // node_id that became candidate
+}
 
 #[derive(Clone)]
 pub struct RaftCluster<C: RaftCommandType> {
     node_senders: HashMap<u64, mpsc::UnboundedSender<Message<C>>>,
     node_count: usize,
+    // Role change notifications
+    role_change_tx: broadcast::Sender<RoleChange>,
+    // Command ID counter for precise tracking
+    next_command_id: Arc<AtomicU64>,
 }
 
 impl<C: RaftCommandType + 'static> RaftCluster<C> {
@@ -20,9 +34,14 @@ impl<C: RaftCommandType + 'static> RaftCluster<C> {
 
         node_senders.insert(node_id, sender.clone());
 
+        // Create role change broadcast channel
+        let (role_change_tx, _role_change_rx) = broadcast::channel(100);
+
         let cluster = RaftCluster {
             node_senders,
             node_count: 1,
+            role_change_tx: role_change_tx.clone(),
+            next_command_id: Arc::new(AtomicU64::new(1)),
         };
 
         // Create and run the single node using the multi-node constructor
@@ -60,9 +79,14 @@ impl<C: RaftCommandType + 'static> RaftCluster<C> {
             node_receivers.insert(node_id, receiver);
         }
 
+        // Create role change broadcast channel
+        let (role_change_tx, _role_change_rx) = broadcast::channel(100);
+
         let cluster = RaftCluster {
             node_senders: node_senders.clone(),
             node_count: node_ids.len(),
+            role_change_tx: role_change_tx.clone(),
+            next_command_id: Arc::new(AtomicU64::new(1)),
         };
 
         // Create and start all nodes
@@ -107,6 +131,7 @@ impl<C: RaftCommandType + 'static> RaftCluster<C> {
             node_sender.send(Message::Propose {
                 id: 0,
                 callback: Some(sender),
+                sync_callback: None,
                 command,
             })?;
 
@@ -115,6 +140,47 @@ impl<C: RaftCommandType + 'static> RaftCluster<C> {
         } else {
             Err("No nodes available in cluster".into())
         }
+    }
+
+    /// Propose a command and wait until it's applied to the state machine
+    /// Uses precise tracking with unique command IDs to wait for exact completion
+    pub async fn propose_and_sync(&self, command: C) -> Result<(), Box<dyn std::error::Error>> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+
+        // Send to the first available node (in a real implementation, you'd route to the leader)
+        if let Some(node_sender) = self.node_senders.values().next() {
+            node_sender.send(Message::Propose {
+                id: 0,
+                callback: None,
+                sync_callback: Some(sender),
+                command,
+            })?;
+
+            // Wait for the specific command to be applied
+            match receiver.await {
+                Ok(result) => result.map_err(|e| -> Box<dyn std::error::Error> { format!("Command application error: {}", e).into() }),
+                Err(e) => Err(format!("Command callback error: {}", e).into()),
+            }
+        } else {
+            Err("No nodes available in cluster".into())
+        }
+    }
+
+    /// Check if this cluster is currently the leader
+    pub async fn is_leader(&self) -> bool {
+        // For single-node clusters, we're always the leader
+        // TODO: In multi-node implementation, query actual Raft leadership status
+        self.node_count == 1
+    }
+
+    /// Subscribe to role change notifications
+    pub fn subscribe_role_changes(&self) -> broadcast::Receiver<RoleChange> {
+        self.role_change_tx.subscribe()
+    }
+
+    /// Notify about role change (internal use)
+    pub fn notify_role_change(&self, role_change: RoleChange) {
+        let _ = self.role_change_tx.send(role_change);
     }
 
 

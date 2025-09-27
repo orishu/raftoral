@@ -115,7 +115,7 @@ impl std::error::Error for WorkflowError {}
 /// Start a workflow with the given ID
 ///
 /// This function implements different behavior for leaders and followers:
-/// - **Leader**: Proposes a WorkflowStart command to the cluster
+/// - **Leader**: Proposes a WorkflowStart command to the cluster and waits for it to be applied
 /// - **Follower**: Waits for the WorkflowStart command to be applied by the leader
 ///
 /// # Arguments
@@ -141,17 +141,14 @@ pub async fn start_workflow(
     }
 
     // Check if we're the leader
-    if is_cluster_leader(cluster).await {
-        // Leader behavior: Propose the WorkflowStart command
+    if cluster.is_leader().await {
+        // Leader behavior: Propose the WorkflowStart command and wait for it to be applied
         let command = WorkflowCommand::WorkflowStart {
             workflow_id: workflow_id.to_string(),
         };
 
-        cluster.propose_command(command).await
+        cluster.propose_and_sync(command).await
             .map_err(|e| WorkflowError::ClusterError(e.to_string()))?;
-
-        // Wait a short time for the command to be applied
-        sleep(Duration::from_millis(100)).await;
 
         // Verify the workflow was started
         let workflows = get_workflow_state();
@@ -183,17 +180,14 @@ pub async fn end_workflow(
         }
     }
 
-    if is_cluster_leader(cluster).await {
-        // Leader behavior: Propose the WorkflowEnd command
+    if cluster.is_leader().await {
+        // Leader behavior: Propose the WorkflowEnd command and wait for it to be applied
         let command = WorkflowCommand::WorkflowEnd {
             workflow_id: workflow_id.to_string(),
         };
 
-        cluster.propose_command(command).await
+        cluster.propose_and_sync(command).await
             .map_err(|e| WorkflowError::ClusterError(e.to_string()))?;
-
-        // Wait for the command to be applied
-        sleep(Duration::from_millis(100)).await;
 
         Ok(())
     } else {
@@ -202,16 +196,6 @@ pub async fn end_workflow(
     }
 }
 
-/// Check if the current node is the cluster leader
-///
-/// For now, this is a simplified implementation that assumes we're always the leader
-/// in single-node clusters. In multi-node clusters, this would need to query the
-/// actual Raft state.
-async fn is_cluster_leader(cluster: &RaftCluster<WorkflowCommand>) -> bool {
-    // For single-node clusters, we're always the leader
-    // TODO: In multi-node implementation, query actual Raft leadership status
-    cluster.node_count() == 1
-}
 
 /// Wait for a workflow to be started (follower behavior)
 async fn wait_for_workflow_start(workflow_id: &str) -> Result<(), WorkflowError> {

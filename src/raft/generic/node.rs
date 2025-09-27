@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, mpsc};
 use raft::{prelude::*, storage::MemStorage};
 use slog::{Drain, Logger};
 use protobuf::Message as PbMessage;
-use crate::raft::generic::message::{Message, RaftCommandType};
+use crate::raft::generic::message::{Message, RaftCommandType, CommandWrapper};
 
-pub type ProposeCallback = tokio::sync::oneshot::Sender<bool>;
+pub type SyncCallback = tokio::sync::oneshot::Sender<Result<(), Box<dyn std::error::Error + Send + Sync>>>;
 
 pub struct RaftNode<C: RaftCommandType> {
     raft_group: RawNode<MemStorage>,
@@ -19,9 +20,9 @@ pub struct RaftNode<C: RaftCommandType> {
     mailbox: mpsc::UnboundedReceiver<Message<C>>,
     peers: HashMap<u64, mpsc::UnboundedSender<Message<C>>>,
 
-    // Proposal tracking
-    next_proposal_id: u8,
-    proposals: HashMap<u8, ProposeCallback>,
+    // Sync command tracking (command_id -> completion callback)
+    sync_commands: HashMap<u64, SyncCallback>,
+    next_command_id: AtomicU64,
 }
 
 impl<C: RaftCommandType + 'static> RaftNode<C> {
@@ -64,8 +65,8 @@ impl<C: RaftCommandType + 'static> RaftNode<C> {
             logger,
             mailbox,
             peers,
-            next_proposal_id: 0,
-            proposals: HashMap::new(),
+            sync_commands: HashMap::new(),
+            next_command_id: AtomicU64::new(1),
         })
     }
 
@@ -109,24 +110,23 @@ impl<C: RaftCommandType + 'static> RaftNode<C> {
             logger,
             mailbox,
             peers,
-            next_proposal_id: 0,
-            proposals: HashMap::new(),
+            sync_commands: HashMap::new(),
+            next_command_id: AtomicU64::new(1),
         })
     }
 
-    pub fn propose_command(&mut self, command: C) -> Result<u8, Box<dyn std::error::Error>> {
-        let data = serde_json::to_vec(&command)?;
-        let proposal_id = self.next_proposal_id;
-        self.next_proposal_id = self.next_proposal_id.wrapping_add(1);
+    pub fn propose_command(&mut self, command: C, sync_id: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
+        let wrapped_command = CommandWrapper {
+            id: sync_id,
+            command,
+        };
 
+        let data = serde_json::to_vec(&wrapped_command)?;
         self.raft_group.propose(vec![], data)?;
-        Ok(proposal_id)
+        Ok(())
     }
 
-    pub fn propose_conf_change_v2(&mut self, conf_change: ConfChangeV2) -> Result<u8, Box<dyn std::error::Error>> {
-        let proposal_id = self.next_proposal_id;
-        self.next_proposal_id = self.next_proposal_id.wrapping_add(1);
-
+    pub fn propose_conf_change_v2(&mut self, conf_change: ConfChangeV2) -> Result<(), Box<dyn std::error::Error>> {
         // Note: raft-rs 0.7.0 may need legacy propose_conf_change, but we'll prepare for v2
         // For now, convert to legacy for compatibility
         if let Some(change) = conf_change.changes.first() {
@@ -138,8 +138,7 @@ impl<C: RaftCommandType + 'static> RaftNode<C> {
             self.raft_group.propose_conf_change(vec![], legacy_change)?;
         }
 
-
-        Ok(proposal_id)
+        Ok(())
     }
 
     pub fn step(&mut self, msg: raft::prelude::Message) -> Result<(), Box<dyn std::error::Error>> {
@@ -247,8 +246,25 @@ impl<C: RaftCommandType + 'static> RaftNode<C> {
 
             match entry.entry_type {
                 EntryType::EntryNormal => {
-                    if let Ok(command) = serde_json::from_slice::<C>(&entry.data) {
-                        self.apply_command(&command)?;
+                    // All commands are now wrapped with CommandWrapper
+                    if let Ok(wrapped_command) = serde_json::from_slice::<CommandWrapper<C>>(&entry.data) {
+                        let result = self.apply_command(&wrapped_command.command);
+
+                        // Notify the waiting sync callback if there's a sync ID
+                        if let Some(sync_id) = wrapped_command.id {
+                            if let Some(callback) = self.sync_commands.remove(&sync_id) {
+                                let callback_result = match &result {
+                                    Ok(_) => Ok(()),
+                                    Err(e) => {
+                                        let err: Box<dyn std::error::Error + Send + Sync> = format!("{}", e).into();
+                                        Err(err)
+                                    }
+                                };
+                                let _ = callback.send(callback_result);
+                            }
+                        }
+
+                        result?;
                         last_applied_index = Some(entry.index);
                     }
                 },
@@ -343,8 +359,19 @@ impl<C: RaftCommandType + 'static> RaftNode<C> {
                 // Handle incoming messages
                 msg = self.mailbox.recv() => {
                     match msg {
-                        Some(Message::Propose { command, callback, .. }) => {
-                            match self.propose_command(command) {
+                        Some(Message::Propose { command, callback, sync_callback, .. }) => {
+                            let sync_id = if sync_callback.is_some() {
+                                Some(self.next_command_id.fetch_add(1, Ordering::SeqCst))
+                            } else {
+                                None
+                            };
+
+                            // Store sync callback if provided
+                            if let (Some(sync_cb), Some(id)) = (sync_callback, sync_id) {
+                                self.sync_commands.insert(id, sync_cb);
+                            }
+
+                            match self.propose_command(command, sync_id) {
                                 Ok(_) => {
                                     if let Some(cb) = callback {
                                         let _ = cb.send(true);
@@ -354,6 +381,14 @@ impl<C: RaftCommandType + 'static> RaftNode<C> {
                                     slog::error!(self.logger, "Failed to propose command"; "error" => %e);
                                     if let Some(cb) = callback {
                                         let _ = cb.send(false);
+                                    }
+                                    // Also notify sync callback of failure if it was set
+                                    if let Some(id) = sync_id {
+                                        if let Some(sync_cb) = self.sync_commands.remove(&id) {
+                                            let err_msg = format!("Failed to propose command: {}", e);
+                                            let err: Box<dyn std::error::Error + Send + Sync> = err_msg.into();
+                                            let _ = sync_cb.send(Err(err));
+                                        }
                                     }
                                 }
                             }
