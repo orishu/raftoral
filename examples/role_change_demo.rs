@@ -1,11 +1,12 @@
-use raftoral::{WorkflowCluster, RoleChange};
+use raftoral::{WorkflowCommandExecutor, RaftCluster, RoleChange};
 use tokio::time::{sleep, Duration};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Role Change Demo - Starting cluster...");
 
-    let cluster = WorkflowCluster::new_single_node(1).await?;
+    let executor = WorkflowCommandExecutor::new();
+    let cluster = RaftCluster::new_single_node(1, executor).await?;
 
     // Subscribe to role changes
     let mut role_changes = cluster.subscribe_role_changes();

@@ -6,30 +6,34 @@ use tokio::sync::{RwLock, mpsc};
 use raft::{prelude::*, storage::MemStorage};
 use slog::{Drain, Logger};
 use protobuf::Message as PbMessage;
-use crate::raft::generic::message::{Message, RaftCommandType, CommandWrapper};
+use crate::raft::generic::message::{Message, CommandExecutor, CommandWrapper};
 
 pub type SyncCallback = tokio::sync::oneshot::Sender<Result<(), Box<dyn std::error::Error + Send + Sync>>>;
 
-pub struct RaftNode<C: RaftCommandType> {
+pub struct RaftNode<E: CommandExecutor> {
     raft_group: RawNode<MemStorage>,
     storage: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     node_id: u64,
     logger: Logger,
 
     // For multi-node communication
-    mailbox: mpsc::UnboundedReceiver<Message<C>>,
-    peers: HashMap<u64, mpsc::UnboundedSender<Message<C>>>,
+    mailbox: mpsc::UnboundedReceiver<Message<E::Command>>,
+    peers: HashMap<u64, mpsc::UnboundedSender<Message<E::Command>>>,
 
     // Sync command tracking (command_id -> completion callback)
     sync_commands: HashMap<u64, SyncCallback>,
     next_command_id: AtomicU64,
+
+    // Command executor for applying committed commands
+    executor: Arc<E>,
 }
 
-impl<C: RaftCommandType + 'static> RaftNode<C> {
+impl<E: CommandExecutor + 'static> RaftNode<E> {
     pub fn new_single_node(
         node_id: u64,
-        mailbox: mpsc::UnboundedReceiver<Message<C>>,
-        peers: HashMap<u64, mpsc::UnboundedSender<Message<C>>>,
+        mailbox: mpsc::UnboundedReceiver<Message<E::Command>>,
+        peers: HashMap<u64, mpsc::UnboundedSender<Message<E::Command>>>,
+        executor: Arc<E>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let config = Config {
             id: node_id,
@@ -67,13 +71,15 @@ impl<C: RaftCommandType + 'static> RaftNode<C> {
             peers,
             sync_commands: HashMap::new(),
             next_command_id: AtomicU64::new(1),
+            executor,
         })
     }
 
     pub fn new(
         node_id: u64,
-        mailbox: mpsc::UnboundedReceiver<Message<C>>,
-        peers: HashMap<u64, mpsc::UnboundedSender<Message<C>>>,
+        mailbox: mpsc::UnboundedReceiver<Message<E::Command>>,
+        peers: HashMap<u64, mpsc::UnboundedSender<Message<E::Command>>>,
+        executor: Arc<E>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let config = Config {
             id: node_id,
@@ -112,10 +118,11 @@ impl<C: RaftCommandType + 'static> RaftNode<C> {
             peers,
             sync_commands: HashMap::new(),
             next_command_id: AtomicU64::new(1),
+            executor,
         })
     }
 
-    pub fn propose_command(&mut self, command: C, sync_id: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn propose_command(&mut self, command: E::Command, sync_id: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
         let wrapped_command = CommandWrapper {
             id: sync_id,
             command,
@@ -247,7 +254,7 @@ impl<C: RaftCommandType + 'static> RaftNode<C> {
             match entry.entry_type {
                 EntryType::EntryNormal => {
                     // All commands are now wrapped with CommandWrapper
-                    if let Ok(wrapped_command) = serde_json::from_slice::<CommandWrapper<C>>(&entry.data) {
+                    if let Ok(wrapped_command) = serde_json::from_slice::<CommandWrapper<E::Command>>(&entry.data) {
                         let result = self.apply_command(&wrapped_command.command);
 
                         // Notify the waiting sync callback if there's a sync ID
@@ -287,9 +294,9 @@ impl<C: RaftCommandType + 'static> RaftNode<C> {
         Ok(last_applied_index)
     }
 
-    fn apply_command(&mut self, command: &C) -> Result<(), Box<dyn std::error::Error>> {
-        // Use the trait method to apply the command
-        command.apply(&self.logger)
+    fn apply_command(&mut self, command: &E::Command) -> Result<(), Box<dyn std::error::Error>> {
+        // Use the executor to apply the command
+        self.executor.apply(command, &self.logger)
     }
 
 

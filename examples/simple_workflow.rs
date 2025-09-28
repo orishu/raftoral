@@ -1,24 +1,20 @@
-use std::sync::Arc;
 use std::time::Duration;
-use raftoral::{RaftCluster, WorkflowCommand, WorkflowRuntime, ReplicatedVar};
+use raftoral::{WorkflowRuntime, ReplicatedVar};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Create a single-node Raft cluster
-    let cluster = Arc::new(
-        RaftCluster::<WorkflowCommand>::new_single_node(1).await?
-    );
+    let workflow_id = "simple_example";
+
+    // Create a workflow runtime with integrated cluster
+    let workflow_runtime = WorkflowRuntime::new_single_node(1).await?;
 
     // Wait for leadership establishment
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let workflow_id = "simple_example";
-
-    // Create a workflow runtime with the cluster
-    let workflow_runtime = WorkflowRuntime::new(cluster);
-
     // Start the workflow using WorkflowRuntime
     let workflow_run = workflow_runtime.start(workflow_id).await?;
+
+    println!("Started workflow: {}", workflow_id);
 
     // Create a replicated variable to store our computation result
     let result_var = ReplicatedVar::new("result", &workflow_run, 0i32);
@@ -35,8 +31,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Message: {}", message);
 
-    // End the workflow and get the result in one step
-    let final_result: i32 = workflow_run.finish_with(&result_var).await?;
+    // End the workflow with the computed result
+    let final_result: i32 = workflow_run.finish_with(stored_result).await?;
 
     println!("Workflow '{}' completed with result: {:?}!", workflow_id, final_result);
 

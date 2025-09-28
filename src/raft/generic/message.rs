@@ -2,21 +2,30 @@ use serde::{Serialize, Deserialize};
 use serde::de::DeserializeOwned;
 use std::fmt::Debug;
 
-/// Trait for commands that can be proposed through Raft
-pub trait RaftCommandType: Clone + Debug + Serialize + DeserializeOwned + Send + Sync + 'static {
-    /// Apply this command to the state machine
-    fn apply(&self, logger: &slog::Logger) -> Result<(), Box<dyn std::error::Error>>;
+/// Trait for executing commands that have been committed through Raft
+pub trait CommandExecutor: Send + Sync + 'static {
+    /// The command type that this executor handles
+    type Command: Clone + Debug + Serialize + DeserializeOwned + Send + Sync + 'static;
+
+    /// Apply a command to the state machine
+    fn apply(&self, command: &Self::Command, logger: &slog::Logger) -> Result<(), Box<dyn std::error::Error>>;
 }
 
 /// Wrapper for commands with optional tracking ID
 #[derive(Clone, Debug, Serialize)]
-pub struct CommandWrapper<C: RaftCommandType> {
+pub struct CommandWrapper<C>
+where
+    C: Clone + Debug + Serialize + DeserializeOwned + Send + Sync + 'static,
+{
     pub id: Option<u64>,
     pub command: C,
 }
 
-// Manual Deserialize implementation to work with RaftCommandType constraints
-impl<'de, C: RaftCommandType> Deserialize<'de> for CommandWrapper<C> {
+// Manual Deserialize implementation to work with command constraints
+impl<'de, C> Deserialize<'de> for CommandWrapper<C>
+where
+    C: Clone + Debug + Serialize + DeserializeOwned + Send + Sync + 'static,
+{
     fn deserialize<D>(deserializer: D) -> Result<CommandWrapper<C>, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -35,7 +44,10 @@ impl<'de, C: RaftCommandType> Deserialize<'de> for CommandWrapper<C> {
     }
 }
 
-pub enum Message<C: RaftCommandType> {
+pub enum Message<C>
+where
+    C: Clone + Debug + Serialize + DeserializeOwned + Send + Sync + 'static,
+{
     Propose {
         id: u8,
         callback: Option<tokio::sync::oneshot::Sender<bool>>,

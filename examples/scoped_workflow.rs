@@ -1,6 +1,5 @@
-use std::sync::Arc;
 use std::time::Duration;
-use raftoral::{RaftCluster, WorkflowCommand, WorkflowRuntime, ReplicatedVar};
+use raftoral::{WorkflowRuntime, ReplicatedVar};
 
 async fn compute_fibonacci(n: u32) -> u32 {
     // Simulate some computation time
@@ -38,10 +37,10 @@ async fn fibonacci_workflow(workflow_runtime: &WorkflowRuntime, n: u32) -> Resul
 
         // Store the result in a replicated variable
         let result_var = ReplicatedVar::new("result", &workflow_run, 0u32);
-        result_var.set(result).await?;
+        let stored_result = result_var.set(result).await?;
 
         // Return the result (workflow ends here)
-        return Ok(workflow_run.finish_with(&result_var).await?);
+        return Ok(workflow_run.finish_with(stored_result).await?);
     }
     // WorkflowRun goes out of scope here and the workflow would be automatically ended
     // But we already called finish_with() so it's already ended
@@ -49,16 +48,11 @@ async fn fibonacci_workflow(workflow_runtime: &WorkflowRuntime, n: u32) -> Resul
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Create a single-node Raft cluster
-    let cluster = Arc::new(
-        RaftCluster::<WorkflowCommand>::new_single_node(1).await?
-    );
+    // Create a workflow runtime with integrated cluster
+    let workflow_runtime = WorkflowRuntime::new_single_node(1).await?;
 
     // Wait for leadership establishment
     tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Create a workflow runtime with the cluster
-    let workflow_runtime = WorkflowRuntime::new(cluster);
 
     println!("Computing Fibonacci numbers using fault-tolerant workflows...");
 
@@ -73,7 +67,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let workflow_run = workflow_runtime.start("test_early_exit").await?;
 
         let counter = ReplicatedVar::new("counter", &workflow_run, 0i32);
-        counter.set(42).await?;
+        let counter_value = counter.set(42).await?;
+        println!("Set counter to: {}", counter_value);
 
         workflow_run.finish().await?;
 

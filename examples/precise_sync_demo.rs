@@ -1,11 +1,12 @@
-use raftoral::{WorkflowCluster, WorkflowCommand};
+use raftoral::{WorkflowCommandExecutor, RaftCluster, WorkflowCommand};
 use std::time::Instant;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Precise Sync Demo - Testing improved propose_and_sync");
 
-    let cluster = WorkflowCluster::new_single_node(1).await?;
+    let executor = WorkflowCommandExecutor::new();
+    let cluster = RaftCluster::new_single_node(1, executor).await?;
 
     // Test multiple rapid commands to demonstrate precise tracking
     let commands = vec![

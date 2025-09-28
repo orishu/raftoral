@@ -3,7 +3,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::sync::{mpsc, broadcast};
 use raft::prelude::*;
-use crate::raft::generic::message::{Message, RaftCommandType};
+use crate::raft::generic::message::{Message, CommandExecutor};
 use crate::raft::generic::node::RaftNode;
 
 /// Role change event for leadership notifications
@@ -15,17 +15,19 @@ pub enum RoleChange {
 }
 
 #[derive(Clone)]
-pub struct RaftCluster<C: RaftCommandType> {
-    node_senders: HashMap<u64, mpsc::UnboundedSender<Message<C>>>,
+pub struct RaftCluster<E: CommandExecutor> {
+    node_senders: HashMap<u64, mpsc::UnboundedSender<Message<E::Command>>>,
     node_count: usize,
     // Role change notifications
     role_change_tx: broadcast::Sender<RoleChange>,
     // Command ID counter for precise tracking
     next_command_id: Arc<AtomicU64>,
+    // Command executor for applying commands
+    pub executor: Arc<E>,
 }
 
-impl<C: RaftCommandType + 'static> RaftCluster<C> {
-    pub async fn new_single_node(node_id: u64) -> Result<Self, Box<dyn std::error::Error>> {
+impl<E: CommandExecutor + 'static> RaftCluster<E> {
+    pub async fn new_single_node(node_id: u64, executor: E) -> Result<Self, Box<dyn std::error::Error>> {
         let mut node_senders = HashMap::new();
         let (sender, receiver) = mpsc::unbounded_channel();
 
@@ -37,16 +39,18 @@ impl<C: RaftCommandType + 'static> RaftCluster<C> {
         // Create role change broadcast channel
         let (role_change_tx, _role_change_rx) = broadcast::channel(100);
 
+        let executor_arc = Arc::new(executor);
         let cluster = RaftCluster {
             node_senders,
             node_count: 1,
             role_change_tx: role_change_tx.clone(),
             next_command_id: Arc::new(AtomicU64::new(1)),
+            executor: executor_arc.clone(),
         };
 
         // Create and run the single node using the multi-node constructor
         tokio::spawn(async move {
-            let mut node = match RaftNode::<C>::new(node_id, receiver, peers) {
+            let mut node = match RaftNode::<E>::new(node_id, receiver, peers, executor_arc.clone()) {
                 Ok(n) => n,
                 Err(e) => {
                     eprintln!("Failed to create RaftNode {}: {}", node_id, e);
@@ -68,7 +72,7 @@ impl<C: RaftCommandType + 'static> RaftCluster<C> {
         Ok(cluster)
     }
 
-    pub async fn new_multi_node(node_ids: Vec<u64>) -> Result<Self, Box<dyn std::error::Error>> {
+    pub async fn new_multi_node(node_ids: Vec<u64>, executor: E) -> Result<Self, Box<dyn std::error::Error>> {
         let mut node_senders = HashMap::new();
         let mut node_receivers = HashMap::new();
 
@@ -82,11 +86,13 @@ impl<C: RaftCommandType + 'static> RaftCluster<C> {
         // Create role change broadcast channel
         let (role_change_tx, _role_change_rx) = broadcast::channel(100);
 
+        let executor_arc = Arc::new(executor);
         let cluster = RaftCluster {
             node_senders: node_senders.clone(),
             node_count: node_ids.len(),
             role_change_tx: role_change_tx.clone(),
             next_command_id: Arc::new(AtomicU64::new(1)),
+            executor: executor_arc.clone(),
         };
 
         // Create and start all nodes
@@ -101,8 +107,9 @@ impl<C: RaftCommandType + 'static> RaftCluster<C> {
                 }
             }
 
+            let executor_clone = executor_arc.clone();
             tokio::spawn(async move {
-                let mut node = match RaftNode::<C>::new(node_id, receiver, peers) {
+                let mut node = match RaftNode::<E>::new(node_id, receiver, peers, executor_clone) {
                     Ok(n) => n,
                     Err(e) => {
                         eprintln!("Failed to create RaftNode {}: {}", node_id, e);
@@ -122,8 +129,9 @@ impl<C: RaftCommandType + 'static> RaftCluster<C> {
         Ok(cluster)
     }
 
-    /// Generic method to propose any command that implements RaftCommandType
-    pub async fn propose_command(&self, command: C) -> Result<bool, Box<dyn std::error::Error>> {
+
+    /// Generic method to propose any command using the CommandExecutor pattern
+    pub async fn propose_command(&self, command: E::Command) -> Result<bool, Box<dyn std::error::Error>> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
 
         // Send to the first available node (in a real implementation, you'd route to the leader)
@@ -144,7 +152,7 @@ impl<C: RaftCommandType + 'static> RaftCluster<C> {
 
     /// Propose a command and wait until it's applied to the state machine
     /// Uses precise tracking with unique command IDs to wait for exact completion
-    pub async fn propose_and_sync(&self, command: C) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn propose_and_sync(&self, command: E::Command) -> Result<(), Box<dyn std::error::Error>> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
 
         // Send to the first available node (in a real implementation, you'd route to the leader)
@@ -284,10 +292,14 @@ mod tests {
         Noop,
     }
 
-    impl RaftCommandType for TestCommand {
-        fn apply(&self, _logger: &slog::Logger) -> Result<(), Box<dyn std::error::Error>> {
+    struct TestCommandExecutor;
+
+    impl CommandExecutor for TestCommandExecutor {
+        type Command = TestCommand;
+
+        fn apply(&self, command: &Self::Command, _logger: &slog::Logger) -> Result<(), Box<dyn std::error::Error>> {
             let state = get_test_state();
-            match self {
+            match command {
                 TestCommand::SetValue { key, value } => {
                     let mut map = state.lock().unwrap();
                     map.insert(key.clone(), value.clone());
@@ -306,7 +318,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_single_node_cluster_creation() {
-        let cluster = RaftCluster::<TestCommand>::new_single_node(1).await;
+        let executor = TestCommandExecutor;
+        let cluster = RaftCluster::new_single_node(1, executor).await;
         assert!(cluster.is_ok());
 
         let cluster = cluster.unwrap();
@@ -321,7 +334,8 @@ mod tests {
         // Clear any previous test state for this prefix
         clear_test_state_for_prefix(TEST_PREFIX);
 
-        let cluster = RaftCluster::<TestCommand>::new_single_node(1).await
+        let executor = TestCommandExecutor;
+        let cluster = RaftCluster::new_single_node(1, executor).await
             .expect("Failed to create single node cluster");
 
         // Wait for leadership establishment
@@ -420,7 +434,8 @@ mod tests {
         // Clear any previous test state for this prefix
         clear_test_state_for_prefix(TEST_PREFIX);
 
-        let cluster = RaftCluster::<TestCommand>::new_single_node(1).await
+        let executor = TestCommandExecutor;
+        let cluster = RaftCluster::new_single_node(1, executor).await
             .expect("Failed to create single node cluster");
 
         // Wait for leadership establishment
