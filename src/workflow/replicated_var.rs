@@ -10,18 +10,18 @@ use crate::workflow::execution::{WorkflowError, WorkflowRun, WorkflowContext};
 ///
 /// # Example Usage
 /// ```rust
-/// # use std::sync::Arc;
-/// # use raftoral::{RaftCluster, WorkflowCommand, WorkflowRuntime, ReplicatedVar};
+/// # use raftoral::{WorkflowRuntime, ReplicatedVar};
 /// #
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// # let cluster = Arc::new(RaftCluster::<WorkflowCommand>::new_single_node(1).await?);
-/// # let workflow_runtime = WorkflowRuntime::new(cluster);
+/// # let workflow_runtime = WorkflowRuntime::new_single_node(1).await?;
+/// # tokio::time::sleep(std::time::Duration::from_millis(100)).await; // Wait for leadership
 /// # let workflow_run = workflow_runtime.start("example_workflow").await?;
 /// let retry_count = ReplicatedVar::new("retry_count", &workflow_run, 0);
 /// let result = ReplicatedVar::new("result", &workflow_run, None::<String>);
 ///
 /// let _new_count = retry_count.set(1).await?;
 /// let _new_result = result.set(Some("success".to_string())).await?;
+/// # workflow_run.finish().await?;
 /// # Ok(())
 /// # }
 /// ```

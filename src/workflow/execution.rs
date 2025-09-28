@@ -291,95 +291,6 @@ impl WorkflowRuntime {
         subscription.wait_for_event(event_extractor, timeout_duration).await
     }
 
-    /// Start a workflow with the given ID
-    pub async fn start_workflow(
-        &self,
-        workflow_id: &str,
-        cluster: &RaftCluster<WorkflowCommandExecutor>
-    ) -> Result<(), WorkflowError> {
-        // Check if workflow already exists and is running
-        if let Some(status) = self.get_workflow_status(workflow_id) {
-            if status == WorkflowStatus::Running {
-                return Err(WorkflowError::AlreadyExists(workflow_id.to_string()));
-            }
-        }
-
-        // Use the reusable leader/follower pattern
-        let workflow_id_owned = workflow_id.to_string();
-        let cluster_ref = cluster;
-
-        self.execute_leader_follower_operation(
-            workflow_id,
-            cluster_ref,
-            || async {
-                // Leader operation: Propose WorkflowStart command
-                let command = WorkflowCommand::WorkflowStart {
-                    workflow_id: workflow_id_owned.clone(),
-                };
-
-                cluster_ref.propose_and_sync(command).await
-                    .map_err(|e| WorkflowError::ClusterError(e.to_string()))?;
-                Ok(())
-            },
-            |event| {
-                if matches!(event, WorkflowEvent::Started { .. }) {
-                    Some(())
-                } else {
-                    None
-                }
-            },
-            Some(Duration::from_secs(10)),
-        ).await
-    }
-
-    /// End a workflow with the given ID
-    pub async fn end_workflow(
-        &self,
-        workflow_id: &str,
-        cluster: &RaftCluster<WorkflowCommandExecutor>
-    ) -> Result<(), WorkflowError> {
-        // Check if workflow exists and is running
-        match self.get_workflow_status(workflow_id) {
-            Some(WorkflowStatus::Running) => {},
-            Some(WorkflowStatus::Completed) => return Ok(()), // Already completed
-            Some(_) => return Err(WorkflowError::ClusterError("Workflow is not running".to_string())),
-            None => return Err(WorkflowError::NotFound(workflow_id.to_string())),
-        }
-
-        // Use the reusable leader/follower pattern
-        let workflow_id_owned = workflow_id.to_string();
-        let cluster_ref = cluster;
-
-        self.execute_leader_follower_operation(
-            workflow_id,
-            cluster_ref,
-            || async {
-                // Leader operation: Propose WorkflowEnd command
-                let command = WorkflowCommand::WorkflowEnd {
-                    workflow_id: workflow_id_owned.clone(),
-                };
-
-                cluster_ref.propose_and_sync(command).await
-                    .map_err(|e| WorkflowError::ClusterError(e.to_string()))?;
-                Ok(())
-            },
-            |event| {
-                if matches!(event, WorkflowEvent::Completed { .. } | WorkflowEvent::Failed { .. }) {
-                    Some(())
-                } else {
-                    None
-                }
-            },
-            None, // Wait indefinitely
-        ).await?;
-
-        // Final state verification - check for failure after completion
-        match self.get_workflow_status(workflow_id) {
-            Some(WorkflowStatus::Completed) => Ok(()),
-            Some(WorkflowStatus::Failed) => Err(WorkflowError::ClusterError("Workflow failed".to_string())),
-            _ => Err(WorkflowError::ClusterError("Unexpected workflow state".to_string())),
-        }
-    }
 
     /// Set a replicated variable value (used by ReplicatedVar)
     pub async fn set_replicated_var<T>(
@@ -446,6 +357,16 @@ pub struct WorkflowContext {
     pub cluster: Arc<RaftCluster<WorkflowCommandExecutor>>,
 }
 
+impl std::fmt::Debug for WorkflowContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkflowContext")
+            .field("workflow_id", &self.workflow_id)
+            .field("cluster", &"<RaftCluster>")
+            .finish()
+    }
+}
+
+#[derive(Debug)]
 pub struct WorkflowRun {
     context: WorkflowContext,
     finished: bool,
@@ -457,9 +378,42 @@ impl WorkflowRun {
         workflow_id: &str,
         cluster: Arc<RaftCluster<WorkflowCommandExecutor>>
     ) -> Result<Self, WorkflowError> {
-        // Create a temporary runtime to start the workflow
+        // Create a temporary runtime to check status and start the workflow
         let runtime = WorkflowRuntime { cluster: cluster.clone() };
-        runtime.start_workflow(workflow_id, &cluster).await?;
+
+        // Check if workflow already exists and is running
+        if let Some(status) = runtime.get_workflow_status(workflow_id) {
+            if status == WorkflowStatus::Running {
+                return Err(WorkflowError::AlreadyExists(workflow_id.to_string()));
+            }
+        }
+
+        // Use the reusable leader/follower pattern to start the workflow
+        let workflow_id_owned = workflow_id.to_string();
+
+        runtime.execute_leader_follower_operation(
+            workflow_id,
+            &cluster,
+            || async {
+                // Leader operation: Propose WorkflowStart command
+                let command = WorkflowCommand::WorkflowStart {
+                    workflow_id: workflow_id_owned.clone(),
+                };
+
+                cluster.propose_and_sync(command).await
+                    .map_err(|e| WorkflowError::ClusterError(e.to_string()))?;
+                Ok(())
+            },
+            |event| {
+                if matches!(event, WorkflowEvent::Started { .. }) {
+                    Some(())
+                } else {
+                    None
+                }
+            },
+            Some(Duration::from_secs(10)),
+        ).await?;
+
         let context = WorkflowContext {
             workflow_id: workflow_id.to_string(),
             cluster,
@@ -488,9 +442,53 @@ impl WorkflowRun {
     /// Finish the workflow without a result
     pub async fn finish(mut self) -> Result<(), WorkflowError> {
         let runtime = WorkflowRuntime { cluster: self.context.cluster.clone() };
-        runtime.end_workflow(&self.context.workflow_id, &self.context.cluster).await?;
-        self.finished = true;
-        Ok(())
+
+        // Check if workflow exists and is running
+        match runtime.get_workflow_status(&self.context.workflow_id) {
+            Some(WorkflowStatus::Running) => {},
+            Some(WorkflowStatus::Completed) => {
+                self.finished = true;
+                return Ok(()); // Already completed
+            },
+            Some(_) => return Err(WorkflowError::ClusterError("Workflow is not running".to_string())),
+            None => return Err(WorkflowError::NotFound(self.context.workflow_id.to_string())),
+        }
+
+        // Use the reusable leader/follower pattern to end the workflow
+        let workflow_id_owned = self.context.workflow_id.clone();
+
+        runtime.execute_leader_follower_operation(
+            &self.context.workflow_id,
+            &self.context.cluster,
+            || async {
+                // Leader operation: Propose WorkflowEnd command
+                let command = WorkflowCommand::WorkflowEnd {
+                    workflow_id: workflow_id_owned.clone(),
+                };
+
+                self.context.cluster.propose_and_sync(command).await
+                    .map_err(|e| WorkflowError::ClusterError(e.to_string()))?;
+                Ok(())
+            },
+            |event| {
+                if matches!(event, WorkflowEvent::Completed { .. } | WorkflowEvent::Failed { .. }) {
+                    Some(())
+                } else {
+                    None
+                }
+            },
+            None, // Wait indefinitely
+        ).await?;
+
+        // Final state verification - check for failure after completion
+        match runtime.get_workflow_status(&self.context.workflow_id) {
+            Some(WorkflowStatus::Completed) => {
+                self.finished = true;
+                Ok(())
+            },
+            Some(WorkflowStatus::Failed) => Err(WorkflowError::ClusterError("Workflow failed".to_string())),
+            _ => Err(WorkflowError::ClusterError("Unexpected workflow state".to_string())),
+        }
     }
 
     /// Finish the workflow with a result value
@@ -499,20 +497,59 @@ impl WorkflowRun {
         T: serde::Serialize + for<'de> serde::Deserialize<'de> + Clone + Send + Sync + 'static,
     {
         let value = result_value;
-
         let runtime = WorkflowRuntime { cluster: self.context.cluster.clone() };
-        runtime.end_workflow(&self.context.workflow_id, &self.context.cluster).await?;
-        self.finished = true;
 
-        Ok(value)
+        // Check if workflow exists and is running
+        match runtime.get_workflow_status(&self.context.workflow_id) {
+            Some(WorkflowStatus::Running) => {},
+            Some(WorkflowStatus::Completed) => {
+                self.finished = true;
+                return Ok(value); // Already completed
+            },
+            Some(_) => return Err(WorkflowError::ClusterError("Workflow is not running".to_string())),
+            None => return Err(WorkflowError::NotFound(self.context.workflow_id.to_string())),
+        }
+
+        // Use the reusable leader/follower pattern to end the workflow
+        let workflow_id_owned = self.context.workflow_id.clone();
+
+        runtime.execute_leader_follower_operation(
+            &self.context.workflow_id,
+            &self.context.cluster,
+            || async {
+                // Leader operation: Propose WorkflowEnd command
+                let command = WorkflowCommand::WorkflowEnd {
+                    workflow_id: workflow_id_owned.clone(),
+                };
+
+                self.context.cluster.propose_and_sync(command).await
+                    .map_err(|e| WorkflowError::ClusterError(e.to_string()))?;
+                Ok(())
+            },
+            |event| {
+                if matches!(event, WorkflowEvent::Completed { .. } | WorkflowEvent::Failed { .. }) {
+                    Some(())
+                } else {
+                    None
+                }
+            },
+            None, // Wait indefinitely
+        ).await?;
+
+        // Final state verification - check for failure after completion
+        match runtime.get_workflow_status(&self.context.workflow_id) {
+            Some(WorkflowStatus::Completed) => {
+                self.finished = true;
+                Ok(value)
+            },
+            Some(WorkflowStatus::Failed) => Err(WorkflowError::ClusterError("Workflow failed".to_string())),
+            _ => Err(WorkflowError::ClusterError("Unexpected workflow state".to_string())),
+        }
     }
 
     /// End the workflow manually (for backward compatibility)
-    pub async fn end(mut self) -> Result<(), WorkflowError> {
-        let runtime = WorkflowRuntime { cluster: self.context.cluster.clone() };
-        runtime.end_workflow(&self.context.workflow_id, &self.context.cluster).await?;
-        self.finished = true;
-        Ok(())
+    pub async fn end(self) -> Result<(), WorkflowError> {
+        self.finish().await
     }
 }
 
@@ -559,40 +596,17 @@ impl std::fmt::Display for WorkflowError {
 
 impl std::error::Error for WorkflowError {}
 
-/// Start a workflow with the given ID (deprecated - use WorkflowRuntime directly)
-///
-/// This function is deprecated. Create a WorkflowRuntime and use its methods instead.
-pub async fn start_workflow(
-    _workflow_id: &str,
-    _cluster: &RaftCluster<WorkflowCommandExecutor>
-) -> Result<(), WorkflowError> {
-    Err(WorkflowError::ClusterError("This function is deprecated. Use WorkflowRuntime::new_single_node() instead.".to_string()))
-}
-
-/// End a workflow with the given ID (deprecated - use WorkflowRuntime directly)
-pub async fn end_workflow(
-    _workflow_id: &str,
-    _cluster: &RaftCluster<WorkflowCommandExecutor>
-) -> Result<(), WorkflowError> {
-    Err(WorkflowError::ClusterError("This function is deprecated. Use WorkflowRuntime::new_single_node() instead.".to_string()))
-}
 
 
 #[cfg(test)]
-#[allow(dead_code)]
 mod tests {
-    // All tests commented out - they use deprecated API that no longer works with CommandExecutor pattern
-    /*
     use super::*;
-    use crate::raft::generic::RaftCluster;
+    use std::time::Duration;
 
     #[tokio::test]
-    #[ignore] // Deprecated - uses old API
-    async fn test_start_workflow_single_node() {
-        clear_workflow_state();
-
-        let cluster = RaftCluster::<WorkflowCommand>::new_single_node(1).await
-            .expect("Failed to create single node cluster");
+    async fn test_workflow_runtime_start_workflow() {
+        let workflow_runtime = WorkflowRuntime::new_single_node(1).await
+            .expect("Failed to create workflow runtime");
 
         // Wait for leadership establishment
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -600,67 +614,151 @@ mod tests {
         let workflow_id = "test_workflow_1";
 
         // Start the workflow
-        let result = start_workflow(workflow_id, &cluster).await;
-        assert!(result.is_ok(), "Failed to start workflow: {:?}", result);
+        let workflow_run = workflow_runtime.start(workflow_id).await;
+        assert!(workflow_run.is_ok(), "Failed to start workflow: {:?}", workflow_run);
+
+        let workflow_run = workflow_run.unwrap();
 
         // Verify workflow is running
-        assert_eq!(get_workflow_status(workflow_id), Some(WorkflowStatus::Running));
+        assert_eq!(
+            workflow_runtime.get_workflow_status(workflow_id),
+            Some(WorkflowStatus::Running)
+        );
 
-        // Try to start the same workflow again (should fail)
-        let result = start_workflow(workflow_id, &cluster).await;
-        assert!(matches!(result, Err(WorkflowError::AlreadyExists(_))));
-    }
+        // Verify workflow ID is correct
+        assert_eq!(workflow_run.workflow_id(), workflow_id);
 
-    #[tokio::test]
-    #[ignore] // Deprecated - uses old API
-    async fn test_end_workflow_single_node() {
-        clear_workflow_state();
-
-        let cluster = RaftCluster::<WorkflowCommand>::new_single_node(1).await
-            .expect("Failed to create single node cluster");
-
-        // Wait for leadership establishment
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        let workflow_id = "test_workflow_2";
-
-        // Start the workflow
-        start_workflow(workflow_id, &cluster).await
-            .expect("Failed to start workflow");
-
-        // End the workflow
-        let result = end_workflow(workflow_id, &cluster).await;
-        assert!(result.is_ok(), "Failed to end workflow: {:?}", result);
+        // Finish the workflow
+        workflow_run.finish().await.expect("Failed to finish workflow");
 
         // Verify workflow is completed
-        assert_eq!(get_workflow_status(workflow_id), Some(WorkflowStatus::Completed));
+        assert_eq!(
+            workflow_runtime.get_workflow_status(workflow_id),
+            Some(WorkflowStatus::Completed)
+        );
     }
 
     #[tokio::test]
-    #[ignore] // Deprecated - uses old API
-    async fn test_workflow_lifecycle() {
-        clear_workflow_state();
-
-        let cluster = RaftCluster::<WorkflowCommand>::new_single_node(1).await
-            .expect("Failed to create single node cluster");
+    async fn test_workflow_runtime_duplicate_start() {
+        let workflow_runtime = WorkflowRuntime::new_single_node(1).await
+            .expect("Failed to create workflow runtime");
 
         // Wait for leadership establishment
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        let workflow_id = "test_workflow_3";
+        let workflow_id = "test_workflow_duplicate";
+
+        // Start the workflow
+        let workflow_run1 = workflow_runtime.start(workflow_id).await
+            .expect("Failed to start first workflow");
+
+        // Try to start the same workflow again (should fail)
+        let result = workflow_runtime.start(workflow_id).await;
+        assert!(matches!(result, Err(WorkflowError::AlreadyExists(_))),
+                "Expected AlreadyExists error, got: {:?}", result);
+
+        // Finish the first workflow
+        workflow_run1.finish().await.expect("Failed to finish workflow");
+    }
+
+    #[tokio::test]
+    async fn test_workflow_runtime_lifecycle() {
+        let workflow_runtime = WorkflowRuntime::new_single_node(1).await
+            .expect("Failed to create workflow runtime");
+
+        // Wait for leadership establishment
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let workflow_id = "test_workflow_lifecycle";
 
         // Initially, workflow should not exist
-        assert_eq!(get_workflow_status(workflow_id), None);
+        assert_eq!(workflow_runtime.get_workflow_status(workflow_id), None);
 
         // Start workflow
-        start_workflow(workflow_id, &cluster).await
+        let workflow_run = workflow_runtime.start(workflow_id).await
             .expect("Failed to start workflow");
-        assert_eq!(get_workflow_status(workflow_id), Some(WorkflowStatus::Running));
+        assert_eq!(
+            workflow_runtime.get_workflow_status(workflow_id),
+            Some(WorkflowStatus::Running)
+        );
 
         // End workflow
-        end_workflow(workflow_id, &cluster).await
-            .expect("Failed to end workflow");
-        assert_eq!(get_workflow_status(workflow_id), Some(WorkflowStatus::Completed));
+        workflow_run.finish().await.expect("Failed to finish workflow");
+        assert_eq!(
+            workflow_runtime.get_workflow_status(workflow_id),
+            Some(WorkflowStatus::Completed)
+        );
     }
-    */
+
+    #[tokio::test]
+    async fn test_workflow_runtime_multiple_workflows() {
+        let workflow_runtime = WorkflowRuntime::new_single_node(1).await
+            .expect("Failed to create workflow runtime");
+
+        // Wait for leadership establishment
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let workflow_id1 = "test_workflow_multi_1";
+        let workflow_id2 = "test_workflow_multi_2";
+
+        // Start both workflows
+        let workflow_run1 = workflow_runtime.start(workflow_id1).await
+            .expect("Failed to start workflow 1");
+        let workflow_run2 = workflow_runtime.start(workflow_id2).await
+            .expect("Failed to start workflow 2");
+
+        // Both should be running
+        assert_eq!(
+            workflow_runtime.get_workflow_status(workflow_id1),
+            Some(WorkflowStatus::Running)
+        );
+        assert_eq!(
+            workflow_runtime.get_workflow_status(workflow_id2),
+            Some(WorkflowStatus::Running)
+        );
+
+        // Finish first workflow
+        workflow_run1.finish().await.expect("Failed to finish workflow 1");
+        assert_eq!(
+            workflow_runtime.get_workflow_status(workflow_id1),
+            Some(WorkflowStatus::Completed)
+        );
+        assert_eq!(
+            workflow_runtime.get_workflow_status(workflow_id2),
+            Some(WorkflowStatus::Running)
+        );
+
+        // Finish second workflow
+        workflow_run2.finish().await.expect("Failed to finish workflow 2");
+        assert_eq!(
+            workflow_runtime.get_workflow_status(workflow_id2),
+            Some(WorkflowStatus::Completed)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_workflow_runtime_finish_with_value() {
+        let workflow_runtime = WorkflowRuntime::new_single_node(1).await
+            .expect("Failed to create workflow runtime");
+
+        // Wait for leadership establishment
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let workflow_id = "test_workflow_finish_with";
+
+        // Start workflow
+        let workflow_run = workflow_runtime.start(workflow_id).await
+            .expect("Failed to start workflow");
+
+        // Finish with a result value
+        let result_value = 42i32;
+        let returned_value = workflow_run.finish_with(result_value).await
+            .expect("Failed to finish workflow with value");
+
+        assert_eq!(returned_value, result_value);
+        assert_eq!(
+            workflow_runtime.get_workflow_status(workflow_id),
+            Some(WorkflowStatus::Completed)
+        );
+    }
 }
