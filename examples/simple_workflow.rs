@@ -16,23 +16,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Started workflow: {}", workflow_id);
 
-    // Create a replicated variable to store our computation result
-    let result_var = ReplicatedVar::new("result", &workflow_run, 0i32);
+    // Create and initialize a replicated variable with direct computation
+    let result_var = ReplicatedVar::with_computation(
+        "result",
+        &workflow_run,
+        || async {
+            // Some "complex" computation
+            println!("Performing computation...");
+            42 + 58
+        }
+    ).await?;
 
-    // Simulate some computation and store the result
-    let computation_result = 42 + 58; // Some "complex" computation
-    let stored_result = result_var.set(computation_result).await?;
+    println!("Stored computation result: {}", result_var.get());
 
-    println!("Stored computation result: {}", stored_result);
+    // Create another replicated variable for a message using direct value
+    let message_var = ReplicatedVar::with_value(
+        "message",
+        &workflow_run,
+        "Workflow completed successfully!".to_string()
+    ).await?;
 
-    // Create another replicated variable for a message
-    let message_var = ReplicatedVar::new("message", &workflow_run, String::new());
-    let message = message_var.set("Workflow completed successfully!".to_string()).await?;
-
-    println!("Message: {}", message);
+    println!("Message: {}", message_var.get());
 
     // End the workflow with the computed result
-    let final_result: i32 = workflow_run.finish_with(stored_result).await?;
+    let final_result: i32 = workflow_run.finish_with(result_var.get()).await?;
 
     println!("Workflow '{}' completed with result: {:?}!", workflow_id, final_result);
 
