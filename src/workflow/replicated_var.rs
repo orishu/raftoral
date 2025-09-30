@@ -1,4 +1,3 @@
-use std::marker::PhantomData;
 use std::future::Future;
 use serde::{Serialize, Deserialize};
 use crate::workflow::execution::{WorkflowError, WorkflowRun, WorkflowContext};
@@ -61,8 +60,6 @@ pub struct ReplicatedVar<T> {
     context: WorkflowContext,
     /// The current value (cached after initialization/updates)
     value: T,
-    /// Phantom data to ensure type safety
-    _phantom: PhantomData<T>,
 }
 
 impl<T> ReplicatedVar<T>
@@ -90,7 +87,7 @@ where
         use crate::workflow::execution::WorkflowRuntime;
 
         let context = workflow_run.context().clone();
-        let runtime = WorkflowRuntime { cluster: context.cluster.clone() };
+        let runtime = WorkflowRuntime::_create_temporary(context.cluster.clone());
 
         // Store the value in Raft
         let stored_value = runtime.set_replicated_var(
@@ -104,7 +101,6 @@ where
             key: key.to_string(),
             context,
             value: stored_value,
-            _phantom: PhantomData,
         })
     }
 
@@ -134,7 +130,7 @@ where
         use crate::workflow::execution::WorkflowRuntime;
 
         let context = workflow_run.context().clone();
-        let runtime = WorkflowRuntime { cluster: context.cluster.clone() };
+        let runtime = WorkflowRuntime::_create_temporary(context.cluster.clone());
 
         // Execute the computation
         let computed_value = computation().await;
@@ -151,7 +147,6 @@ where
             key: key.to_string(),
             context,
             value: stored_value,
-            _phantom: PhantomData,
         })
     }
 
@@ -180,7 +175,7 @@ where
     {
         use crate::workflow::execution::WorkflowRuntime;
 
-        let runtime = WorkflowRuntime { cluster: self.context.cluster.clone() };
+        let runtime = WorkflowRuntime::_create_temporary(self.context.cluster.clone());
 
         // Apply the update function
         let new_value = updater(self.value.clone());
@@ -213,7 +208,7 @@ where
     pub async fn set(&mut self, value: T) -> Result<T, WorkflowError> {
         use crate::workflow::execution::WorkflowRuntime;
 
-        let runtime = WorkflowRuntime { cluster: self.context.cluster.clone() };
+        let runtime = WorkflowRuntime::_create_temporary(self.context.cluster.clone());
 
         // Store the new value in Raft
         let stored_value = runtime.set_replicated_var(
@@ -250,7 +245,6 @@ where
             key: key.to_string(),
             context: workflow_run.context().clone(),
             value: initial_value,
-            _phantom: PhantomData,
         }
     }
 
@@ -276,7 +270,6 @@ where
             key: self.key.clone(),
             context: self.context.clone(),
             value: self.value.clone(),
-            _phantom: PhantomData,
         }
     }
 }
