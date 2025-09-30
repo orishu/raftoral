@@ -1,8 +1,8 @@
+use std::any::Any;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use serde::{Serialize, Deserialize};
 use crate::workflow::execution::{WorkflowError, WorkflowContext};
 
 /// A trait for workflow functions that can be registered and executed
@@ -11,8 +11,8 @@ use crate::workflow::execution::{WorkflowError, WorkflowContext};
 /// Workflow functions take serializable input parameters and return serializable results.
 pub trait WorkflowFunction<I, O>: Send + Sync + 'static
 where
-    I: for<'de> Deserialize<'de> + Send + 'static,
-    O: Serialize + Send + 'static,
+    I: Send + 'static,
+    O: Send + 'static,
 {
     /// Execute the workflow function with the given input and context
     fn execute(
@@ -25,34 +25,33 @@ where
 /// A type-erased wrapper for workflow functions to enable storage in collections
 pub struct BoxedWorkflowFunction {
     /// The actual function that executes the workflow
-    executor: Box<dyn Fn(serde_json::Value, WorkflowContext) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, WorkflowError>> + Send>> + Send + Sync>,
+    executor: Box<dyn Fn(Box<dyn Any + Send>, WorkflowContext) -> Pin<Box<dyn Future<Output = Result<Box<dyn Any + Send>, WorkflowError>> + Send>> + Send + Sync>,
 }
 
 impl BoxedWorkflowFunction {
     /// Create a new boxed workflow function from a typed workflow function
     pub fn new<I, O, F>(func: F) -> Self
     where
-        I: for<'de> Deserialize<'de> + Send + 'static,
-        O: Serialize + Send + 'static,
+        I: Send + 'static,
+        O: Send + 'static,
         F: WorkflowFunction<I, O>,
     {
         let func = Arc::new(func);
-        let executor = Box::new(move |input_json: serde_json::Value, context: WorkflowContext| {
+        let executor = Box::new(move |input_any: Box<dyn Any + Send>, context: WorkflowContext| {
             let func = func.clone();
             Box::pin(async move {
-                // Deserialize input
-                let input: I = serde_json::from_value(input_json)
-                    .map_err(|e| WorkflowError::ClusterError(format!("Failed to deserialize workflow input: {}", e)))?;
+                // Downcast input from Any
+                let input: I = *input_any.downcast::<I>()
+                    .map_err(|_| WorkflowError::ClusterError("Failed to downcast workflow input".to_string()))?;
 
                 // Execute workflow
                 let output = func.execute(input, context).await?;
 
-                // Serialize output
-                let output_json = serde_json::to_value(output)
-                    .map_err(|e| WorkflowError::ClusterError(format!("Failed to serialize workflow output: {}", e)))?;
+                // Box output as Any
+                let output_any: Box<dyn Any + Send> = Box::new(output);
 
-                Ok(output_json)
-            }) as Pin<Box<dyn Future<Output = Result<serde_json::Value, WorkflowError>> + Send>>
+                Ok(output_any)
+            }) as Pin<Box<dyn Future<Output = Result<Box<dyn Any + Send>, WorkflowError>> + Send>>
         });
 
         BoxedWorkflowFunction { executor }
@@ -61,9 +60,9 @@ impl BoxedWorkflowFunction {
     /// Execute the boxed workflow function
     pub async fn execute(
         &self,
-        input: serde_json::Value,
+        input: Box<dyn Any + Send>,
         context: WorkflowContext,
-    ) -> Result<serde_json::Value, WorkflowError> {
+    ) -> Result<Box<dyn Any + Send>, WorkflowError> {
         (self.executor)(input, context).await
     }
 }
@@ -103,8 +102,8 @@ impl WorkflowRegistry {
         function: F,
     ) -> Result<(), WorkflowError>
     where
-        I: for<'de> Deserialize<'de> + Send + 'static,
-        O: Serialize + Send + 'static,
+        I: Send + 'static,
+        O: Send + 'static,
         F: WorkflowFunction<I, O>,
     {
         let key = (workflow_type.to_string(), version);
@@ -139,8 +138,8 @@ impl WorkflowRegistry {
         function: F,
     ) -> Result<(), WorkflowError>
     where
-        I: for<'de> Deserialize<'de> + Send + Sync + 'static,
-        O: Serialize + Send + Sync + 'static,
+        I: Send + Sync + 'static,
+        O: Send + Sync + 'static,
         F: Fn(I, WorkflowContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<O, WorkflowError>> + Send + Sync + 'static,
     {
@@ -155,8 +154,8 @@ impl WorkflowRegistry {
 
         impl<I, O, F, Fut> WorkflowFunction<I, O> for ClosureWorkflow<I, O, F, Fut>
         where
-            I: for<'de> Deserialize<'de> + Send + Sync + 'static,
-            O: Serialize + Send + Sync + 'static,
+            I: Send + Sync + 'static,
+            O: Send + Sync + 'static,
             F: Fn(I, WorkflowContext) -> Fut + Send + Sync + 'static,
             Fut: Future<Output = Result<O, WorkflowError>> + Send + Sync + 'static,
         {
@@ -216,14 +215,14 @@ impl WorkflowRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde::{Serialize, Deserialize};
+    use std::any::Any;
 
-    #[derive(Serialize, Deserialize)]
+    #[derive(Clone, Debug, PartialEq)]
     struct TestInput {
         value: i32,
     }
 
-    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    #[derive(Clone, Debug, PartialEq)]
     struct TestOutput {
         result: i32,
     }
@@ -287,7 +286,7 @@ mod tests {
 
         // Create test input
         let input = TestInput { value: 21 };
-        let input_json = serde_json::to_value(input).unwrap();
+        let input_any: Box<dyn Any + Send> = Box::new(input);
 
         // Create mock context using WorkflowRuntime
         let workflow_runtime = crate::workflow::execution::WorkflowRuntime::new_single_node(1).await.unwrap();
@@ -297,8 +296,8 @@ mod tests {
         };
 
         // Execute workflow
-        let result = workflow.execute(input_json, context).await.unwrap();
-        let output: TestOutput = serde_json::from_value(result).unwrap();
+        let result = workflow.execute(input_any, context).await.unwrap();
+        let output = *result.downcast::<TestOutput>().unwrap();
 
         assert_eq!(output.result, 42);
     }

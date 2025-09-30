@@ -2,7 +2,9 @@ use crate::raft::generic::RaftCluster;
 use crate::raft::generic::message::CommandExecutor;
 use crate::workflow::registry::WorkflowRegistry;
 use serde::{Deserialize, Serialize};
+use std::any::Any;
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -142,6 +144,8 @@ pub struct WorkflowState {
 pub struct WorkflowRuntime {
     pub cluster: Arc<RaftCluster<WorkflowCommandExecutor>>,
     registry: Arc<Mutex<WorkflowRegistry>>,
+    /// In-memory store for workflow results (not replicated via Raft)
+    results: Arc<Mutex<HashMap<String, Box<dyn Any + Send + Sync>>>>,
 }
 
 impl std::fmt::Debug for WorkflowRuntime {
@@ -149,6 +153,7 @@ impl std::fmt::Debug for WorkflowRuntime {
         f.debug_struct("WorkflowRuntime")
             .field("cluster", &"Arc<RaftCluster<WorkflowCommandExecutor>>")
             .field("registry", &"Arc<Mutex<WorkflowRegistry>>")
+            .field("results", &"Arc<Mutex<HashMap<String, Box<dyn Any + Send + Sync>>>>")
             .finish()
     }
 }
@@ -217,6 +222,7 @@ impl WorkflowRuntime {
         let runtime = Arc::new(WorkflowRuntime {
             cluster,
             registry: Arc::new(Mutex::new(WorkflowRegistry::new())),
+            results: Arc::new(Mutex::new(HashMap::new())),
         });
 
         Ok(runtime)
@@ -420,10 +426,10 @@ impl WorkflowRuntime {
         workflow_type: &str,
         version: u32,
         input: I,
-    ) -> Result<WorkflowRun, WorkflowError>
+    ) -> Result<TypedWorkflowRun<O>, WorkflowError>
     where
-        I: serde::Serialize + for<'de> serde::Deserialize<'de> + Send + 'static,
-        O: serde::Serialize + for<'de> serde::Deserialize<'de> + Clone + Send + Sync + 'static,
+        I: Send + 'static,
+        O: Clone + Send + Sync + 'static,
     {
         // Look up the workflow function
         let workflow_function = {
@@ -449,24 +455,23 @@ impl WorkflowRuntime {
 
         // Execute the workflow function in the background
         let runtime_clone = self.clone();
-        let input_json = serde_json::to_value(input)
-            .map_err(|e| WorkflowError::ClusterError(format!("Failed to serialize input: {}", e)))?;
+        let input_any: Box<dyn std::any::Any + Send> = Box::new(input);
 
         tokio::spawn(async move {
             // Create a WorkflowRun for the background task to use for finishing
             let bg_workflow_run = WorkflowRun::for_existing(&workflow_id, runtime_clone);
 
             // Execute the workflow function
-            match workflow_function.execute(input_json, context).await {
-                Ok(output_json) => {
-                    // Parse the output to the expected type
-                    if let Ok(output) = serde_json::from_value::<O>(output_json) {
+            match workflow_function.execute(input_any, context).await {
+                Ok(output_any) => {
+                    // Downcast the output to the expected type
+                    if let Ok(output) = output_any.downcast::<O>() {
                         // Finish the workflow with the result using finish_with
-                        if let Err(e) = bg_workflow_run.finish_with(output).await {
+                        if let Err(e) = bg_workflow_run.finish_with(*output).await {
                             eprintln!("Failed to finish workflow {} with result: {}", workflow_id, e);
                         }
                     } else {
-                        eprintln!("Failed to deserialize workflow output for {}", workflow_id);
+                        eprintln!("Failed to downcast workflow output for {}", workflow_id);
                         // Try to finish anyway
                         if let Err(e) = bg_workflow_run.finish().await {
                             eprintln!("Failed to finish failed workflow {}: {}", workflow_id, e);
@@ -483,7 +488,7 @@ impl WorkflowRuntime {
             }
         });
 
-        Ok(workflow_run)
+        Ok(TypedWorkflowRun::new(workflow_run))
     }
 
     /// Check if a workflow type and version is registered
@@ -505,6 +510,29 @@ impl WorkflowRuntime {
         WorkflowRuntime {
             cluster,
             registry: Arc::new(Mutex::new(WorkflowRegistry::new())),
+            results: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Store a workflow result (internal use)
+    pub(crate) fn store_result<T>(&self, workflow_id: &str, result: T)
+    where
+        T: Send + Sync + 'static,
+    {
+        let mut results = self.results.lock().unwrap();
+        results.insert(workflow_id.to_string(), Box::new(result));
+    }
+
+    /// Retrieve a workflow result (internal use)
+    pub(crate) fn get_result<T>(&self, workflow_id: &str) -> Option<T>
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        let mut results = self.results.lock().unwrap();
+        if let Some(boxed_result) = results.remove(workflow_id) {
+            boxed_result.downcast::<T>().ok().map(|boxed| *boxed)
+        } else {
+            None
         }
     }
 }
@@ -670,7 +698,7 @@ impl WorkflowRun {
     /// Finish the workflow with a result value
     pub async fn finish_with<T>(mut self, result_value: T) -> Result<T, WorkflowError>
     where
-        T: serde::Serialize + for<'de> serde::Deserialize<'de> + Clone + Send + Sync + 'static,
+        T: Clone + Send + Sync + 'static,
     {
         let value = result_value;
 
@@ -684,6 +712,9 @@ impl WorkflowRun {
             Some(_) => return Err(WorkflowError::ClusterError("Workflow is not running".to_string())),
             None => return Err(WorkflowError::NotFound(self.context.workflow_id.to_string())),
         }
+
+        // Store the result for later retrieval
+        self.runtime.store_result(&self.context.workflow_id, value.clone());
 
         // Use the reusable leader/follower pattern to end the workflow
         let workflow_id_owned = self.context.workflow_id.clone();
@@ -773,12 +804,6 @@ impl WorkflowRun {
         }
     }
 
-    /// Mark the workflow as finished without sending a WorkflowEnd command
-    /// This is used when the workflow has already been ended by another process
-    pub fn mark_as_finished(&mut self) {
-        self.finished = true;
-    }
-
     /// End the workflow manually (for backward compatibility)
     pub async fn end(self) -> Result<(), WorkflowError> {
         self.finish().await
@@ -796,6 +821,50 @@ impl Drop for WorkflowRun {
             );
         }
         // If finished = true, workflow was already properly ended, so it's safe to drop
+    }
+}
+
+/// A typed wrapper for WorkflowRun that preserves the output type from start_workflow_typed
+/// This allows wait_for_completion to return the correctly typed result
+#[derive(Debug)]
+pub struct TypedWorkflowRun<O> {
+    inner: WorkflowRun,
+    _phantom: PhantomData<O>,
+}
+
+impl<O> TypedWorkflowRun<O>
+where
+    O: Clone + Send + Sync + 'static,
+{
+    /// Create a new TypedWorkflowRun from a WorkflowRun
+    pub(crate) fn new(inner: WorkflowRun) -> Self {
+        Self {
+            inner,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Get the workflow ID
+    pub fn workflow_id(&self) -> &str {
+        self.inner.workflow_id()
+    }
+
+    /// Get the workflow context
+    pub fn context(&self) -> &WorkflowContext {
+        self.inner.context()
+    }
+
+    /// Wait for the workflow to complete and return the typed result
+    /// This method waits for the workflow to finish naturally and returns the result
+    pub async fn wait_for_completion(mut self) -> Result<O, WorkflowError> {
+        // First wait for the workflow to complete using the inner wait_for_completion
+        self.inner.wait_for_completion().await?;
+
+        // Now retrieve the result from the runtime's result store
+        match self.inner.runtime.get_result::<O>(&self.inner.context.workflow_id) {
+            Some(result) => Ok(result),
+            None => Err(WorkflowError::ClusterError("Workflow result not found".to_string())),
+        }
     }
 }
 
@@ -1054,34 +1123,20 @@ mod tests {
 
         // Test starting a typed workflow - this now actually executes the workflow function
         let input = FibonacciInput { n: 10 };
-        let mut workflow_run = workflow_runtime.start_workflow_typed::<FibonacciInput, FibonacciOutput>("fibonacci", 1, input).await
+        let workflow_run = workflow_runtime.start_workflow_typed::<FibonacciInput, FibonacciOutput>("fibonacci", 1, input).await
             .expect("Failed to start typed workflow");
 
         // Verify the workflow was started (it has a generated ID)
         assert!(workflow_run.workflow_id().starts_with("fibonacci_v1_"));
 
-        // Give the background execution a moment to complete
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Give the background task a moment to start
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Check if the workflow completed automatically in the background
-        let status = workflow_runtime.get_workflow_status(workflow_run.workflow_id());
-        println!("Workflow status after delay: {:?}", status);
+        // Wait for the workflow to complete and get the result
+        let result = workflow_run.wait_for_completion().await.expect("Failed to wait for workflow completion");
 
-        if status == Some(WorkflowStatus::Completed) {
-            // Workflow already completed in background - just mark it as finished to avoid panic on drop
-            workflow_run.mark_as_finished();
-            println!("✅ Workflow completed automatically in the background!");
-        } else {
-            // Wait for the workflow to complete naturally - the background execution should call finish_with()
-            match workflow_run.wait_for_completion().await {
-                Ok(()) => println!("✅ Workflow completed via wait_for_completion!"),
-                Err(e) => {
-                    let final_status = workflow_runtime.get_workflow_status(workflow_run.workflow_id());
-                    println!("Wait failed: {}. Final status: {:?}", e, final_status);
-                    panic!("Failed to wait for workflow completion: {}", e);
-                }
-            }
-        }
+        // Verify the result is correct (10th Fibonacci number)
+        assert_eq!(result.result, 55);
 
         println!("✅ Workflow registry integration test completed successfully!");
     }

@@ -1,5 +1,5 @@
 use std::time::Duration;
-use raftoral::{WorkflowRuntime, ReplicatedVar};
+use raftoral::{WorkflowRuntime, WorkflowRun, ReplicatedVar};
 
 async fn compute_fibonacci(n: u32) -> u32 {
     // Simulate some computation time
@@ -21,12 +21,12 @@ async fn compute_fibonacci(n: u32) -> u32 {
     }
 }
 
-async fn fibonacci_workflow(workflow_runtime: &WorkflowRuntime, n: u32) -> Result<u32, Box<dyn std::error::Error>> {
+async fn fibonacci_workflow(workflow_runtime: &std::sync::Arc<WorkflowRuntime>, n: u32) -> Result<u32, Box<dyn std::error::Error>> {
     let workflow_id = format!("fibonacci_{}", n);
 
     // This block demonstrates automatic cleanup - WorkflowRun will auto-end when dropped
     {
-        let workflow_run = workflow_runtime.start(&workflow_id).await?;
+        let workflow_run = WorkflowRun::start(&workflow_id, workflow_runtime).await?;
 
         // Store the input parameter using direct value
         let _input_var = ReplicatedVar::with_value("input", &workflow_run, n).await?;
@@ -51,7 +51,7 @@ async fn fibonacci_workflow(workflow_runtime: &WorkflowRuntime, n: u32) -> Resul
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create a workflow runtime with integrated cluster
-    let workflow_runtime = WorkflowRuntime::new_single_node(1).await?;
+    let workflow_runtime = std::sync::Arc::new(WorkflowRuntime::new_single_node(1).await?);
 
     // Wait for leadership establishment
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -66,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Demonstrate explicit workflow finish with update functionality
     {
-        let workflow_run = workflow_runtime.start("test_early_exit").await?;
+        let workflow_run = WorkflowRun::start("test_early_exit", &workflow_runtime).await?;
 
         // Start with a counter using the new interface
         let mut counter = ReplicatedVar::with_value("counter", &workflow_run, 0i32).await?;
