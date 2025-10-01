@@ -16,7 +16,7 @@ use crate::workflow::execution::{WorkflowError, WorkflowRun};
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// # let workflow_runtime = WorkflowRuntime::new_single_node(1).await?;
 /// # tokio::time::sleep(std::time::Duration::from_millis(100)).await; // Wait for leadership
-/// # let workflow_run = workflow_runtime.start("example_workflow").await?;
+/// # let workflow_run = workflow_runtime.start("example_workflow", ()).await?;
 ///
 /// // Direct value initialization - value is immediately stored in Raft
 /// let mut counter = ReplicatedVar::with_value("counter", &workflow_run, 42).await?;
@@ -40,7 +40,7 @@ use crate::workflow::execution::{WorkflowError, WorkflowRun};
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// # let workflow_runtime = WorkflowRuntime::new_single_node(1).await?;
 /// # tokio::time::sleep(std::time::Duration::from_millis(100)).await; // Wait for leadership
-/// # let workflow_run = workflow_runtime.start("example_workflow").await?;
+/// # let workflow_run = workflow_runtime.start("example_workflow", ()).await?;
 ///
 /// // Computed value - lambda is executed and result stored in Raft
 /// let computed_result = ReplicatedVar::with_computation(
@@ -183,57 +183,6 @@ where
         Ok(stored_value)
     }
 
-    /// Set a new value for this replicated variable (legacy method)
-    ///
-    /// This method exists for backward compatibility. Consider using
-    /// `with_value()` for new code.
-    ///
-    /// # Arguments
-    /// * `value` - The new value to set
-    ///
-    /// # Returns
-    /// * `Ok(T)` with the value if the operation was successful
-    /// * `Err(WorkflowError)` if the operation failed
-    pub async fn set(&mut self, value: T) -> Result<T, WorkflowError> {
-        // Store the new value in Raft using the workflow run's runtime
-        let stored_value = self.workflow_run.runtime.set_replicated_var(
-            &self.workflow_run.context.workflow_id,
-            &self.key,
-            value,
-            &self.workflow_run.runtime.cluster
-        ).await?;
-
-        // Update the local cache
-        self.value = stored_value.clone();
-
-        Ok(stored_value)
-    }
-
-    /// Create a new ReplicatedVar without initializing (legacy method)
-    ///
-    /// This method exists for backward compatibility. Consider using
-    /// `with_value()` or `with_computation()` for new code.
-    ///
-    /// # Arguments
-    /// * `key` - Unique identifier for this variable within the workflow
-    /// * `workflow_run` - Reference to the workflow this variable belongs to
-    /// * `initial_value` - Default value (used as placeholder)
-    ///
-    /// # Returns
-    /// A new ReplicatedVar instance (value not yet stored in Raft)
-    pub fn new(
-        key: &str,
-        workflow_run: &Arc<WorkflowRun>,
-        initial_value: T,
-    ) -> Self {
-        ReplicatedVar {
-            key: key.to_string(),
-            workflow_run: workflow_run.clone(),
-            value: initial_value,
-        }
-    }
-
-
 
     /// Get the key used for this replicated variable
     pub fn key(&self) -> &str {
@@ -368,12 +317,12 @@ mod tests {
         assert_eq!(api_result.get(), Ok("initial".to_string()));
 
         // Update to error state
-        let returned_error = api_result.set(Err("Network error".to_string())).await.expect("Failed to set error result");
+        let returned_error = api_result.update(|_| Err("Network error".to_string())).await.expect("Failed to update to error result");
         assert_eq!(returned_error, Err("Network error".to_string()));
         assert_eq!(api_result.get(), Err("Network error".to_string()));
 
         // Update to success state
-        let returned_success = api_result.set(Ok("Success!".to_string())).await.expect("Failed to set success result");
+        let returned_success = api_result.update(|_| Ok("Success!".to_string())).await.expect("Failed to update to success result");
         assert_eq!(returned_success, Ok("Success!".to_string()));
         assert_eq!(api_result.get(), Ok("Success!".to_string()));
 

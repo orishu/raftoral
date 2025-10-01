@@ -1,5 +1,4 @@
 use std::time::Duration;
-use std::sync::Arc;
 use raftoral::{WorkflowRuntime, ReplicatedVar};
 
 #[tokio::main]

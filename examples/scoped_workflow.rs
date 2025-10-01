@@ -24,7 +24,6 @@ async fn compute_fibonacci(n: u32) -> u32 {
 async fn fibonacci_workflow(workflow_runtime: &std::sync::Arc<WorkflowRuntime>, n: u32) -> Result<u32, Box<dyn std::error::Error>> {
     let workflow_id = format!("fibonacci_{}", n);
 
-    // This block demonstrates automatic cleanup - WorkflowRun will auto-end when dropped
     {
         let workflow_run = WorkflowRun::start(&workflow_id, workflow_runtime, n).await?;
 
@@ -41,13 +40,10 @@ async fn fibonacci_workflow(workflow_runtime: &std::sync::Arc<WorkflowRuntime>, 
             }
         ).await?;
 
-        // Return the result (workflow ends here)
         let result = result_var.get();
         workflow_run.finish_with(result).await?;
         return Ok(result);
     }
-    // WorkflowRun goes out of scope here and the workflow would be automatically ended
-    // But we already called finish_with() so it's already ended
 }
 
 #[tokio::main]
@@ -80,9 +76,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Counter value via get(): {}", counter.get());
 
         workflow_run.finish_with(()).await?;
-
-        println!("Workflow finished explicitly (no auto-cleanup needed)...");
-        // WorkflowRun is already finished, so Drop won't panic
     }
 
     println!("All workflows completed!");

@@ -99,18 +99,6 @@ impl WorkflowCommandExecutor {
         let _ = self.event_tx.send(event);
     }
 
-    fn emit_failed_event(&self, workflow_id: &str, error: Vec<u8>) {
-        let mut state = self.state.lock().unwrap();
-        state.workflows.insert(workflow_id.to_string(), WorkflowStatus::Failed);
-        drop(state);
-
-        let event = WorkflowEvent::Failed {
-            workflow_id: workflow_id.to_string(),
-            error,
-        };
-        let _ = self.event_tx.send(event);
-    }
-
     fn emit_checkpoint_event(&self, workflow_id: &str, key: &str, value: Vec<u8>) {
         let event = WorkflowEvent::CheckpointSet {
             workflow_id: workflow_id.to_string(),
@@ -191,7 +179,7 @@ impl CommandExecutor for WorkflowCommandExecutor {
                             let input_any: Box<dyn std::any::Any + Send> = Box::new(input_bytes);
 
                             match workflow_function.execute(input_any, context).await {
-                                Ok(output_any) => {
+                                Ok(_output_any) => {
                                     // Serialize the output
                                     // Note: The workflow function should call finish_with() which will
                                     // propose WorkflowEnd, so we don't need to do anything here
@@ -200,9 +188,7 @@ impl CommandExecutor for WorkflowCommandExecutor {
                                                "workflow_id" => &workflow_id);
                                 },
                                 Err(e) => {
-                                    eprintln!("Workflow {} failed: {}", workflow_id, e);
-                                    // On error, we should propose WorkflowEnd with error
-                                    // For now, just log the error
+                                    eprintln!("Workflow {} failed during execution: {}", workflow_id, e);
                                 }
                             }
                         });
@@ -211,10 +197,6 @@ impl CommandExecutor for WorkflowCommandExecutor {
             },
             WorkflowCommand::WorkflowEnd(data) => {
                 slog::info!(logger, "Ended workflow"; "workflow_id" => &data.workflow_id);
-
-                // Deserialize the result to determine if it's success or failure
-                // For now, we'll just treat all WorkflowEnd as Completed
-                // In a full implementation, we'd deserialize Result<T, E> and check
                 self.emit_completed_event(&data.workflow_id, data.result.clone());
             },
             WorkflowCommand::SetCheckpoint(data) => {
@@ -223,7 +205,6 @@ impl CommandExecutor for WorkflowCommandExecutor {
                            "key" => &data.key,
                            "value_size" => data.value.len());
 
-                // Emit event for subscribers (followers waiting for this checkpoint)
                 self.emit_checkpoint_event(&data.workflow_id, &data.key, data.value.clone());
             },
         }
@@ -636,44 +617,6 @@ impl WorkflowRuntime {
         let registry = registry.lock().unwrap();
         registry.list_workflows()
     }
-
-
-
-
-    /// Finish a workflow without requiring a WorkflowRun instance (internal use)
-    async fn finish_workflow<T, E>(&self, workflow_id: &str, result: Result<T, E>) -> Result<(), WorkflowError>
-    where
-        T: serde::Serialize + Send + 'static,
-        E: serde::Serialize + Send + 'static,
-    {
-        // Serialize the result
-        let result_bytes = serde_json::to_vec(&result).map_err(|e| WorkflowError::SerializationError(e.to_string()))?;
-
-        // Use the reusable leader/follower pattern to end the workflow
-        self.execute_leader_follower_operation(
-            workflow_id,
-            &self.cluster,
-            || async {
-                // Leader operation: Propose WorkflowEnd command with result
-                let command = WorkflowCommand::WorkflowEnd(WorkflowEndData {
-                    workflow_id: workflow_id.to_string(),
-                    result: result_bytes.clone(),  // Include the serialized result
-                });
-
-                self.cluster.propose_and_sync(command).await
-                    .map_err(|e| WorkflowError::ClusterError(e.to_string()))?;
-                Ok(())
-            },
-            |event| {
-                match event {
-                    WorkflowEvent::Completed { workflow_id: wf_id, .. } if wf_id == workflow_id => Some(()),
-                    WorkflowEvent::Failed { workflow_id: wf_id, .. } if wf_id == workflow_id => Some(()),
-                    _ => None
-                }
-            },
-            None, // Wait indefinitely
-        ).await
-    }
 }
 
 
@@ -695,38 +638,32 @@ impl std::fmt::Debug for WorkflowContext {
 }
 
 impl WorkflowContext {
-    /// Create a ReplicatedVar using the new reference hierarchy
+    /// Create a ReplicatedVar from within a workflow execution context
     ///
-    /// This is a convenience method that creates a temporary WorkflowRun for ReplicatedVar usage.
-    /// It allows existing workflow code to use the new API without major refactoring.
+    /// This is used by workflow functions that are spawned via consensus-driven execution.
     pub async fn create_replicated_var<T>(
         &self,
         key: &str,
-        runtime: &Arc<WorkflowRuntime>,
         value: T,
     ) -> Result<crate::workflow::replicated_var::ReplicatedVar<T>, WorkflowError>
     where
         T: serde::Serialize + for<'de> serde::Deserialize<'de> + Clone + Send + Sync + 'static,
     {
-        // Create a temporary WorkflowRun for this context
+        // Create a WorkflowRun for ReplicatedVar operations
+        // This WorkflowRun is marked as finished since the workflow lifecycle is managed elsewhere
         let workflow_run = Arc::new(WorkflowRun {
             context: self.clone(),
-            runtime: runtime.clone(),
-            finished: std::sync::atomic::AtomicBool::new(false),
+            runtime: self.runtime.clone(),
+            finished: AtomicBool::new(true), // Pre-marked as finished to avoid drop panic
         });
 
-        // Use the new ReplicatedVar API
         crate::workflow::replicated_var::ReplicatedVar::with_value(key, &workflow_run, value).await
     }
 
-    /// Create a ReplicatedVar with computation using the new reference hierarchy
-    ///
-    /// This is a convenience method for computed values that allows existing workflow code
-    /// to use the new API without major refactoring.
+    /// Create a ReplicatedVar with computation from within a workflow execution context
     pub async fn create_replicated_var_with_computation<T, F, Fut>(
         &self,
         key: &str,
-        runtime: &Arc<WorkflowRuntime>,
         computation: F,
     ) -> Result<crate::workflow::replicated_var::ReplicatedVar<T>, WorkflowError>
     where
@@ -734,17 +671,17 @@ impl WorkflowContext {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = T> + Send + 'static,
     {
-        // Create a temporary WorkflowRun for this context
+        // Create a WorkflowRun for ReplicatedVar operations
         let workflow_run = Arc::new(WorkflowRun {
             context: self.clone(),
-            runtime: runtime.clone(),
-            finished: std::sync::atomic::AtomicBool::new(false),
+            runtime: self.runtime.clone(),
+            finished: AtomicBool::new(true), // Pre-marked as finished to avoid drop panic
         });
 
-        // Use the new ReplicatedVar API
         crate::workflow::replicated_var::ReplicatedVar::with_computation(key, &workflow_run, computation).await
     }
 }
+
 
 #[derive(Debug)]
 pub struct WorkflowRun {
@@ -799,13 +736,12 @@ impl WorkflowRun {
             &cluster,
             || async {
                 // Leader operation: Propose WorkflowStart command with input
-                // NOTE: For now, we're using empty workflow_type and version
-                // This will be populated properly when start_workflow_typed is refactored
+                // Note: workflow_type and version are empty when not using start_workflow_typed()
                 let command = WorkflowCommand::WorkflowStart(WorkflowStartData {
                     workflow_id: workflow_id_owned.clone(),
-                    workflow_type: String::new(),  // Empty for backward compatibility
-                    version: 0,  // Default version for backward compatibility
-                    input: input_bytes.clone(),  // Include the serialized input
+                    workflow_type: String::new(),
+                    version: 0,
+                    input: input_bytes.clone(),
                 });
 
                 cluster.propose_and_sync(command).await

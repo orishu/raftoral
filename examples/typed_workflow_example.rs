@@ -26,18 +26,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Register a workflow using the closure-based approach
-    let runtime_for_closure = workflow_runtime.clone();
     workflow_runtime.register_workflow_closure(
         "computation_workflow",
         1,
         move |input: ComputationInput, context: WorkflowContext| {
-            let runtime = runtime_for_closure.clone();
             async move {
                 println!("📊 Starting computation with input: {:?}", input);
 
                 // Create a replicated variable to track our progress
                 let mut progress = context
-                    .create_replicated_var("progress", &runtime, 0u32)
+                    .create_replicated_var("progress", 0u32)
                     .await?;
                 println!("✅ Created progress tracker: {}", progress.get());
 
@@ -60,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Store intermediate result as replicated variable (checkpointing)
                     let step_key = format!("step_{}", i);
                     let _step_checkpoint = context
-                        .create_replicated_var(&step_key, &runtime, current_value)
+                        .create_replicated_var(&step_key, current_value)
                         .await?;
 
                     println!("💾 Checkpointed step {}: value = {}", i, current_value);
@@ -73,7 +71,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let final_summary = context
                     .create_replicated_var_with_computation(
                         "final_summary",
-                        &runtime,
                         move || async move {
                             format!(
                                 "Computed {} iterations: {} -> {}",
