@@ -1,4 +1,5 @@
 use std::time::Duration;
+use std::sync::Arc;
 use raftoral::{WorkflowRuntime, ReplicatedVar};
 
 #[tokio::main]
@@ -12,7 +13,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Start the workflow using WorkflowRuntime
-    let workflow_run = workflow_runtime.start(workflow_id).await?;
+    let workflow_run = workflow_runtime.start(workflow_id, ()).await?;
 
     println!("Started workflow: {}", workflow_id);
 

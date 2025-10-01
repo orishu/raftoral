@@ -1,6 +1,7 @@
 use std::future::Future;
 use serde::{Serialize, Deserialize};
-use crate::workflow::execution::{WorkflowError, WorkflowRun, WorkflowContext};
+use std::sync::Arc;
+use crate::workflow::execution::{WorkflowError, WorkflowRun};
 
 /// A type-safe replicated variable that stores its value as a checkpoint in the Raft cluster.
 ///
@@ -56,8 +57,8 @@ use crate::workflow::execution::{WorkflowError, WorkflowRun, WorkflowContext};
 pub struct ReplicatedVar<T> {
     /// Unique key for this replicated variable within the workflow
     key: String,
-    /// Reference to the workflow context this variable belongs to
-    context: WorkflowContext,
+    /// Reference to the workflow run this variable belongs to
+    workflow_run: Arc<WorkflowRun>,
     /// The current value (cached after initialization/updates)
     value: T,
 }
@@ -81,28 +82,24 @@ where
     /// * `Err(WorkflowError)` if the operation failed
     pub async fn with_value(
         key: &str,
-        workflow_run: &WorkflowRun,
+        workflow_run: &Arc<WorkflowRun>,
         value: T,
     ) -> Result<Self, WorkflowError> {
-        use crate::workflow::execution::WorkflowRuntime;
-
-        let context = workflow_run.context().clone();
-        let runtime = WorkflowRuntime::_create_temporary(context.cluster.clone());
-
-        // Store the value in Raft
-        let stored_value = runtime.set_replicated_var(
-            &context.workflow_id,
+        // Store the value using the workflow run's runtime
+        let stored_value = workflow_run.runtime.set_replicated_var(
+            &workflow_run.context.workflow_id,
             key,
             value.clone(),
-            &context.cluster
+            &workflow_run.runtime.cluster
         ).await?;
 
         Ok(ReplicatedVar {
             key: key.to_string(),
-            context,
+            workflow_run: workflow_run.clone(),
             value: stored_value,
         })
     }
+
 
     /// Create and initialize a ReplicatedVar with a computed value
     ///
@@ -120,35 +117,31 @@ where
     /// * `Err(WorkflowError)` if the operation failed
     pub async fn with_computation<F, Fut>(
         key: &str,
-        workflow_run: &WorkflowRun,
+        workflow_run: &Arc<WorkflowRun>,
         computation: F,
     ) -> Result<Self, WorkflowError>
     where
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = T> + Send + 'static,
     {
-        use crate::workflow::execution::WorkflowRuntime;
-
-        let context = workflow_run.context().clone();
-        let runtime = WorkflowRuntime::_create_temporary(context.cluster.clone());
-
-        // Execute the computation
+        // Execute the computation to get the value
         let computed_value = computation().await;
 
-        // Store the computed value in Raft
-        let stored_value = runtime.set_replicated_var(
-            &context.workflow_id,
+        // Store the computed value using the workflow run's runtime
+        let stored_value = workflow_run.runtime.set_replicated_var(
+            &workflow_run.context.workflow_id,
             key,
-            computed_value,
-            &context.cluster
+            computed_value.clone(),
+            &workflow_run.runtime.cluster
         ).await?;
 
         Ok(ReplicatedVar {
             key: key.to_string(),
-            context,
+            workflow_run: workflow_run.clone(),
             value: stored_value,
         })
     }
+
 
     /// Get the current cached value
     ///
@@ -173,19 +166,15 @@ where
     where
         F: FnOnce(T) -> T + Send + 'static,
     {
-        use crate::workflow::execution::WorkflowRuntime;
-
-        let runtime = WorkflowRuntime::_create_temporary(self.context.cluster.clone());
-
         // Apply the update function
         let new_value = updater(self.value.clone());
 
-        // Store the new value in Raft
-        let stored_value = runtime.set_replicated_var(
-            &self.context.workflow_id,
+        // Store the new value in Raft using the workflow run's runtime
+        let stored_value = self.workflow_run.runtime.set_replicated_var(
+            &self.workflow_run.context.workflow_id,
             &self.key,
             new_value,
-            &self.context.cluster
+            &self.workflow_run.runtime.cluster
         ).await?;
 
         // Update the local cache
@@ -206,16 +195,12 @@ where
     /// * `Ok(T)` with the value if the operation was successful
     /// * `Err(WorkflowError)` if the operation failed
     pub async fn set(&mut self, value: T) -> Result<T, WorkflowError> {
-        use crate::workflow::execution::WorkflowRuntime;
-
-        let runtime = WorkflowRuntime::_create_temporary(self.context.cluster.clone());
-
-        // Store the new value in Raft
-        let stored_value = runtime.set_replicated_var(
-            &self.context.workflow_id,
+        // Store the new value in Raft using the workflow run's runtime
+        let stored_value = self.workflow_run.runtime.set_replicated_var(
+            &self.workflow_run.context.workflow_id,
             &self.key,
             value,
-            &self.context.cluster
+            &self.workflow_run.runtime.cluster
         ).await?;
 
         // Update the local cache
@@ -238,12 +223,12 @@ where
     /// A new ReplicatedVar instance (value not yet stored in Raft)
     pub fn new(
         key: &str,
-        workflow_run: &WorkflowRun,
+        workflow_run: &Arc<WorkflowRun>,
         initial_value: T,
     ) -> Self {
         ReplicatedVar {
             key: key.to_string(),
-            context: workflow_run.context().clone(),
+            workflow_run: workflow_run.clone(),
             value: initial_value,
         }
     }
@@ -257,7 +242,7 @@ where
 
     /// Get the workflow ID this variable belongs to
     pub fn workflow_id(&self) -> &str {
-        &self.context.workflow_id
+        &self.workflow_run.context.workflow_id
     }
 }
 
@@ -268,7 +253,7 @@ where
     fn clone(&self) -> Self {
         ReplicatedVar {
             key: self.key.clone(),
-            context: self.context.clone(),
+            workflow_run: self.workflow_run.clone(),
             value: self.value.clone(),
         }
     }
@@ -318,7 +303,7 @@ mod tests {
 
         // Wait for leadership establishment
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let workflow_run = workflow_runtime.start(workflow_id).await.expect("Failed to start workflow");
+        let workflow_run = workflow_runtime.start(workflow_id, ()).await.expect("Failed to start workflow");
 
         // Test new with_value() interface for direct initialization
         let counter = ReplicatedVar::with_value("counter", &workflow_run, 42i32).await.expect("Failed to create counter");
@@ -336,7 +321,7 @@ mod tests {
         assert_eq!(message.get(), "Hello, Raft!".to_string());
 
         // Finish the workflow
-        workflow_run.finish().await.expect("Failed to finish workflow");
+        workflow_run.finish_with(()).await.expect("Failed to finish workflow");
     }
 
     #[tokio::test]
@@ -346,8 +331,8 @@ mod tests {
 
         // Wait for leadership establishment
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let workflow_run1 = workflow_runtime.start("workflow_1").await.expect("Failed to start workflow 1");
-        let workflow_run2 = workflow_runtime.start("workflow_2").await.expect("Failed to start workflow 2");
+        let workflow_run1 = workflow_runtime.start("workflow_1", ()).await.expect("Failed to start workflow 1");
+        let workflow_run2 = workflow_runtime.start("workflow_2", ()).await.expect("Failed to start workflow 2");
 
         // Variables in different workflows should be isolated using same key but different workflows
         let var1 = ReplicatedVar::with_value("shared_key", &workflow_run1, 100i32).await.expect("Failed to create var1");
@@ -358,8 +343,8 @@ mod tests {
         assert_eq!(var2.get(), 200);
 
         // Finish both workflows
-        workflow_run1.finish().await.expect("Failed to finish workflow 1");
-        workflow_run2.finish().await.expect("Failed to finish workflow 2");
+        workflow_run1.finish_with(()).await.expect("Failed to finish workflow 1");
+        workflow_run2.finish_with(()).await.expect("Failed to finish workflow 2");
     }
 
     #[tokio::test]
@@ -371,7 +356,7 @@ mod tests {
 
         // Wait for leadership establishment
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let workflow_run = workflow_runtime.start(workflow_id).await.expect("Failed to start workflow");
+        let workflow_run = workflow_runtime.start(workflow_id, ()).await.expect("Failed to start workflow");
 
         // Test with Result type using new with_value interface
         let mut api_result = ReplicatedVar::with_value(
@@ -405,7 +390,7 @@ mod tests {
         assert_eq!(optional_data.get(), Some(vec!["computed_item1".to_string(), "computed_item2".to_string()]));
 
         // Finish the workflow
-        workflow_run.finish().await.expect("Failed to finish workflow");
+        workflow_run.finish_with(()).await.expect("Failed to finish workflow");
     }
 
     #[tokio::test]
@@ -417,7 +402,7 @@ mod tests {
 
         // Wait for leadership establishment
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let workflow_run = workflow_runtime.start(workflow_id).await.expect("Failed to start workflow");
+        let workflow_run = workflow_runtime.start(workflow_id, ()).await.expect("Failed to start workflow");
 
         // Test with_computation for side effects - simulate an external API call
         let external_data = ReplicatedVar::with_computation(
@@ -454,6 +439,6 @@ mod tests {
         assert_eq!(fibonacci_result.get(), 55); // 10th Fibonacci number
 
         // Finish the workflow
-        workflow_run.finish().await.expect("Failed to finish workflow");
+        workflow_run.finish_with(()).await.expect("Failed to finish workflow");
     }
 }

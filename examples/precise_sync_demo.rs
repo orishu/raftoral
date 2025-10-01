@@ -1,4 +1,4 @@
-use raftoral::{WorkflowCommandExecutor, RaftCluster, WorkflowCommand};
+use raftoral::{WorkflowCommandExecutor, RaftCluster, WorkflowCommand, CheckpointData, WorkflowStartData, WorkflowEndData};
 use std::time::Instant;
 
 #[tokio::main]
@@ -10,18 +10,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Test multiple rapid commands to demonstrate precise tracking
     let commands = vec![
-        WorkflowCommand::WorkflowStart { workflow_id: "workflow_1".to_string() },
-        WorkflowCommand::SetCheckpoint {
+        WorkflowCommand::WorkflowStart(WorkflowStartData {
+            workflow_id: "workflow_1".to_string(),
+            workflow_type: "test".to_string(),
+            version: 1,
+            input: b"()".to_vec()
+        }),
+        WorkflowCommand::SetCheckpoint(CheckpointData {
             workflow_id: "workflow_1".to_string(),
             key: "step1".to_string(),
             value: b"checkpoint data 1".to_vec()
-        },
-        WorkflowCommand::SetCheckpoint {
+        }),
+        WorkflowCommand::SetCheckpoint(CheckpointData {
             workflow_id: "workflow_1".to_string(),
             key: "step2".to_string(),
             value: b"checkpoint data 2".to_vec()
-        },
-        WorkflowCommand::WorkflowEnd { workflow_id: "workflow_1".to_string() },
+        }),
+        WorkflowCommand::WorkflowEnd(WorkflowEndData {
+            workflow_id: "workflow_1".to_string(),
+            result: b"completed".to_vec()
+        }),
     ];
 
     println!("Submitting {} commands with precise tracking...", commands.len());

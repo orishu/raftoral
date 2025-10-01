@@ -6,6 +6,7 @@ pub type WorkflowCluster = raft::RaftCluster<workflow::WorkflowCommandExecutor>;
 
 pub use raft::{RaftCluster, PlaceholderCommand, RaftCommand, RoleChange};
 pub use workflow::{
-    WorkflowCommand, WorkflowCommandExecutor, WorkflowError,
+    WorkflowCommand, WorkflowStartData, WorkflowEndData, CheckpointData,
+    WorkflowCommandExecutor, WorkflowError,
     ReplicatedVar, ReplicatedVarError, WorkflowRuntime, WorkflowRun, WorkflowContext
 };

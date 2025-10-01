@@ -1,5 +1,6 @@
-use raftoral::{WorkflowCommand, WorkflowRuntime};
+use raftoral::{WorkflowCommand, CheckpointData, WorkflowRuntime};
 use tokio::time::{sleep, Duration};
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -18,7 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let workflow_id = "demo_workflow";
     println!("Starting workflow: {}", workflow_id);
 
-    match workflow_runtime.start(workflow_id).await {
+    match workflow_runtime.start(workflow_id, ()).await {
         Ok(workflow_run) => {
             println!("Successfully started workflow: {}", workflow_id);
 
@@ -26,11 +27,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Test setting a checkpoint using low-level command via runtime
             println!("Setting checkpoint for workflow...");
-            let checkpoint_command = WorkflowCommand::SetCheckpoint {
+            let checkpoint_command = WorkflowCommand::SetCheckpoint(CheckpointData {
                 workflow_id: workflow_id.to_string(),
                 key: "step1".to_string(),
                 value: b"checkpoint data for step 1".to_vec(),
-            };
+            });
 
             match workflow_runtime.cluster.propose_and_sync(checkpoint_command).await {
                 Ok(()) => println!("Successfully set checkpoint"),

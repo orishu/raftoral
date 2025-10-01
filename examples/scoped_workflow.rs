@@ -26,7 +26,7 @@ async fn fibonacci_workflow(workflow_runtime: &std::sync::Arc<WorkflowRuntime>, 
 
     // This block demonstrates automatic cleanup - WorkflowRun will auto-end when dropped
     {
-        let workflow_run = WorkflowRun::start(&workflow_id, workflow_runtime).await?;
+        let workflow_run = WorkflowRun::start(&workflow_id, workflow_runtime, n).await?;
 
         // Store the input parameter using direct value
         let _input_var = ReplicatedVar::with_value("input", &workflow_run, n).await?;
@@ -42,7 +42,9 @@ async fn fibonacci_workflow(workflow_runtime: &std::sync::Arc<WorkflowRuntime>, 
         ).await?;
 
         // Return the result (workflow ends here)
-        return Ok(workflow_run.finish_with(result_var.get()).await?);
+        let result = result_var.get();
+        workflow_run.finish_with(result).await?;
+        return Ok(result);
     }
     // WorkflowRun goes out of scope here and the workflow would be automatically ended
     // But we already called finish_with() so it's already ended
@@ -66,7 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Demonstrate explicit workflow finish with update functionality
     {
-        let workflow_run = WorkflowRun::start("test_early_exit", &workflow_runtime).await?;
+        let workflow_run = WorkflowRun::start("test_early_exit", &workflow_runtime, ()).await?;
 
         // Start with a counter using the new interface
         let mut counter = ReplicatedVar::with_value("counter", &workflow_run, 0i32).await?;
@@ -77,7 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Updated counter to: {}", counter_value);
         println!("Counter value via get(): {}", counter.get());
 
-        workflow_run.finish().await?;
+        workflow_run.finish_with(()).await?;
 
         println!("Workflow finished explicitly (no auto-cleanup needed)...");
         // WorkflowRun is already finished, so Drop won't panic

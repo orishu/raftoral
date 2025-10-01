@@ -292,7 +292,7 @@ mod tests {
         let workflow_runtime = crate::workflow::execution::WorkflowRuntime::new_single_node(1).await.unwrap();
         let context = WorkflowContext {
             workflow_id: "test_instance".to_string(),
-            cluster: workflow_runtime.cluster.clone(),
+            runtime: workflow_runtime.clone(),
         };
 
         // Execute workflow
