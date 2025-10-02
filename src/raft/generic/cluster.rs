@@ -21,6 +21,7 @@ pub struct RaftCluster<E: CommandExecutor> {
     // Role change notifications
     role_change_tx: broadcast::Sender<RoleChange>,
     // Command ID counter for precise tracking
+    #[allow(dead_code)] // Reserved for future command tracking
     next_command_id: Arc<AtomicU64>,
     // Command executor for applying commands
     pub executor: Arc<E>,

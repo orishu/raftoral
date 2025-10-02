@@ -536,7 +536,6 @@ impl WorkflowRuntime {
                 let serialized_value_clone = serialized_value.clone();
                 let workflow_id_owned_clone = workflow_id_owned.clone();
                 let key_owned_clone = key_owned.clone();
-                let cluster_clone = cluster.clone();
                 async move {
                     // Leader operation: Propose SetCheckpoint command and return the value
                     let command = WorkflowCommand::SetCheckpoint(CheckpointData {
@@ -551,7 +550,7 @@ impl WorkflowRuntime {
                     // Pop the value we just enqueued (during apply in propose_and_sync)
                     // This prevents leader's own execution from consuming its proposed values
                     let queue_key = (workflow_id_owned_clone, key_owned_clone);
-                    cluster_clone.executor.state.lock().unwrap()
+                    cluster.executor.state.lock().unwrap()
                         .checkpoint_queues
                         .get_mut(&queue_key)
                         .and_then(|queue| queue.pop_back()); // Pop the value we just pushed

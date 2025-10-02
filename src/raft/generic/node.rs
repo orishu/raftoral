@@ -12,6 +12,7 @@ pub type SyncCallback = tokio::sync::oneshot::Sender<Result<(), Box<dyn std::err
 
 pub struct RaftNode<E: CommandExecutor> {
     raft_group: RawNode<MemStorage>,
+    #[allow(dead_code)] // Reserved for future use
     storage: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     node_id: u64,
     logger: Logger,
