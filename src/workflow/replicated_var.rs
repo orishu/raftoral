@@ -86,6 +86,7 @@ where
         value: T,
     ) -> Result<Self, WorkflowError> {
         // Store the value using the workflow run's runtime
+        // Always checks queue for late follower catch-up (FIFO guarantees correct order)
         let stored_value = workflow_run.runtime.set_replicated_var(
             &workflow_run.context.workflow_id,
             key,
@@ -128,6 +129,7 @@ where
         let computed_value = computation().await;
 
         // Store the computed value using the workflow run's runtime
+        // Always checks queue for late follower catch-up (FIFO guarantees correct order)
         let stored_value = workflow_run.runtime.set_replicated_var(
             &workflow_run.context.workflow_id,
             key,
@@ -170,6 +172,7 @@ where
         let new_value = updater(self.value.clone());
 
         // Store the new value in Raft using the workflow run's runtime
+        // Always checks queue for late follower catch-up (FIFO guarantees correct order)
         let stored_value = self.workflow_run.runtime.set_replicated_var(
             &self.workflow_run.context.workflow_id,
             &self.key,

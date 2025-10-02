@@ -223,6 +223,15 @@ impl CommandExecutor for WorkflowCommandExecutor {
                            "key" => &data.key,
                            "value_size" => data.value.len());
 
+                // Enqueue the checkpoint value for late followers
+                // All nodes enqueue - the consumption side will determine whether to use it
+                let queue_key = (data.workflow_id.clone(), data.key.clone());
+                self.state.lock().unwrap()
+                    .checkpoint_queues
+                    .entry(queue_key)
+                    .or_insert_with(std::collections::VecDeque::new)
+                    .push_back(data.value.clone());
+
                 self.emit_checkpoint_event(&data.workflow_id, &data.key, data.value.clone());
             },
         }
@@ -258,6 +267,10 @@ pub struct WorkflowState {
     pub workflows: HashMap<String, WorkflowStatus>,
     /// Store workflow results (serialized) by ID for retrieval after completion
     pub results: HashMap<String, Vec<u8>>,
+    /// Queue of checkpoint values that arrived before execution reached them
+    /// Key: (workflow_id, checkpoint_key), Value: Queue of serialized values
+    /// This enables late followers to catch up without blocking on consensus
+    pub checkpoint_queues: HashMap<(String, String), std::collections::VecDeque<Vec<u8>>>,
 }
 
 
@@ -455,7 +468,41 @@ impl WorkflowRuntime {
     }
 
 
+    /// Try to get a queued checkpoint value for a late follower (internal use)
+    /// Returns Some(value) if a queued checkpoint exists, None otherwise
+    ///
+    /// Uses simple FIFO queue semantics: pop once from front.
+    /// Deterministic execution guarantees the queue order matches execution order.
+    fn try_dequeue_checkpoint<T>(
+        &self,
+        workflow_id: &str,
+        key: &str,
+        cluster: &RaftCluster<WorkflowCommandExecutor>,
+    ) -> Result<Option<T>, WorkflowError>
+    where
+        T: serde::Serialize + for<'de> serde::Deserialize<'de> + Clone + Send + Sync + 'static,
+    {
+        let queue_key = (workflow_id.to_string(), key.to_string());
+        let mut state = cluster.executor.state.lock().unwrap();
+
+        if let Some(queue) = state.checkpoint_queues.get_mut(&queue_key) {
+            // Simple FIFO: pop once from front
+            // Deterministic execution ensures this is the correct value
+            if let Some(serialized_value) = queue.pop_front() {
+                let deserialized = serde_json::from_slice::<T>(&serialized_value)
+                    .map_err(|e| WorkflowError::ClusterError(format!("Deserialization error: {}", e)))?;
+                return Ok(Some(deserialized));
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Set a replicated variable value (used by ReplicatedVar)
+    ///
+    /// Followers check for queued values first (late follower catch-up).
+    /// Leaders always propose through consensus.
+    /// Deterministic execution ensures FIFO queue order matches execution order.
     pub async fn set_replicated_var<T>(
         &self,
         workflow_id: &str,
@@ -469,6 +516,13 @@ impl WorkflowRuntime {
         let key_owned = key.to_string();
         let workflow_id_owned = workflow_id.to_string();
 
+        // Always check queue first (for late followers and new leaders catching up)
+        // Leaders clean up their own proposed values from the queue (see line 554-560)
+        if let Some(queued_value) = self.try_dequeue_checkpoint(workflow_id, key, cluster)? {
+            return Ok(queued_value);
+        }
+
+        // No queued value - proceed with normal consensus-based flow
         // Serialize the value
         let serialized_value = serde_json::to_vec(&value)
             .map_err(|e| WorkflowError::ClusterError(format!("Serialization error: {}", e)))?;
@@ -482,16 +536,26 @@ impl WorkflowRuntime {
                 let serialized_value_clone = serialized_value.clone();
                 let workflow_id_owned_clone = workflow_id_owned.clone();
                 let key_owned_clone = key_owned.clone();
+                let cluster_clone = cluster.clone();
                 async move {
                     // Leader operation: Propose SetCheckpoint command and return the value
                     let command = WorkflowCommand::SetCheckpoint(CheckpointData {
-                        workflow_id: workflow_id_owned_clone,
-                        key: key_owned_clone,
+                        workflow_id: workflow_id_owned_clone.clone(),
+                        key: key_owned_clone.clone(),
                         value: serialized_value_clone,
                     });
 
                     cluster.propose_and_sync(command).await
                         .map_err(|e| WorkflowError::ClusterError(e.to_string()))?;
+
+                    // Pop the value we just enqueued (during apply in propose_and_sync)
+                    // This prevents leader's own execution from consuming its proposed values
+                    let queue_key = (workflow_id_owned_clone, key_owned_clone);
+                    cluster_clone.executor.state.lock().unwrap()
+                        .checkpoint_queues
+                        .get_mut(&queue_key)
+                        .and_then(|queue| queue.pop_back()); // Pop the value we just pushed
+
                     Ok(value_clone)
                 }
             },
