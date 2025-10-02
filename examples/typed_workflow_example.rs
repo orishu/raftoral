@@ -112,7 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Start the typed workflow
         let workflow_run = workflow_runtime
-            .start_workflow_typed::<ComputationInput, ComputationOutput>(
+            .start_workflow::<ComputationInput, ComputationOutput>(
                 "computation_workflow",
                 1,
                 input.clone(),

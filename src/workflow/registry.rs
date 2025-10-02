@@ -24,34 +24,41 @@ where
 
 /// A type-erased wrapper for workflow functions to enable storage in collections
 pub struct BoxedWorkflowFunction {
-    /// The actual function that executes the workflow
-    executor: Box<dyn Fn(Box<dyn Any + Send>, WorkflowContext) -> Pin<Box<dyn Future<Output = Result<Box<dyn Any + Send>, WorkflowError>> + Send>> + Send + Sync>,
+    /// The actual function that executes the workflow and returns serialized output
+    executor: Box<dyn Fn(Box<dyn Any + Send>, WorkflowContext) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, WorkflowError>> + Send>> + Send + Sync>,
 }
 
 impl BoxedWorkflowFunction {
     /// Create a new boxed workflow function from a typed workflow function
     pub fn new<I, O, F>(func: F) -> Self
     where
-        I: Send + 'static,
-        O: Send + 'static,
+        I: Send + for<'de> serde::Deserialize<'de> + 'static,
+        O: Send + serde::Serialize + 'static,
         F: WorkflowFunction<I, O>,
     {
         let func = Arc::new(func);
         let executor = Box::new(move |input_any: Box<dyn Any + Send>, context: WorkflowContext| {
             let func = func.clone();
             Box::pin(async move {
-                // Downcast input from Any
-                let input: I = *input_any.downcast::<I>()
-                    .map_err(|_| WorkflowError::ClusterError("Failed to downcast workflow input".to_string()))?;
+                // Try to downcast input from Any to Vec<u8> (serialized input)
+                let input: I = if let Ok(input_bytes) = input_any.downcast::<Vec<u8>>() {
+                    // Deserialize from bytes
+                    serde_json::from_slice(&input_bytes)
+                        .map_err(|e| WorkflowError::DeserializationError(e.to_string()))?
+                } else {
+                    // This shouldn't happen in production, but kept for backward compatibility
+                    return Err(WorkflowError::ClusterError("Expected serialized input (Vec<u8>)".to_string()));
+                };
 
-                // Execute workflow
-                let output = func.execute(input, context).await?;
+                // Execute workflow and get the Result<O, WorkflowError>
+                let output_result = func.execute(input, context).await;
 
-                // Box output as Any
-                let output_any: Box<dyn Any + Send> = Box::new(output);
+                // Serialize the entire Result to Vec<u8>
+                let result_bytes = serde_json::to_vec(&output_result)
+                    .map_err(|e| WorkflowError::SerializationError(e.to_string()))?;
 
-                Ok(output_any)
-            }) as Pin<Box<dyn Future<Output = Result<Box<dyn Any + Send>, WorkflowError>> + Send>>
+                Ok(result_bytes)
+            }) as Pin<Box<dyn Future<Output = Result<Vec<u8>, WorkflowError>> + Send>>
         });
 
         BoxedWorkflowFunction { executor }
@@ -62,7 +69,7 @@ impl BoxedWorkflowFunction {
         &self,
         input: Box<dyn Any + Send>,
         context: WorkflowContext,
-    ) -> Result<Box<dyn Any + Send>, WorkflowError> {
+    ) -> Result<Vec<u8>, WorkflowError> {
         (self.executor)(input, context).await
     }
 }
@@ -102,8 +109,8 @@ impl WorkflowRegistry {
         function: F,
     ) -> Result<(), WorkflowError>
     where
-        I: Send + 'static,
-        O: Send + 'static,
+        I: Send + for<'de> serde::Deserialize<'de> + 'static,
+        O: Send + serde::Serialize + 'static,
         F: WorkflowFunction<I, O>,
     {
         let key = (workflow_type.to_string(), version);
@@ -138,8 +145,8 @@ impl WorkflowRegistry {
         function: F,
     ) -> Result<(), WorkflowError>
     where
-        I: Send + Sync + 'static,
-        O: Send + Sync + 'static,
+        I: Send + Sync + for<'de> serde::Deserialize<'de> + 'static,
+        O: Send + Sync + serde::Serialize + 'static,
         F: Fn(I, WorkflowContext) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<O, WorkflowError>> + Send + Sync + 'static,
     {
@@ -154,8 +161,8 @@ impl WorkflowRegistry {
 
         impl<I, O, F, Fut> WorkflowFunction<I, O> for ClosureWorkflow<I, O, F, Fut>
         where
-            I: Send + Sync + 'static,
-            O: Send + Sync + 'static,
+            I: Send + Sync + for<'de> serde::Deserialize<'de> + 'static,
+            O: Send + Sync + serde::Serialize + 'static,
             F: Fn(I, WorkflowContext) -> Fut + Send + Sync + 'static,
             Fut: Future<Output = Result<O, WorkflowError>> + Send + Sync + 'static,
         {
@@ -217,12 +224,12 @@ mod tests {
     use super::*;
     use std::any::Any;
 
-    #[derive(Clone, Debug, PartialEq)]
+    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
     struct TestInput {
         value: i32,
     }
 
-    #[derive(Clone, Debug, PartialEq)]
+    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
     struct TestOutput {
         result: i32,
     }
@@ -284,9 +291,10 @@ mod tests {
 
         let workflow = registry.get("test_workflow", 1).unwrap();
 
-        // Create test input
+        // Create test input and serialize it
         let input = TestInput { value: 21 };
-        let input_any: Box<dyn Any + Send> = Box::new(input);
+        let input_bytes = serde_json::to_vec(&input).unwrap();
+        let input_any: Box<dyn Any + Send> = Box::new(input_bytes);
 
         // Create mock context using WorkflowRuntime
         let workflow_runtime = crate::workflow::execution::WorkflowRuntime::new_single_node(1).await.unwrap();
@@ -295,9 +303,15 @@ mod tests {
             runtime: workflow_runtime.clone(),
         };
 
-        // Execute workflow
-        let result = workflow.execute(input_any, context).await.unwrap();
-        let output = *result.downcast::<TestOutput>().unwrap();
+        // Execute workflow - returns serialized Result<TestOutput, WorkflowError>
+        let result_bytes = workflow.execute(input_any, context).await.unwrap();
+
+        // Deserialize the Result
+        let output_result: Result<TestOutput, crate::workflow::execution::WorkflowError> =
+            serde_json::from_slice(&result_bytes).unwrap();
+
+        // Unwrap the Ok value
+        let output = output_result.unwrap();
 
         assert_eq!(output.result, 42);
     }

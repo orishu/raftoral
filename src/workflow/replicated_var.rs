@@ -26,7 +26,7 @@ use crate::workflow::execution::{WorkflowError, WorkflowRun};
 /// let updated_counter = counter.update(|old_val| old_val + 1).await?;
 /// println!("Updated counter: {}", updated_counter); // 43
 ///
-/// # workflow_run.finish().await?;
+/// # workflow_run.finish_with(()).await?;
 /// # Ok(())
 /// # }
 /// ```
@@ -50,7 +50,7 @@ use crate::workflow::execution::{WorkflowError, WorkflowRun};
 /// ).await?;
 /// println!("Computed value: {}", computed_result.get()); // 100
 ///
-/// # workflow_run.finish().await?;
+/// # workflow_run.finish_with(()).await?;
 /// # Ok(())
 /// # }
 /// ```

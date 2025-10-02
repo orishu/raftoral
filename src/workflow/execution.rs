@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::broadcast;
 use tokio::time::timeout;
 
@@ -114,6 +113,12 @@ impl WorkflowCommandExecutor {
         state.workflows.get(workflow_id).cloned()
     }
 
+    /// Get stored workflow result (if completed)
+    pub fn get_workflow_result(&self, workflow_id: &str) -> Option<Vec<u8>> {
+        let state = self.state.lock().unwrap();
+        state.results.get(workflow_id).cloned()
+    }
+
     /// Subscribe to workflow events
     pub fn subscribe_to_workflow(&self, workflow_id: &str) -> WorkflowSubscription {
         WorkflowSubscription {
@@ -169,26 +174,35 @@ impl CommandExecutor for WorkflowCommandExecutor {
                                 }
                             };
 
-                            // Create workflow context
+                            // Create workflow context and WorkflowRun for this execution
                             let context = WorkflowContext {
                                 workflow_id: workflow_id.clone(),
                                 runtime: runtime.clone(),
                             };
 
+                            let workflow_run = Arc::new(WorkflowRun {
+                                context: context.clone(),
+                                runtime: runtime.clone(),
+                            });
+
                             // Deserialize input and execute the workflow function
                             let input_any: Box<dyn std::any::Any + Send> = Box::new(input_bytes);
 
                             match workflow_function.execute(input_any, context).await {
-                                Ok(_output_any) => {
-                                    // Serialize the output
-                                    // Note: The workflow function should call finish_with() which will
-                                    // propose WorkflowEnd, so we don't need to do anything here
+                                Ok(result_bytes) => {
+                                    // Workflow execution succeeded - call finish_with to propose WorkflowEnd
+                                    // Only the leader's call will actually propose (followers will get NotLeader error)
+                                    // Propose WorkflowEnd with the serialized result
+                                    // This will succeed on leader, fail with NotLeader on followers
+                                    let _ = workflow_run.finish_with_bytes(result_bytes).await;
+
                                     slog::info!(slog::Logger::root(slog::Discard, slog::o!()),
                                                "Workflow execution completed successfully";
                                                "workflow_id" => &workflow_id);
                                 },
                                 Err(e) => {
                                     eprintln!("Workflow {} failed during execution: {}", workflow_id, e);
+                                    // TODO: Emit failure event or propose WorkflowEnd with error
                                 }
                             }
                         });
@@ -197,6 +211,10 @@ impl CommandExecutor for WorkflowCommandExecutor {
             },
             WorkflowCommand::WorkflowEnd(data) => {
                 slog::info!(logger, "Ended workflow"; "workflow_id" => &data.workflow_id);
+
+                // Store the result in state for later retrieval
+                self.state.lock().unwrap().results.insert(data.workflow_id.clone(), data.result.clone());
+
                 self.emit_completed_event(&data.workflow_id, data.result.clone());
             },
             WorkflowCommand::SetCheckpoint(data) => {
@@ -238,6 +256,8 @@ pub enum WorkflowEvent {
 pub struct WorkflowState {
     /// Track workflow status by ID
     pub workflows: HashMap<String, WorkflowStatus>,
+    /// Store workflow results (serialized) by ID for retrieval after completion
+    pub results: HashMap<String, Vec<u8>>,
 }
 
 
@@ -331,6 +351,11 @@ impl WorkflowRuntime {
         self.cluster.executor.get_workflow_status(workflow_id)
     }
 
+    /// Get stored workflow result (delegate to executor)
+    pub fn get_workflow_result(&self, workflow_id: &str) -> Option<Vec<u8>> {
+        self.cluster.executor.get_workflow_result(workflow_id)
+    }
+
     /// Subscribe to workflow events for a specific workflow ID
     fn subscribe_to_workflow(&self, workflow_id: &str) -> WorkflowSubscription {
         self.cluster.executor.subscribe_to_workflow(workflow_id)
@@ -399,7 +424,7 @@ impl WorkflowRuntime {
 
     /// Wait for a specific event with state checking
     async fn wait_for_specific_event<E, T>(
-        _workflow_id: &str,
+        workflow_id: &str,
         mut subscription: WorkflowSubscription,
         event_extractor: E,
         timeout_duration: Option<Duration>
@@ -408,7 +433,25 @@ impl WorkflowRuntime {
         E: Fn(&WorkflowEvent) -> Option<T> + Send + Sync + Clone,
         T: Send + 'static,
     {
-        subscription.wait_for_event(event_extractor, timeout_duration).await
+        let workflow_id = workflow_id.to_string();
+        let filtered_extractor = move |event: &WorkflowEvent| {
+            // First check if this event is for our workflow_id
+            let event_workflow_id = match event {
+                WorkflowEvent::Started { workflow_id } => workflow_id,
+                WorkflowEvent::Completed { workflow_id, .. } => workflow_id,
+                WorkflowEvent::Failed { workflow_id, .. } => workflow_id,
+                WorkflowEvent::CheckpointSet { workflow_id, .. } => workflow_id,
+            };
+
+            if event_workflow_id != &workflow_id {
+                return None; // Not for our workflow
+            }
+
+            // Then apply the user's event extractor
+            event_extractor(event)
+        };
+
+        subscription.wait_for_event(filtered_extractor, timeout_duration).await
     }
 
 
@@ -525,7 +568,7 @@ impl WorkflowRuntime {
     /// # Returns
     /// * `Ok(TypedWorkflowRun<O>)` if the workflow was started successfully
     /// * `Err(WorkflowError)` if the workflow type is not registered or startup failed
-    pub async fn start_workflow_typed<I, O>(
+    pub async fn start_workflow<I, O>(
         self: &Arc<Self>,
         workflow_type: &str,
         version: u32,
@@ -598,7 +641,6 @@ impl WorkflowRuntime {
         let workflow_run = Arc::new(WorkflowRun {
             context,
             runtime: self.clone(),
-            finished: AtomicBool::new(false),
         });
 
         Ok(TypedWorkflowRun::new(workflow_run))
@@ -654,7 +696,6 @@ impl WorkflowContext {
         let workflow_run = Arc::new(WorkflowRun {
             context: self.clone(),
             runtime: self.runtime.clone(),
-            finished: AtomicBool::new(true), // Pre-marked as finished to avoid drop panic
         });
 
         crate::workflow::replicated_var::ReplicatedVar::with_value(key, &workflow_run, value).await
@@ -675,7 +716,6 @@ impl WorkflowContext {
         let workflow_run = Arc::new(WorkflowRun {
             context: self.clone(),
             runtime: self.runtime.clone(),
-            finished: AtomicBool::new(true), // Pre-marked as finished to avoid drop panic
         });
 
         crate::workflow::replicated_var::ReplicatedVar::with_computation(key, &workflow_run, computation).await
@@ -687,7 +727,6 @@ impl WorkflowContext {
 pub struct WorkflowRun {
     pub context: WorkflowContext,
     pub runtime: Arc<WorkflowRuntime>,
-    finished: AtomicBool,
 }
 
 impl WorkflowRun {
@@ -703,7 +742,6 @@ impl WorkflowRun {
         WorkflowRun {
             context,
             runtime,
-            finished: AtomicBool::new(false),
         }
     }
 
@@ -765,7 +803,6 @@ impl WorkflowRun {
         Ok(Arc::new(WorkflowRun {
             context,
             runtime: runtime.clone(),
-            finished: AtomicBool::new(false),
         }))
     }
 
@@ -784,88 +821,46 @@ impl WorkflowRun {
         &self.context
     }
 
-    /// Finish the workflow without a result
-    pub async fn finish(&self) -> Result<(), WorkflowError> {
-        // Check if workflow exists and is running
-        match self.runtime.get_workflow_status(&self.context.workflow_id) {
-            Some(WorkflowStatus::Running) => {},
-            Some(WorkflowStatus::Completed) => {
-                self.finished.store(true, Ordering::SeqCst);
-                return Ok(()); // Already completed
-            },
-            Some(_) => return Err(WorkflowError::ClusterError("Workflow is not running".to_string())),
-            None => return Err(WorkflowError::NotFound(self.context.workflow_id.to_string())),
-        }
-
-        // Use the reusable leader/follower pattern to end the workflow
-        let workflow_id_owned = self.context.workflow_id.clone();
-
-        self.runtime.execute_leader_follower_operation(
-            &self.context.workflow_id,
-            &self.runtime.cluster,
-            || async {
-                // Leader operation: Propose WorkflowEnd command
-                let command = WorkflowCommand::WorkflowEnd(WorkflowEndData {
-                    workflow_id: workflow_id_owned.clone(),
-                    result: Vec::new(),  // Empty result for workflows without explicit result
-                });
-
-                self.runtime.cluster.propose_and_sync(command).await
-                    .map_err(|e| WorkflowError::ClusterError(e.to_string()))?;
-                Ok(())
-            },
-            |event| {
-                if matches!(event, WorkflowEvent::Completed { .. } | WorkflowEvent::Failed { .. }) {
-                    Some(())
-                } else {
-                    None
-                }
-            },
-            None, // Wait indefinitely
-        ).await?;
-
-        // Final state verification - check for failure after completion
-        match self.runtime.get_workflow_status(&self.context.workflow_id) {
-            Some(WorkflowStatus::Completed) => {
-                self.finished.store(true, Ordering::SeqCst);
-                Ok(())
-            },
-            Some(WorkflowStatus::Failed) => Err(WorkflowError::ClusterError("Workflow failed".to_string())),
-            _ => Err(WorkflowError::ClusterError("Unexpected workflow state".to_string())),
-        }
-    }
 
     /// Finish the workflow with a result value
     pub async fn finish_with<T>(&self, result_value: T) -> Result<T, WorkflowError>
     where
-        T: Clone + Send + Sync + 'static,
+        T: Clone + Send + Sync + serde::Serialize + 'static,
     {
-        let value = result_value;
+        // Serialize the result value as Result<T, WorkflowError>
+        let result_as_result: Result<T, WorkflowError> = Ok(result_value.clone());
+        let result_bytes = serde_json::to_vec(&result_as_result)
+            .map_err(|e| WorkflowError::SerializationError(e.to_string()))?;
 
+        // Call finish_with_bytes to do the actual work
+        self.finish_with_bytes(result_bytes).await?;
+
+        Ok(result_value)
+    }
+
+    /// Finish the workflow with raw bytes (internal use by executor)
+    pub async fn finish_with_bytes(&self, result_bytes: Vec<u8>) -> Result<(), WorkflowError> {
         // Check if workflow exists and is running
         match self.runtime.get_workflow_status(&self.context.workflow_id) {
             Some(WorkflowStatus::Running) => {},
             Some(WorkflowStatus::Completed) => {
-                self.finished.store(true, Ordering::SeqCst);
-                return Ok(value); // Already completed
+                        return Ok(()); // Already completed
             },
             Some(_) => return Err(WorkflowError::ClusterError("Workflow is not running".to_string())),
             None => return Err(WorkflowError::NotFound(self.context.workflow_id.to_string())),
         }
 
-        // Note: Results are now stored directly in WorkflowEnd commands via finish_workflow
-
-        // Use the reusable leader/follower pattern to end the workflow
         let workflow_id_owned = self.context.workflow_id.clone();
+        let result_bytes_owned = result_bytes.clone();
 
         self.runtime.execute_leader_follower_operation(
             &self.context.workflow_id,
             &self.runtime.cluster,
             || async {
-                // Leader operation: Propose WorkflowEnd command
+                // Leader operation: Propose WorkflowEnd command with result
                 let command = WorkflowCommand::WorkflowEnd(WorkflowEndData {
                     workflow_id: workflow_id_owned.clone(),
-                    result: Vec::new(),  // Empty result for workflows without explicit result
+                    result: result_bytes_owned.clone(),
                 });
 
                 self.runtime.cluster.propose_and_sync(command).await
@@ -882,15 +877,8 @@ impl WorkflowRun {
             None, // Wait indefinitely
         ).await?;
 
-        // Final state verification - check for failure after completion
-        match self.runtime.get_workflow_status(&self.context.workflow_id) {
-            Some(WorkflowStatus::Completed) => {
-                self.finished.store(true, Ordering::SeqCst);
-                Ok(value)
-            },
-            Some(WorkflowStatus::Failed) => Err(WorkflowError::ClusterError("Workflow failed".to_string())),
-            _ => Err(WorkflowError::ClusterError("Unexpected workflow state".to_string())),
-        }
+        // Mark as finished
+        Ok(())
     }
 
     /// Wait for the workflow to complete and return the result
@@ -899,12 +887,10 @@ impl WorkflowRun {
         // Check current status
         match self.runtime.get_workflow_status(&self.context.workflow_id) {
             Some(WorkflowStatus::Completed) => {
-                self.finished.store(true, Ordering::SeqCst);
-                return Ok(());
+                        return Ok(());
             },
             Some(WorkflowStatus::Failed) => {
-                self.finished.store(true, Ordering::SeqCst);
-                return Err(WorkflowError::ClusterError("Workflow failed".to_string()));
+                        return Err(WorkflowError::ClusterError("Workflow failed".to_string()));
             },
             Some(WorkflowStatus::Running) => {
                 // Continue to wait
@@ -933,36 +919,19 @@ impl WorkflowRun {
         // Final state verification
         match self.runtime.get_workflow_status(&self.context.workflow_id) {
             Some(WorkflowStatus::Completed) => {
-                self.finished.store(true, Ordering::SeqCst);
-                Ok(())
+                        Ok(())
             },
             Some(WorkflowStatus::Failed) => {
-                self.finished.store(true, Ordering::SeqCst);
-                Err(WorkflowError::ClusterError("Workflow failed".to_string()))
+                        Err(WorkflowError::ClusterError("Workflow failed".to_string()))
             },
             _ => Err(WorkflowError::ClusterError("Unexpected workflow state".to_string())),
         }
     }
 
-    /// End the workflow manually (for backward compatibility)
-    pub async fn end(&self) -> Result<(), WorkflowError> {
-        self.finish().await
-    }
 }
 
-impl Drop for WorkflowRun {
-    fn drop(&mut self) {
-        if !self.finished.load(Ordering::SeqCst) {
-            // Panic if the workflow was not properly finished
-            panic!(
-                "WorkflowRun for '{}' was dropped without calling finish() or finish_with(). \
-                 This indicates a programming error - workflows must be explicitly finished.",
-                self.context.workflow_id
-            );
-        }
-        // If finished = true, workflow was already properly ended, so it's safe to drop
-    }
-}
+// Drop implementation removed - no longer needed since workflow execution
+// happens in a separate spawned task, not tied to WorkflowRun lifetime
 
 /// A typed wrapper for WorkflowRun that preserves the output type from start_workflow_typed
 /// This allows wait_for_completion to return the correctly typed result
@@ -997,8 +966,39 @@ where
     /// Wait for the workflow to complete and return the typed result
     /// This method waits for the workflow to finish naturally and returns the result
     pub async fn wait_for_completion(self) -> Result<O, WorkflowError> {
-        // Subscribe to workflow events to get the result from the WorkflowEnd event
+        // First, subscribe to events BEFORE checking state to avoid race condition
         let mut subscription = self.inner.runtime.subscribe_to_workflow(&self.inner.context.workflow_id);
+
+        // Check if workflow already completed (race condition: completed before we subscribed)
+        match self.inner.runtime.get_workflow_status(&self.inner.context.workflow_id) {
+            Some(WorkflowStatus::Completed) => {
+                // Workflow already completed - retrieve result from stored state
+                if let Some(result_bytes) = self.inner.runtime.get_workflow_result(&self.inner.context.workflow_id) {
+                    // Deserialize and return the stored result
+                    let workflow_result: Result<O, WorkflowError> = serde_json::from_slice(&result_bytes)
+                        .map_err(|e| WorkflowError::DeserializationError(e.to_string()))?;
+
+                    return workflow_result;
+                } else {
+                    return Err(WorkflowError::ClusterError(
+                        "Workflow completed but result not found in state".to_string()
+                    ));
+                }
+            },
+            Some(WorkflowStatus::Failed) => {
+                // Try to get the error from stored results
+                if let Some(error_bytes) = self.inner.runtime.get_workflow_result(&self.inner.context.workflow_id) {
+                    let workflow_result: Result<O, WorkflowError> = serde_json::from_slice(&error_bytes)
+                        .map_err(|e| WorkflowError::DeserializationError(e.to_string()))?;
+
+                    return workflow_result;
+                }
+                return Err(WorkflowError::ClusterError("Workflow failed".to_string()));
+            },
+            _ => {
+                // Workflow still running or starting, proceed with subscription
+            }
+        }
 
         // Wait for the workflow completion event and extract the result
         let result_bytes = subscription.wait_for_event(
@@ -1017,19 +1017,16 @@ where
         ).await?;
 
         // Deserialize the result from the event data
-        let workflow_result: Result<O, String> = serde_json::from_slice(&result_bytes)
-            .map_err(|e| WorkflowError::SerializationError(e.to_string()))?;
-
-        // Mark the inner WorkflowRun as finished to prevent panic on drop
-        self.inner.finished.store(true, Ordering::SeqCst);
+        let workflow_result: Result<O, WorkflowError> = serde_json::from_slice(&result_bytes)
+            .map_err(|e| WorkflowError::DeserializationError(e.to_string()))?;
 
         // Return the final result or error
-        workflow_result.map_err(|e| WorkflowError::ClusterError(e))
+        workflow_result
     }
 }
 
 /// Error types for workflow operations
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum WorkflowError {
     /// Workflow already exists
     AlreadyExists(String),
@@ -1041,8 +1038,10 @@ pub enum WorkflowError {
     ClusterError(String),
     /// Timeout waiting for workflow to start
     Timeout,
-    /// Serialization/deserialization error
+    /// Serialization error
     SerializationError(String),
+    /// Deserialization error
+    DeserializationError(String),
 }
 
 impl std::fmt::Display for WorkflowError {
@@ -1054,6 +1053,7 @@ impl std::fmt::Display for WorkflowError {
             WorkflowError::ClusterError(msg) => write!(f, "Cluster error: {}", msg),
             WorkflowError::Timeout => write!(f, "Timeout waiting for workflow to start"),
             WorkflowError::SerializationError(msg) => write!(f, "Serialization error: {}", msg),
+            WorkflowError::DeserializationError(msg) => write!(f, "Deserialization error: {}", msg),
         }
     }
 }

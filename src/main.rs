@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Test ending the workflow
             println!("Ending workflow: {}", workflow_id);
-            match workflow_run.finish().await {
+            match workflow_run.finish_with(()).await {
                 Ok(()) => println!("Successfully ended workflow: {}", workflow_id),
                 Err(e) => eprintln!("Failed to end workflow: {}", e),
             }
