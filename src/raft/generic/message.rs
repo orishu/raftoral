@@ -14,6 +14,12 @@ pub trait CommandExecutor: Send + Sync + 'static {
     fn apply(&self, command: &Self::Command, logger: &slog::Logger) -> Result<(), Box<dyn std::error::Error>> {
         self.apply_with_index(command, logger, 0)
     }
+
+    /// Set the node ID for ownership checks (default: no-op)
+    fn set_node_id(&self, _node_id: u64) {
+        // Default implementation does nothing
+        // WorkflowCommandExecutor overrides this
+    }
 }
 
 /// Wrapper for commands with optional tracking ID

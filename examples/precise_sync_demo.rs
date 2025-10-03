@@ -14,7 +14,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             workflow_id: "workflow_1".to_string(),
             workflow_type: "test".to_string(),
             version: 1,
-            input: b"()".to_vec()
+            input: b"()".to_vec(),
+            owner_node_id: 1,
         }),
         WorkflowCommand::SetCheckpoint(CheckpointData {
             workflow_id: "workflow_1".to_string(),

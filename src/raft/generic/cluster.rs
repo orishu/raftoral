@@ -56,6 +56,9 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
 
         let executor_arc = Arc::new(executor);
 
+        // Set node ID on executor (for ownership checks)
+        executor_arc.set_node_id(node_id);
+
         // Build node_senders map (this node + all peers)
         let mut node_senders = peer_senders.clone();
         node_senders.insert(node_id, self_sender);
@@ -252,8 +255,8 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
     pub async fn propose_command(&self, command: E::Command) -> Result<bool, Box<dyn std::error::Error>> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
 
-        // Send to the first available node (in a real implementation, you'd route to the leader)
-        if let Some(node_sender) = self.node_senders.values().next() {
+        // Send to this node's local Raft instance, which will forward to leader if needed
+        if let Some(node_sender) = self.node_senders.get(&self.node_id) {
             node_sender.send(Message::Propose {
                 id: 0,
                 callback: Some(sender),
@@ -264,32 +267,72 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
             let result = receiver.await?;
             Ok(result)
         } else {
-            Err("No nodes available in cluster".into())
+            Err("Local node sender not found".into())
         }
     }
 
     /// Propose a command and wait until it's applied to the state machine
     /// Uses precise tracking with unique command IDs to wait for exact completion
     pub async fn propose_and_sync(&self, command: E::Command) -> Result<(), Box<dyn std::error::Error>> {
-        let (sender, receiver) = tokio::sync::oneshot::channel();
+        // If this node is the leader, send directly to self
+        if self.is_leader.load(Ordering::SeqCst) {
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            if let Some(node_sender) = self.node_senders.get(&self.node_id) {
+                node_sender.send(Message::Propose {
+                    id: 0,
+                    callback: None,
+                    sync_callback: Some(sender),
+                    command,
+                })?;
 
-        // Send to the first available node (in a real implementation, you'd route to the leader)
-        if let Some(node_sender) = self.node_senders.values().next() {
-            node_sender.send(Message::Propose {
+                // Wait for the specific command to be applied
+                return match receiver.await {
+                    Ok(result) => result.map_err(|e| -> Box<dyn std::error::Error> { format!("Command application error: {}", e).into() }),
+                    Err(e) => Err(format!("Command callback error: {}", e).into()),
+                };
+            }
+        }
+
+        // Not the leader - try all nodes until one succeeds (simple leader discovery)
+        // In a real implementation, we'd track the leader ID from Raft messages
+        for (node_id, node_sender) in &self.node_senders {
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+
+            // Clone the command for each attempt (in case of retries)
+            let command_clone = command.clone();
+
+            if node_sender.send(Message::Propose {
                 id: 0,
                 callback: None,
                 sync_callback: Some(sender),
-                command,
-            })?;
-
-            // Wait for the specific command to be applied
-            match receiver.await {
-                Ok(result) => result.map_err(|e| -> Box<dyn std::error::Error> { format!("Command application error: {}", e).into() }),
-                Err(e) => Err(format!("Command callback error: {}", e).into()),
+                command: command_clone,
+            }).is_err() {
+                continue; // Node channel closed, try next
             }
-        } else {
-            Err("No nodes available in cluster".into())
+
+            // Wait for response with a short timeout
+            match tokio::time::timeout(std::time::Duration::from_millis(500), receiver).await {
+                Ok(Ok(Ok(_))) => {
+                    // Success! This node was the leader
+                    return Ok(());
+                },
+                Ok(Ok(Err(e))) => {
+                    // Command application error - likely not the leader, try next node
+                    if e.to_string().contains("raft: proposal dropped") || e.to_string().contains("not leader") {
+                        continue;
+                    } else {
+                        // Different error, propagate it
+                        return Err(e);
+                    }
+                },
+                Ok(Err(_)) | Err(_) => {
+                    // Channel error or timeout, try next node
+                    continue;
+                }
+            }
         }
+
+        Err("Failed to propose command: no leader found".into())
     }
 
     /// Check if this cluster is currently the leader
@@ -318,7 +361,7 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
         change.node_id = node_id;
         conf_change.changes.push(change);
 
-        if let Some(node_sender) = self.node_senders.values().next() {
+        if let Some(node_sender) = self.node_senders.get(&self.node_id) {
             node_sender.send(Message::ConfChangeV2 {
                 id: 0,
                 callback: Some(sender),
@@ -328,7 +371,7 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
             let result = receiver.await?;
             Ok(result)
         } else {
-            Err("No nodes available in cluster".into())
+            Err("Local node sender not found".into())
         }
     }
 
@@ -342,7 +385,7 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
         change.node_id = node_id;
         conf_change.changes.push(change);
 
-        if let Some(node_sender) = self.node_senders.values().next() {
+        if let Some(node_sender) = self.node_senders.get(&self.node_id) {
             node_sender.send(Message::ConfChangeV2 {
                 id: 0,
                 callback: Some(sender),
@@ -352,7 +395,7 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
             let result = receiver.await?;
             Ok(result)
         } else {
-            Err("No nodes available in cluster".into())
+            Err("Local node sender not found".into())
         }
     }
 
@@ -372,7 +415,7 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
     pub async fn campaign(&self) -> Result<bool, Box<dyn std::error::Error>> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
 
-        if let Some(node_sender) = self.node_senders.values().next() {
+        if let Some(node_sender) = self.node_senders.get(&self.node_id) {
             node_sender.send(Message::Campaign {
                 callback: Some(sender),
             })?;
@@ -380,7 +423,7 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
             let result = receiver.await?;
             Ok(result)
         } else {
-            Err("No nodes available in cluster".into())
+            Err("Local node sender not found".into())
         }
     }
 
