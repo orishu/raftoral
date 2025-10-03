@@ -156,17 +156,9 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
     }
 
     pub fn propose_conf_change_v2(&mut self, conf_change: ConfChangeV2) -> Result<(), Box<dyn std::error::Error>> {
-        // Note: raft-rs 0.7.0 may need legacy propose_conf_change, but we'll prepare for v2
-        // For now, convert to legacy for compatibility
-        if let Some(change) = conf_change.changes.first() {
-            let mut legacy_change = ConfChange::default();
-            legacy_change.change_type = change.change_type;
-            legacy_change.node_id = change.node_id;
-            legacy_change.context = bytes::Bytes::new();
-
-            self.raft_group.propose_conf_change(vec![], legacy_change)?;
-        }
-
+        // raft-rs 0.7.0 supports ConfChangeV2 through the ConfChangeI trait
+        // Pass ConfChangeV2 directly - it will create EntryConfChangeV2 entries
+        self.raft_group.propose_conf_change(vec![], conf_change)?;
         Ok(())
     }
 
@@ -348,6 +340,8 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                 },
                 ConfChangeType::RemoveNode => {
                     slog::info!(self.logger, "Removing node from cluster (v2)"; "node_id" => node_id);
+                    // Notify the executor so it can handle workflow reassignment
+                    self.executor.on_node_removed(node_id, &self.logger);
                 },
                 ConfChangeType::AddLearnerNode => {
                     slog::info!(self.logger, "Adding learner node to cluster (v2)"; "node_id" => node_id);

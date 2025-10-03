@@ -20,6 +20,13 @@ pub trait CommandExecutor: Send + Sync + 'static {
         // Default implementation does nothing
         // WorkflowCommandExecutor overrides this
     }
+
+    /// Notify when a node is removed from the cluster
+    /// This allows the executor to react to node failures (e.g., reassign workflows)
+    fn on_node_removed(&self, _removed_node_id: u64, _logger: &slog::Logger) {
+        // Default implementation does nothing
+        // WorkflowCommandExecutor overrides this for workflow reassignment
+    }
 }
 
 /// Wrapper for commands with optional tracking ID

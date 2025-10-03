@@ -437,6 +437,67 @@ impl CommandExecutor for WorkflowCommandExecutor {
         let mut node_id = self.node_id.lock().unwrap();
         *node_id = Some(id);
     }
+
+    /// Handle node removal - reassign workflows if this node is the leader
+    fn on_node_removed(&self, removed_node_id: u64, logger: &slog::Logger) {
+        slog::info!(logger, "Node removed from cluster";
+                   "removed_node_id" => removed_node_id);
+
+        // Get the list of workflows owned by the removed node
+        let orphaned_workflows = self.ownership_map.get_workflows_owned_by(removed_node_id);
+
+        if orphaned_workflows.is_empty() {
+            slog::info!(logger, "No workflows owned by removed node";
+                       "removed_node_id" => removed_node_id);
+            return;
+        }
+
+        slog::info!(logger, "Found orphaned workflows";
+                   "removed_node_id" => removed_node_id,
+                   "count" => orphaned_workflows.len());
+
+        // Get the runtime to check if we're the leader and to propose reassignments
+        let runtime_opt = self.runtime.lock().unwrap().clone();
+        if let Some(runtime) = runtime_opt {
+            // Spawn a task to handle reassignment asynchronously
+            // This avoids blocking the ConfChange application
+            tokio::spawn(async move {
+                // Only the leader should reassign workflows
+                if !runtime.cluster.is_leader().await {
+                    return;
+                }
+
+                // Get list of available nodes (excluding the removed one)
+                let available_nodes: Vec<u64> = runtime.cluster.get_node_ids()
+                    .into_iter()
+                    .filter(|&id| id != removed_node_id)
+                    .collect();
+
+                if available_nodes.is_empty() {
+                    eprintln!("No available nodes to reassign workflows to!");
+                    return;
+                }
+
+                // Reassign each workflow to a different node (simple round-robin)
+                for (idx, workflow_id) in orphaned_workflows.iter().enumerate() {
+                    // Select new owner using round-robin
+                    let new_owner_id = available_nodes[idx % available_nodes.len()];
+
+                    // Propose OwnerChange command
+                    let command = WorkflowCommand::OwnerChange(OwnerChangeData {
+                        workflow_id: workflow_id.clone(),
+                        old_owner_node_id: removed_node_id,
+                        new_owner_node_id: new_owner_id,
+                        reason: OwnerChangeReason::NodeFailure,
+                    });
+
+                    if let Err(e) = runtime.cluster.propose_and_sync(command).await {
+                        eprintln!("Failed to reassign workflow {}: {:?}", workflow_id, e);
+                    }
+                }
+            });
+        }
+    }
 }
 
 /// Status of a workflow
