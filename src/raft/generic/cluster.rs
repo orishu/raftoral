@@ -274,65 +274,77 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
     /// Propose a command and wait until it's applied to the state machine
     /// Uses precise tracking with unique command IDs to wait for exact completion
     pub async fn propose_and_sync(&self, command: E::Command) -> Result<(), Box<dyn std::error::Error>> {
-        // If this node is the leader, send directly to self
-        if self.is_leader.load(Ordering::SeqCst) {
-            let (sender, receiver) = tokio::sync::oneshot::channel();
-            if let Some(node_sender) = self.node_senders.get(&self.node_id) {
-                node_sender.send(Message::Propose {
+        // Retry up to 10 times with exponential backoff to handle leader elections
+        let max_retries = 10;
+        let mut retry_delay_ms = 100;
+
+        for retry in 0..max_retries {
+            // If this node is the leader, send directly to self
+            if self.is_leader.load(Ordering::SeqCst) {
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                if let Some(node_sender) = self.node_senders.get(&self.node_id) {
+                    node_sender.send(Message::Propose {
+                        id: 0,
+                        callback: None,
+                        sync_callback: Some(sender),
+                        command: command.clone(),
+                    })?;
+
+                    // Wait for the specific command to be applied
+                    return match receiver.await {
+                        Ok(result) => result.map_err(|e| -> Box<dyn std::error::Error> { format!("Command application error: {}", e).into() }),
+                        Err(e) => Err(format!("Command callback error: {}", e).into()),
+                    };
+                }
+            }
+
+            // Not the leader - try all nodes until one succeeds (simple leader discovery)
+            // In a real implementation, we'd track the leader ID from Raft messages
+            for (_node_id, node_sender) in &self.node_senders {
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+
+                // Clone the command for each attempt (in case of retries)
+                let command_clone = command.clone();
+
+                if node_sender.send(Message::Propose {
                     id: 0,
                     callback: None,
                     sync_callback: Some(sender),
-                    command,
-                })?;
+                    command: command_clone,
+                }).is_err() {
+                    continue; // Node channel closed, try next
+                }
 
-                // Wait for the specific command to be applied
-                return match receiver.await {
-                    Ok(result) => result.map_err(|e| -> Box<dyn std::error::Error> { format!("Command application error: {}", e).into() }),
-                    Err(e) => Err(format!("Command callback error: {}", e).into()),
-                };
-            }
-        }
-
-        // Not the leader - try all nodes until one succeeds (simple leader discovery)
-        // In a real implementation, we'd track the leader ID from Raft messages
-        for (node_id, node_sender) in &self.node_senders {
-            let (sender, receiver) = tokio::sync::oneshot::channel();
-
-            // Clone the command for each attempt (in case of retries)
-            let command_clone = command.clone();
-
-            if node_sender.send(Message::Propose {
-                id: 0,
-                callback: None,
-                sync_callback: Some(sender),
-                command: command_clone,
-            }).is_err() {
-                continue; // Node channel closed, try next
-            }
-
-            // Wait for response with a short timeout
-            match tokio::time::timeout(std::time::Duration::from_millis(500), receiver).await {
-                Ok(Ok(Ok(_))) => {
-                    // Success! This node was the leader
-                    return Ok(());
-                },
-                Ok(Ok(Err(e))) => {
-                    // Command application error - likely not the leader, try next node
-                    if e.to_string().contains("raft: proposal dropped") || e.to_string().contains("not leader") {
+                // Wait for response with a short timeout
+                match tokio::time::timeout(std::time::Duration::from_millis(500), receiver).await {
+                    Ok(Ok(Ok(_))) => {
+                        // Success! This node was the leader
+                        return Ok(());
+                    },
+                    Ok(Ok(Err(e))) => {
+                        // Command application error - likely not the leader, try next node
+                        if e.to_string().contains("raft: proposal dropped") || e.to_string().contains("not leader") {
+                            continue;
+                        } else {
+                            // Different error, propagate it
+                            return Err(e);
+                        }
+                    },
+                    Ok(Err(_)) | Err(_) => {
+                        // Channel error or timeout, try next node
                         continue;
-                    } else {
-                        // Different error, propagate it
-                        return Err(e);
                     }
-                },
-                Ok(Err(_)) | Err(_) => {
-                    // Channel error or timeout, try next node
-                    continue;
                 }
             }
+
+            // No leader found in this round - sleep and retry
+            if retry < max_retries - 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(retry_delay_ms)).await;
+                retry_delay_ms = (retry_delay_ms * 2).min(1000); // Exponential backoff, max 1s
+            }
         }
 
-        Err("Failed to propose command: no leader found".into())
+        Err("Failed to propose command: no leader found after retries".into())
     }
 
     /// Check if this cluster is currently the leader

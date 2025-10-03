@@ -308,7 +308,7 @@ impl CommandExecutor for WorkflowCommandExecutor {
                                 Ok(result_bytes) => {
                                     // Workflow execution succeeded - call finish_with to propose WorkflowEnd
                                     // Owner node proposes the WorkflowEnd command
-                                    // If this node is not the leader, the local Raft will forward to leader
+                                    // The proposal will be forwarded to the leader if needed
                                     match workflow_run.finish_with_bytes(result_bytes).await {
                                         Ok(_) => {
                                             slog::info!(slog::Logger::root(slog::Discard, slog::o!()),
