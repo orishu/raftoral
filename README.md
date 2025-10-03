@@ -4,140 +4,189 @@ A Rust library for building fault-tolerant, distributed workflows using the Raft
 
 ## Overview
 
-Raftoral provides a simplified approach to distributed workflow orchestration, focusing on long-running programs that require reliability across node failures. Instead of relying on centralized databases for event sourcing, Raftoral replicates workflow state via Raft consensus, enabling seamless failover and recovery.
+Raftoral provides a distributed workflow orchestration engine where workflows execute in parallel across all cluster nodes. Using Raft consensus for coordination, it enables seamless failover and recovery without centralized databases.
 
-**Key Innovation**: Workflows execute on all nodes (leader and followers), with a queue-based catch-up mechanism allowing late followers to synchronize without blocking cluster progress. This enables true distributed execution that respects Raft's consensus principles.
+**Key Innovation**: All nodes (leader + followers) execute workflows simultaneously. Checkpoint queues handle late followers, allowing cluster progress even when some nodes lag behind. This respects Raft's consensus principles while maximizing distributed execution.
 
 ## Current Status
 
 **Production-Ready Features:**
-- ✅ Single-node Raft cluster with full consensus
+- ✅ Multi-node Raft cluster with full consensus
+- ✅ Parallel workflow execution on all nodes
 - ✅ Type-safe workflow registry with closure-based registration
-- ✅ Automatic workflow execution on all nodes
 - ✅ Replicated variables for checkpointing workflow state
 - ✅ Late follower catch-up via checkpoint queues
 - ✅ Leadership transition support
+- ✅ Transport abstraction (InMemoryClusterTransport)
+- ✅ Universal workflow initiation (any node can start)
 - ✅ Event-driven architecture (no polling)
-- ✅ Comprehensive test coverage (11 unit tests)
+- ✅ Comprehensive test coverage (20 tests including multi-node)
 
-**Architecture Ready for Multi-Node:**
-- Queue-based checkpoint synchronization
-- Leader/follower execution coordination
-- Dynamic leadership transition handling
-- Full Raft consensus integration
+## Quick Start
 
-## Key Features
+### Multi-Node Cluster Setup
 
-### Type-Safe Workflow Registration
+```rust
+use raftoral::raft::generic::transport::{ClusterTransport, InMemoryClusterTransport};
+use raftoral::workflow::{WorkflowCommandExecutor, WorkflowRuntime, WorkflowContext};
 
-Register workflows using simple closures with full type safety:
+// 1. Create transport for 3-node cluster
+let transport = InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3]);
+transport.start().await?;
+
+// 2. Create runtimes (executors and self-registration automatic)
+let runtime1 = WorkflowRuntime::new(transport.create_cluster(1).await?);
+let runtime2 = WorkflowRuntime::new(transport.create_cluster(2).await?);
+let runtime3 = WorkflowRuntime::new(transport.create_cluster(3).await?);
+
+// 3. Register workflow on all nodes
+let workflow = |input: OrderInput, ctx: WorkflowContext| async move {
+    let status = ctx.create_replicated_var("status", "processing").await?;
+    // ... business logic ...
+    Ok(OrderOutput { id: input.id })
+};
+
+runtime1.register_workflow_closure("process_order", 1, workflow.clone())?;
+runtime2.register_workflow_closure("process_order", 1, workflow.clone())?;
+runtime3.register_workflow_closure("process_order", 1, workflow)?;
+
+// 4. Start from any node - Raft handles routing
+let run = runtime1.start_workflow_typed("process_order", 1, input).await?;
+let result = run.wait_for_completion().await?;
+```
+
+### Single-Node Setup (for testing)
 
 ```rust
 use raftoral::{WorkflowRuntime, WorkflowContext};
 
-let workflow_runtime = WorkflowRuntime::new_single_node(1).await?;
+let runtime = WorkflowRuntime::new_single_node(1).await?;
+tokio::time::sleep(Duration::from_millis(500)).await; // Wait for leadership
 
-// Register a typed workflow
-workflow_runtime.register_workflow_closure(
-    "process_order",
+runtime.register_workflow_closure("my_workflow", 1,
+    |input: MyInput, ctx: WorkflowContext| async move {
+        Ok(MyOutput { /* ... */ })
+    }
+)?;
+
+let run = runtime.start_workflow_typed("my_workflow", 1, input).await?;
+let result = run.wait_for_completion().await?;
+```
+
+## Key Features
+
+### 1. Consensus-Driven Parallel Execution
+
+All nodes execute workflows when they see `WorkflowStart` through Raft consensus:
+
+- **Leader**: Executes and proposes checkpoints/completion via Raft
+- **Followers**: Execute in parallel, consuming checkpoints from queue
+- **Load Distribution**: Computation spread across entire cluster
+- **Fault Tolerance**: Any node can complete if leader fails
+
+### 2. Type-Safe Workflow Registration
+
+```rust
+runtime.register_workflow_closure(
+    "fibonacci",
     1,
-    |input: OrderInput, context: WorkflowContext| async move {
-        // Workflow logic with automatic checkpointing
-        let status = context.create_replicated_var("status", "pending").await?;
-
-        // ... business logic ...
-
-        Ok(OrderResult { order_id: input.id })
+    |input: FibonacciInput, context: WorkflowContext| async move {
+        let mut a = 0u64;
+        let mut b = 1u64;
+        for _ in 2..=input.n {
+            let temp = a + b;
+            a = b;
+            b = temp;
+        }
+        Ok(FibonacciOutput { result: b })
     }
 )?;
 ```
 
-### Replicated Variables
-
-Checkpoint workflow state with automatic serialization and replication:
+### 3. Replicated Variables with Automatic Checkpointing
 
 ```rust
-// Direct value initialization
-let counter = ReplicatedVar::with_value("counter", &workflow_run, 42).await?;
+// Create checkpointed variable
+let counter = context.create_replicated_var("counter", 0).await?;
 
-// Computed values (for side effects)
-let api_result = ReplicatedVar::with_computation(
-    "api_result",
-    &workflow_run,
-    || async {
-        // Side effect - only executed once, result replicated
-        call_external_api().await
-    }
-).await?;
-
-// Updates
+// Atomic updates
 counter.update(|val| val + 1).await?;
+
+// Computed values (for external API calls)
+let api_result = context.create_replicated_var_with_computation(
+    "api_result",
+    || async { call_external_api().await }
+).await?;
 ```
 
-### Automatic Workflow Execution
+### 4. Late Follower Catch-Up (Checkpoint Queues)
 
-Workflows execute automatically in the background on all nodes:
+**Problem**: Follower receives checkpoint before execution reaches that point → deadlock
 
-```rust
-// Start a typed workflow
-let workflow_run = workflow_runtime
-    .start_workflow::<Input, Output>("process_order", 1, input)
-    .await?;
-
-// Wait for natural completion (no manual coordination needed)
-let result = workflow_run.wait_for_completion().await?;
-```
-
-### Late Follower Catch-Up
-
-**The Innovation**: Followers can lag behind the leader without blocking cluster progress.
-
-When a follower's Raft log receives checkpoint commands before execution reaches those points, values are queued. When execution catches up, it consumes from the queue. Simple FIFO semantics with deterministic execution guarantee correctness.
-
-**Leader queue cleanup**: After proposing a checkpoint, the leader pops its own value from the queue, preventing self-consumption while allowing followers to catch up independently.
+**Solution**: Queue checkpoint values, pop on first access
+- FIFO queue per (workflow_id, checkpoint_key)
+- Deterministic execution ensures correctness
+- Leader cleanup prevents self-consumption
+- Cluster progresses even with slow followers
 
 ## Architecture
 
-### Execution Model
+### Execution Flow
 
-**All nodes execute workflows**, but with different timing:
-- **Leader**: Executes in real-time, proposing checkpoints via consensus
-- **Followers**: May lag behind, consuming checkpoints from queue as they catch up
-- **New Leaders**: Finish consuming queued checkpoints before proposing new ones
+1. Any node proposes `WorkflowStart(type, version, input)` via Raft
+2. Consensus applies WorkflowStart on ALL nodes → all spawn execution
+3. Leader's execution completes → proposes `WorkflowEnd(result)`
+4. Consensus applies WorkflowEnd → followers exit gracefully
 
-### Consensus-Driven Workflow Execution
+### Transport Abstraction
 
-1. **Workflow Registration**: All nodes register the same workflow functions
-2. **Initiation**: Leader receives start request, proposes `WorkflowStart` event
-3. **Execution**: All nodes spawn workflow execution upon seeing `WorkflowStart`
-4. **Checkpointing**:
-   - Leader proposes `SetCheckpoint` commands
-   - All nodes enqueue checkpoints in `apply()`
-   - Leader cleans up its own values
-   - Followers consume from queue
-5. **Completion**: Leader's execution calls `finish_with()`, proposing `WorkflowEnd`
+```rust
+pub trait ClusterTransport<E: CommandExecutor> {
+    fn create_cluster(&self, node_id: u64)
+        -> Future<Output = Arc<RaftCluster<E>>>;
+    fn node_ids(&self) -> Vec<u64>;
+    fn start(&self) -> Future<Output = Result<()>>;
+    fn shutdown(&self) -> Future<Output = Result<()>>;
+}
+```
+
+- `InMemoryClusterTransport` - Local testing via tokio channels
+- Future: `GrpcClusterTransport` - Distributed deployment
 
 ### Event-Driven Coordination
 
-No polling or heuristic delays - all synchronization via Tokio broadcast channels:
+No polling - all synchronization via Tokio broadcast channels:
 
 ```rust
 pub enum WorkflowEvent {
     Started { workflow_id: String },
-    Completed { workflow_id: String, result: Vec<u8> },
-    Failed { workflow_id: String, error: String },
-    CheckpointSet { workflow_id: String, key: String, value: Vec<u8> },
+    Completed { workflow_id: String },
+    Failed { workflow_id: String },
+    CheckpointSet { workflow_id: String, key: String },
 }
+```
+
+## Running Examples
+
+```bash
+# Multi-node fibonacci example
+cargo test test_three_node_cluster_workflow_execution -- --nocapture
+
+# Typed workflow with checkpoints
+cargo run --example typed_workflow_example
+
+# Run all tests
+cargo test
+
+# With logging
+RUST_LOG=info cargo test
 ```
 
 ## Working Example
 
-See `examples/typed_workflow_example.rs` for a complete working example:
+See `examples/typed_workflow_example.rs`:
 
 ```rust
-use raftoral::{WorkflowContext, WorkflowRuntime};
-use serde::{Deserialize, Serialize};
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ComputationInput {
     base_value: i32,
@@ -145,30 +194,18 @@ struct ComputationInput {
     iterations: u32,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct ComputationOutput {
-    final_result: i32,
-    intermediate_values: Vec<i32>,
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let workflow_runtime = WorkflowRuntime::new_single_node(1).await?;
-
-    // Wait for leadership
+    let runtime = WorkflowRuntime::new_single_node(1).await?;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Register workflow
-    workflow_runtime.register_workflow_closure(
-        "computation",
-        1,
+    runtime.register_workflow_closure(
+        "computation", 1,
         |input: ComputationInput, context: WorkflowContext| async move {
-            let mut progress = context.create_replicated_var("progress", 0u32).await?;
             let mut current_value = input.base_value;
             let mut results = Vec::new();
 
             for i in 0..input.iterations {
-                progress.update(|p| p + 1).await?;
                 current_value *= input.multiplier;
                 results.push(current_value);
 
@@ -186,155 +223,118 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     )?;
 
-    // Execute workflow
-    let input = ComputationInput { base_value: 2, multiplier: 3, iterations: 4 };
-    let workflow_run = workflow_runtime
-        .start_workflow("computation", 1, input)
-        .await?;
+    let input = ComputationInput {
+        base_value: 2,
+        multiplier: 3,
+        iterations: 4
+    };
 
-    let result = workflow_run.wait_for_completion().await?;
+    let run = runtime.start_workflow_typed("computation", 1, input).await?;
+    let result = run.wait_for_completion().await?;
+
     println!("Result: {}", result.final_result); // 162
-
     Ok(())
 }
 ```
 
-## Getting Started
+## Development Milestones
 
-### Prerequisites
+### Completed ✅
 
-- Rust 1.70 or later
-- Tokio async runtime
+**Milestone 8: Checkpoint Queues for Late Followers**
+- Queue-based catch-up mechanism
+- Leader cleanup to prevent self-consumption
+- Deterministic FIFO ordering
 
-### Installation
+**Milestone 9: Multi-Node Cluster Transport**
+- ClusterTransport trait abstraction
+- InMemoryClusterTransport implementation
+- Universal workflow initiation
+- Proper leader election across nodes
+
+**Milestone 10: API Simplification**
+- Automatic executor creation via Default trait
+- WorkflowRuntime::new() returns Arc<Self> and auto-registers
+- Clean 3-line setup (down from ~15 lines)
+
+### Next Steps 🚀
+
+**Milestone 11: Raft Snapshots**
+- State snapshots for new node catch-up
+- Checkpoint history tracking
+- Snapshot creation and application
+
+**Future Enhancements**
+- GrpcClusterTransport for distributed deployment
+- Advanced workflow patterns (child workflows, compensation)
+- Observability and metrics
+- Performance benchmarking
+
+## Technical Details
+
+### Performance
+- **Command Processing**: 30-171µs (microseconds)
+- **Event-Driven**: Zero polling overhead
+- **Optimized For**: Orchestration-heavy workflows
+
+### Requirements
+- **Rust**: 1.70 or later
+- **Deterministic Execution**: Same input → same operation sequence
+- **Serializable State**: Types must implement `Serialize + Deserialize`
+- **Type Safety**: Full compile-time checking
+
+### Current Limitations
+- Workflow functions must be registered identically on all nodes
+- No built-in compensation/rollback (implement in workflow logic)
+- In-memory storage only (snapshots coming in Milestone 11)
+
+## Installation
 
 Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-raftoral = "0.1.0"
+raftoral = { path = "path/to/raftoral" }  # or git/version when published
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 ```
 
-### Basic Usage
+## File Organization
 
-```rust
-use raftoral::{WorkflowRuntime, WorkflowContext};
-
-// 1. Create a workflow runtime
-let runtime = WorkflowRuntime::new_single_node(1).await?;
-tokio::time::sleep(Duration::from_millis(500)).await; // Wait for leadership
-
-// 2. Register your workflow
-runtime.register_workflow_closure(
-    "my_workflow",
-    1,
-    |input: MyInput, context: WorkflowContext| async move {
-        // Your workflow logic here
-        Ok(MyOutput { /* ... */ })
-    }
-)?;
-
-// 3. Start execution
-let workflow_run = runtime
-    .start_workflow("my_workflow", 1, input)
-    .await?;
-
-// 4. Wait for completion
-let result = workflow_run.wait_for_completion().await?;
 ```
+src/
+├── raft/generic/
+│   ├── cluster.rs      # RaftCluster coordination
+│   ├── node.rs         # RaftNode raft-rs integration
+│   ├── transport.rs    # ClusterTransport abstraction
+│   └── message.rs      # Message types
+├── workflow/
+│   ├── execution.rs    # WorkflowRuntime, events
+│   ├── registry.rs     # Type-safe workflow storage
+│   └── replicated_var.rs # Checkpointed variables
+└── lib.rs              # Public API
 
-### Running Examples
+tests/
+└── multi_node_test.rs  # 3-node integration tests
 
-```bash
-# Build and run the typed workflow example
-cargo run --example typed_workflow_example
-
-# Run tests
-cargo test
-
-# Run with logging
-RUST_LOG=info cargo run --example typed_workflow_example
+examples/
+├── typed_workflow_example.rs
+├── simple_workflow.rs
+└── scoped_workflow.rs
 ```
-
-## Development Status
-
-### Completed Milestones
-
-**✅ Milestone 1**: Single-node Raft with command proposal and application
-- Proper raft-rs integration
-- Command serialization and consensus
-- Event-driven state machine
-
-**✅ Milestone 2**: Event-driven workflow execution
-- WorkflowRuntime singleton pattern
-- Race condition-free architecture
-- Microsecond-level performance (30-171µs command completion)
-
-**✅ Milestone 3**: Workflow registry with type-safe execution
-- Closure-based workflow registration
-- Generic input/output types with serialization
-- Automatic background execution
-
-**✅ Milestone 4-7**: Architecture refinements
-- Clean ownership hierarchies
-- Simplified APIs
-- Code quality improvements
-- Removed deprecated methods
-
-**✅ Milestone 8**: Late follower catch-up with checkpoint queues
-- Queue-based synchronization
-- Leader queue cleanup
-- Leadership transition support
-- Simple FIFO deterministic execution
-
-### Upcoming Work
-
-**Next: Multi-Node Testing**
-- 3+ node cluster tests
-- Actual leader election during workflows
-- Network partition simulation
-- Failover and recovery validation
-
-**Future Enhancements**
-- Child workflows
-- Parallel execution branches
-- Compensation/saga patterns
-- Observability and metrics
-- Production hardening
-
-## Technical Details
-
-### Performance
-
-- **Command Processing**: 30-171µs (microseconds)
-- **Event-Driven**: Zero polling overhead
-- **Optimized for**: Orchestration-heavy workflows, not compute-intensive tasks
-
-### Requirements
-
-- **Deterministic Execution**: Same input produces same sequence of operations
-- **Serializable State**: All checkpointed types must implement `Serialize + Deserialize`
-- **Type Safety**: Full compile-time type checking for workflow inputs/outputs
-
-### Limitations
-
-- Currently single-node testing only (multi-node architecture ready)
-- Workflow functions must be registered on all nodes identically
-- No built-in compensation/rollback (can be implemented in workflow logic)
-
-## Author
-
-**Ori Shalev** - [ori.shalev@gmail.com](mailto:ori.shalev@gmail.com)
 
 ## Contributing
 
 Contributions welcome! Areas of interest:
-- Multi-node cluster testing
+- Multi-node fault injection testing
+- GrpcClusterTransport implementation
 - Advanced workflow patterns
 - Performance benchmarking
 - Documentation improvements
+
+## Author
+
+**Ori Shalev** - [ori.shalev@gmail.com](mailto:ori.shalev@gmail.com)
 
 ## License
 
@@ -343,5 +343,5 @@ MIT License. See [LICENSE](LICENSE) for details.
 ## Acknowledgments
 
 - Built on [raft-rs](https://github.com/tikv/raft-rs) for Raft consensus
-- Inspired by [Temporal](https://temporal.io/) workflow orchestration concepts
+- Inspired by [Temporal](https://temporal.io/) workflow orchestration
 - Uses [Tokio](https://tokio.rs/) for async runtime

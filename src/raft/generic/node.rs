@@ -2,11 +2,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, mpsc};
-use raft::{prelude::*, storage::MemStorage};
+use tokio::sync::{RwLock, mpsc, broadcast};
+use raft::{prelude::*, storage::MemStorage, StateRole};
 use slog::{Drain, Logger};
 use protobuf::Message as PbMessage;
 use crate::raft::generic::message::{Message, CommandExecutor, CommandWrapper};
+use crate::raft::generic::cluster::RoleChange;
 
 pub type SyncCallback = tokio::sync::oneshot::Sender<Result<(), Box<dyn std::error::Error + Send + Sync>>>;
 
@@ -27,6 +28,12 @@ pub struct RaftNode<E: CommandExecutor> {
 
     // Command executor for applying committed commands
     executor: Arc<E>,
+
+    // Role change notifications
+    role_change_tx: broadcast::Sender<RoleChange>,
+
+    // Track current role to detect changes
+    current_role: StateRole,
 }
 
 impl<E: CommandExecutor + 'static> RaftNode<E> {
@@ -35,6 +42,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
         mailbox: mpsc::UnboundedReceiver<Message<E::Command>>,
         peers: HashMap<u64, mpsc::UnboundedSender<Message<E::Command>>>,
         executor: Arc<E>,
+        role_change_tx: broadcast::Sender<RoleChange>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let config = Config {
             id: node_id,
@@ -73,6 +81,8 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             sync_commands: HashMap::new(),
             next_command_id: AtomicU64::new(1),
             executor,
+            role_change_tx,
+            current_role: StateRole::Follower, // Start as follower
         })
     }
 
@@ -81,6 +91,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
         mailbox: mpsc::UnboundedReceiver<Message<E::Command>>,
         peers: HashMap<u64, mpsc::UnboundedSender<Message<E::Command>>>,
         executor: Arc<E>,
+        role_change_tx: broadcast::Sender<RoleChange>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let config = Config {
             id: node_id,
@@ -95,12 +106,15 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
 
         let storage = MemStorage::new();
 
-        // If this is a single-node cluster, set up the initial configuration
-        if peers.is_empty() {
-            let mut initial_state = ConfState::default();
-            initial_state.voters.push(node_id);
-            storage.wl().set_conf_state(initial_state);
+        // Set up the initial cluster configuration
+        let mut initial_state = ConfState::default();
+        // Add ourselves as a voter
+        initial_state.voters.push(node_id);
+        // Add all peers as voters
+        for &peer_id in peers.keys() {
+            initial_state.voters.push(peer_id);
         }
+        storage.wl().set_conf_state(initial_state);
 
         // Create logger for this node
         let decorator = slog_term::TermDecorator::new().build();
@@ -120,6 +134,8 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             sync_commands: HashMap::new(),
             next_command_id: AtomicU64::new(1),
             executor,
+            role_change_tx,
+            current_role: StateRole::Follower, // Start as follower
         })
     }
 
@@ -192,9 +208,20 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             store.wl().set_hardstate(hs.clone());
         }
 
-        // Handle soft state changes (informational only)
-        if let Some(_ss) = ready.ss() {
-            // Soft state changes don't need special handling
+        // Handle soft state changes (role changes)
+        if let Some(ss) = ready.ss() {
+            let new_role = ss.raft_state;
+            if new_role != self.current_role {
+                // Role changed - emit notification
+                let role_change = match new_role {
+                    StateRole::Leader => RoleChange::BecameLeader(self.node_id),
+                    StateRole::Follower => RoleChange::BecameFollower(self.node_id),
+                    StateRole::Candidate => RoleChange::BecameCandidate(self.node_id),
+                    StateRole::PreCandidate => RoleChange::BecameFollower(self.node_id), // Treat as follower
+                };
+                let _ = self.role_change_tx.send(role_change);
+                self.current_role = new_role;
+            }
         }
 
         // Send persisted messages

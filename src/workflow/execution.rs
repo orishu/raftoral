@@ -57,8 +57,8 @@ pub struct WorkflowCommandExecutor {
     runtime: Arc<Mutex<Option<Arc<WorkflowRuntime>>>>,
 }
 
-impl WorkflowCommandExecutor {
-    pub fn new() -> Self {
+impl Default for WorkflowCommandExecutor {
+    fn default() -> Self {
         let (event_tx, _) = broadcast::channel(1000);
         Self {
             state: Arc::new(Mutex::new(WorkflowState::default())),
@@ -66,6 +66,12 @@ impl WorkflowCommandExecutor {
             registry: Arc::new(Mutex::new(WorkflowRegistry::new())),
             runtime: Arc::new(Mutex::new(None)),
         }
+    }
+}
+
+impl WorkflowCommandExecutor {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Set the workflow runtime reference (called after runtime construction)
@@ -344,6 +350,35 @@ impl WorkflowSubscription {
 }
 
 impl WorkflowRuntime {
+    /// Create a new workflow runtime from an existing cluster
+    ///
+    /// This is the primary constructor for multi-node setups where the cluster
+    /// is created via a ClusterTransport. The runtime automatically sets itself
+    /// in the cluster's executor to enable workflow execution.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use raftoral::raft::generic::transport::{ClusterTransport, InMemoryClusterTransport};
+    /// # use raftoral::workflow::{WorkflowCommandExecutor, WorkflowRuntime};
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let transport = InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3]);
+    /// let cluster = transport.create_cluster(1).await?;
+    /// let runtime = WorkflowRuntime::new(cluster);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new(cluster: Arc<RaftCluster<WorkflowCommandExecutor>>) -> Arc<Self> {
+        let runtime = Arc::new(WorkflowRuntime {
+            cluster: cluster.clone(),
+        });
+
+        // Automatically set the runtime reference in the executor
+        cluster.executor.set_runtime(runtime.clone());
+
+        runtime
+    }
+
     /// Create a new workflow runtime and cluster
     pub async fn new_single_node(node_id: u64) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         let executor = WorkflowCommandExecutor::new();
@@ -666,35 +701,17 @@ impl WorkflowRuntime {
             }
         }
 
-        let cluster = self.cluster.clone();
-        let workflow_id_owned = workflow_id.clone();
+        // Propose WorkflowStart command directly - Raft will handle leader routing
+        // All nodes will execute the workflow when they see it applied via consensus
+        let command = WorkflowCommand::WorkflowStart(WorkflowStartData {
+            workflow_id: workflow_id.clone(),
+            workflow_type: workflow_type.to_string(),
+            version,
+            input: input_bytes.clone(),
+        });
 
-        // Use the reusable leader/follower pattern to start the workflow with type and version info
-        self.execute_leader_follower_operation(
-            &workflow_id,
-            &cluster,
-            || async {
-                // Leader operation: Propose WorkflowStart command with type, version, and input
-                let command = WorkflowCommand::WorkflowStart(WorkflowStartData {
-                    workflow_id: workflow_id_owned.clone(),
-                    workflow_type: workflow_type.to_string(),
-                    version,
-                    input: input_bytes.clone(),
-                });
-
-                cluster.propose_and_sync(command).await
-                    .map_err(|e| WorkflowError::ClusterError(e.to_string()))?;
-                Ok(())
-            },
-            |event| {
-                if matches!(event, WorkflowEvent::Started { .. }) {
-                    Some(())
-                } else {
-                    None
-                }
-            },
-            Some(Duration::from_secs(10)),
-        ).await?;
+        self.cluster.propose_and_sync(command).await
+            .map_err(|e| WorkflowError::ClusterError(e.to_string()))?;
 
         // Create and return TypedWorkflowRun
         let context = WorkflowContext {

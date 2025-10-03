@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, broadcast};
 use raft::prelude::*;
@@ -25,9 +25,115 @@ pub struct RaftCluster<E: CommandExecutor> {
     next_command_id: Arc<AtomicU64>,
     // Command executor for applying commands
     pub executor: Arc<E>,
+    // Track if this node is currently the leader
+    is_leader: Arc<AtomicBool>,
+    // The ID of this node
+    node_id: u64,
 }
 
 impl<E: CommandExecutor + 'static> RaftCluster<E> {
+    /// Create a new cluster node with pre-configured transport channels
+    ///
+    /// This is the primary constructor used by ClusterTransport implementations.
+    /// It creates a single RaftCluster instance that represents one node in a
+    /// potentially multi-node cluster.
+    ///
+    /// # Arguments
+    /// * `node_id` - Unique identifier for this node
+    /// * `receiver` - Channel to receive messages for this node
+    /// * `peer_senders` - Map of peer node IDs to their message senders (excluding self)
+    /// * `self_sender` - Sender for this node's own mailbox
+    /// * `executor` - Command executor for applying committed commands
+    pub async fn new_with_transport(
+        node_id: u64,
+        receiver: mpsc::UnboundedReceiver<Message<E::Command>>,
+        peer_senders: HashMap<u64, mpsc::UnboundedSender<Message<E::Command>>>,
+        self_sender: mpsc::UnboundedSender<Message<E::Command>>,
+        executor: E,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Create role change broadcast channel
+        let (role_change_tx, _role_change_rx) = broadcast::channel(100);
+
+        let executor_arc = Arc::new(executor);
+
+        // Build node_senders map (this node + all peers)
+        let mut node_senders = peer_senders.clone();
+        node_senders.insert(node_id, self_sender);
+
+        let node_count = node_senders.len();
+
+        // Determine if this is a single-node or multi-node setup
+        let is_single_node = peer_senders.is_empty();
+        let is_leader_arc = Arc::new(AtomicBool::new(is_single_node)); // Single nodes start as leader
+
+        let cluster = RaftCluster {
+            node_senders,
+            node_count,
+            role_change_tx: role_change_tx.clone(),
+            next_command_id: Arc::new(AtomicU64::new(1)),
+            executor: executor_arc.clone(),
+            is_leader: is_leader_arc.clone(),
+            node_id,
+        };
+
+        // Spawn a task to listen for role changes and update is_leader
+        let is_leader_listener = is_leader_arc.clone();
+        let mut role_rx = role_change_tx.subscribe();
+        let listen_node_id = node_id;
+        tokio::spawn(async move {
+            while let Ok(role_change) = role_rx.recv().await {
+                match role_change {
+                    RoleChange::BecameLeader(id) if id == listen_node_id => {
+                        is_leader_listener.store(true, Ordering::SeqCst);
+                    }
+                    RoleChange::BecameFollower(id) if id == listen_node_id => {
+                        is_leader_listener.store(false, Ordering::SeqCst);
+                    }
+                    RoleChange::BecameCandidate(id) if id == listen_node_id => {
+                        is_leader_listener.store(false, Ordering::SeqCst);
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        // Create and spawn the Raft node
+        let role_tx_for_node = role_change_tx.clone();
+        tokio::spawn(async move {
+            let mut node = if is_single_node {
+                match RaftNode::<E>::new_single_node(node_id, receiver, peer_senders, executor_arc.clone(), role_tx_for_node) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        eprintln!("Failed to create single-node RaftNode {}: {}", node_id, e);
+                        return;
+                    }
+                }
+            } else {
+                match RaftNode::<E>::new(node_id, receiver, peer_senders, executor_arc.clone(), role_tx_for_node) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        eprintln!("Failed to create RaftNode {}: {}", node_id, e);
+                        return;
+                    }
+                }
+            };
+
+            if let Err(e) = node.run().await {
+                eprintln!("Node {} exited with error: {}", node_id, e);
+            }
+        });
+
+        // Give the node time to initialize
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // For single node, manually trigger campaign to become leader
+        if is_single_node {
+            cluster.campaign().await?;
+        }
+
+        Ok(cluster)
+    }
+
     pub async fn new_single_node(node_id: u64, executor: E) -> Result<Self, Box<dyn std::error::Error>> {
         let mut node_senders = HashMap::new();
         let (sender, receiver) = mpsc::unbounded_channel();
@@ -41,17 +147,22 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
         let (role_change_tx, _role_change_rx) = broadcast::channel(100);
 
         let executor_arc = Arc::new(executor);
+        let is_leader_arc = Arc::new(AtomicBool::new(true)); // Single node starts as leader
+
         let cluster = RaftCluster {
             node_senders,
             node_count: 1,
             role_change_tx: role_change_tx.clone(),
             next_command_id: Arc::new(AtomicU64::new(1)),
             executor: executor_arc.clone(),
+            is_leader: is_leader_arc.clone(),
+            node_id,
         };
 
         // Create and run the single node using the multi-node constructor
+        let role_tx_clone = role_change_tx.clone();
         tokio::spawn(async move {
-            let mut node = match RaftNode::<E>::new(node_id, receiver, peers, executor_arc.clone()) {
+            let mut node = match RaftNode::<E>::new(node_id, receiver, peers, executor_arc.clone(), role_tx_clone) {
                 Ok(n) => n,
                 Err(e) => {
                     eprintln!("Failed to create RaftNode {}: {}", node_id, e);
@@ -88,12 +199,17 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
         let (role_change_tx, _role_change_rx) = broadcast::channel(100);
 
         let executor_arc = Arc::new(executor);
+        let first_node_id = node_ids[0]; // Use first node ID as representative
+        let is_leader_arc = Arc::new(AtomicBool::new(false)); // Multi-node starts as follower
+
         let cluster = RaftCluster {
             node_senders: node_senders.clone(),
             node_count: node_ids.len(),
             role_change_tx: role_change_tx.clone(),
             next_command_id: Arc::new(AtomicU64::new(1)),
             executor: executor_arc.clone(),
+            is_leader: is_leader_arc.clone(),
+            node_id: first_node_id,
         };
 
         // Create and start all nodes
@@ -109,8 +225,9 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
             }
 
             let executor_clone = executor_arc.clone();
+            let role_tx_clone = role_change_tx.clone();
             tokio::spawn(async move {
-                let mut node = match RaftNode::<E>::new(node_id, receiver, peers, executor_clone) {
+                let mut node = match RaftNode::<E>::new(node_id, receiver, peers, executor_clone, role_tx_clone) {
                     Ok(n) => n,
                     Err(e) => {
                         eprintln!("Failed to create RaftNode {}: {}", node_id, e);
@@ -177,9 +294,7 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
 
     /// Check if this cluster is currently the leader
     pub async fn is_leader(&self) -> bool {
-        // For single-node clusters, we're always the leader
-        // TODO: In multi-node implementation, query actual Raft leadership status
-        self.node_count == 1
+        self.is_leader.load(Ordering::SeqCst)
     }
 
     /// Subscribe to role change notifications
@@ -247,6 +362,11 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
 
     pub fn get_node_ids(&self) -> Vec<u64> {
         self.node_senders.keys().copied().collect()
+    }
+
+    /// Get the ID of this node
+    pub fn node_id(&self) -> u64 {
+        self.node_id
     }
 
     pub async fn campaign(&self) -> Result<bool, Box<dyn std::error::Error>> {

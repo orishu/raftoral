@@ -1,6 +1,5 @@
 use raftoral::{WorkflowCommand, CheckpointData, WorkflowRuntime};
 use tokio::time::{sleep, Duration};
-use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
