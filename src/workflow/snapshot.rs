@@ -2,6 +2,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use crate::workflow::execution::WorkflowStatus;
 
+/// Helper function to create a composite key from workflow_id and checkpoint_key
+fn make_checkpoint_key(workflow_id: &str, key: &str) -> String {
+    format!("{}:{}", workflow_id, key)
+}
+
 /// Entry in checkpoint history with metadata
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CheckpointEntry {
@@ -17,32 +22,35 @@ pub struct CheckpointEntry {
 /// Never popped, only appended during workflow execution
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct CheckpointHistory {
-    /// Map of (workflow_id, checkpoint_key) -> ordered list of values
+    /// Map of "workflow_id:checkpoint_key" -> ordered list of values
     /// Stores ALL checkpoint updates for active workflows
-    checkpoints: HashMap<(String, String), Vec<CheckpointEntry>>,
+    checkpoints: HashMap<String, Vec<CheckpointEntry>>,
 }
 
 impl CheckpointHistory {
     /// Add a checkpoint to the history
     pub fn add_checkpoint(&mut self, workflow_id: String, key: String, entry: CheckpointEntry) {
+        let composite_key = make_checkpoint_key(&workflow_id, &key);
         self.checkpoints
-            .entry((workflow_id, key))
+            .entry(composite_key)
             .or_insert_with(Vec::new)
             .push(entry);
     }
 
     /// Get all checkpoint entries for a specific workflow and key
     pub fn get_checkpoints(&self, workflow_id: &str, key: &str) -> Option<&Vec<CheckpointEntry>> {
-        self.checkpoints.get(&(workflow_id.to_string(), key.to_string()))
+        let composite_key = make_checkpoint_key(workflow_id, key);
+        self.checkpoints.get(&composite_key)
     }
 
     /// Remove all checkpoints for a completed workflow
     pub fn remove_workflow(&mut self, workflow_id: &str) {
-        self.checkpoints.retain(|(wf_id, _), _| wf_id != workflow_id);
+        let prefix = format!("{}:", workflow_id);
+        self.checkpoints.retain(|k, _| !k.starts_with(&prefix));
     }
 
     /// Get all checkpoints (for snapshot creation)
-    pub fn all_checkpoints(&self) -> &HashMap<(String, String), Vec<CheckpointEntry>> {
+    pub fn all_checkpoints(&self) -> &HashMap<String, Vec<CheckpointEntry>> {
         &self.checkpoints
     }
 }

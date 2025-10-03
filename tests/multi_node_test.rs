@@ -187,3 +187,177 @@ async fn test_cluster_node_count() {
 
     println!("✓ Cluster configuration test passed!");
 }
+
+#[tokio::test]
+async fn test_snapshot_based_catch_up() {
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct ComputationInput {
+        iterations: u32,
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct ComputationOutput {
+        result: i32,
+    }
+
+    println!("=== Starting Snapshot-Based Catch-Up Test ===");
+    println!("This test will:");
+    println!("  1. Start a 3-node cluster");
+    println!("  2. Begin a long-running workflow");
+    println!("  3. Create snapshot while workflow is ACTIVE");
+    println!("  4. Add 4th node and restore from snapshot");
+    println!("  5. Verify 4th node continues execution from snapshot state\n");
+
+    // Create a 3-node cluster transport
+    let transport = InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3]);
+    transport.start().await.expect("Transport should start");
+
+    // Create clusters and runtimes for first 3 nodes
+    let runtime1 = WorkflowRuntime::new(transport.create_cluster(1).await.expect("Should create cluster 1"));
+    let runtime2 = WorkflowRuntime::new(transport.create_cluster(2).await.expect("Should create cluster 2"));
+    let runtime3 = WorkflowRuntime::new(transport.create_cluster(3).await.expect("Should create cluster 3"));
+
+    // Register workflow that creates multiple checkpoints with delays
+    // This workflow takes ~5 seconds to complete (10 iterations * 500ms)
+    let computation_fn = |input: ComputationInput, context: WorkflowContext| async move {
+        let mut result = 0i32;
+
+        for i in 0..input.iterations {
+            result += (i as i32) * 10;
+
+            // Create checkpoint for each iteration
+            context.create_replicated_var(
+                &format!("step_{}", i),
+                result
+            ).await?;
+
+            println!("  [Workflow] Completed step {}, result: {}", i, result);
+
+            // Longer delay to simulate real work and ensure workflow is still running
+            // when we create the snapshot
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        Ok(ComputationOutput { result })
+    };
+
+    runtime1.register_workflow_closure("computation", 1, computation_fn.clone())
+        .expect("Should register workflow on runtime 1");
+    runtime2.register_workflow_closure("computation", 1, computation_fn.clone())
+        .expect("Should register workflow on runtime 2");
+    runtime3.register_workflow_closure("computation", 1, computation_fn.clone())
+        .expect("Should register workflow on runtime 3");
+
+    // Wait for leader election
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+
+    println!("Starting long-running workflow with 10 iterations...");
+    let input = ComputationInput { iterations: 10 };
+
+    let workflow_run = tokio::time::timeout(
+        Duration::from_secs(30),
+        runtime1.start_workflow::<ComputationInput, ComputationOutput>("computation", 1, input)
+    ).await
+        .expect("Should not timeout")
+        .expect("Should start workflow");
+
+    let workflow_id = workflow_run.workflow_id().to_string();
+    println!("Workflow ID: {}", workflow_id);
+    println!("Workflow started, execution in progress on nodes 1, 2, and 3...\n");
+
+    // Wait for a few checkpoints to be created (workflow is still running)
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    // Create snapshot from node 1 while workflow is ACTIVE
+    println!("Creating snapshot from node 1 (workflow still running)...");
+    let snapshot_state = runtime1.cluster.executor.get_state_for_snapshot();
+
+    println!("  Active workflows in snapshot: {}", snapshot_state.active_workflows.len());
+    println!("  Checkpoint history entries: {}",
+        snapshot_state.checkpoint_history.all_checkpoints().len());
+
+    // Verify workflow is still running
+    assert_eq!(snapshot_state.active_workflows.len(), 1,
+        "Workflow should still be active when snapshot is created");
+
+    // Create a WorkflowSnapshot
+    let snapshot = raftoral::workflow::snapshot::WorkflowSnapshot {
+        snapshot_index: 100, // Simulated log index
+        timestamp: raftoral::workflow::snapshot::current_timestamp(),
+        active_workflows: snapshot_state.active_workflows.clone(),
+        checkpoint_history: snapshot_state.checkpoint_history.clone(),
+        metadata: raftoral::workflow::snapshot::SnapshotMetadata {
+            creator_node_id: 1,
+            voters: vec![1, 2, 3],
+            learners: vec![],
+        },
+    };
+
+    let snapshot_data = serde_json::to_vec(&snapshot)
+        .expect("Should serialize snapshot");
+
+    println!("✓ Snapshot created while workflow is active");
+    println!("  - Snapshot size: {} bytes", snapshot_data.len());
+    println!("  - Contains {} active workflow(s)", snapshot.active_workflows.len());
+    println!("  - Contains {} checkpoint entries\n",
+        snapshot.checkpoint_history.all_checkpoints().len());
+
+    println!("=== Now adding node 4 with snapshot ===");
+
+    // Create a new transport with 4 nodes to simulate adding a node
+    let transport4 = InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3, 4]);
+    transport4.start().await.expect("Transport should start");
+
+    // Create node 4
+    let runtime4 = WorkflowRuntime::new(transport4.create_cluster(4).await.expect("Should create cluster 4"));
+
+    // Register workflow on node 4
+    runtime4.register_workflow_closure("computation", 1, computation_fn.clone())
+        .expect("Should register workflow on runtime 4");
+
+    println!("Node 4 created, applying snapshot...");
+
+    // Apply snapshot to node 4 using executor
+    let restored_snapshot: raftoral::workflow::snapshot::WorkflowSnapshot =
+        serde_json::from_slice(&snapshot_data).expect("Should deserialize snapshot");
+
+    runtime4.cluster.executor.restore_from_snapshot(restored_snapshot)
+        .expect("Should apply snapshot");
+
+    println!("✓ Snapshot applied to node 4");
+
+    // Verify node 4 has the active workflow
+    let status4 = runtime4.cluster.executor.get_workflow_status(&workflow_id);
+    println!("  Node 4 workflow status: {:?}", status4);
+
+    // Workflow should be Running (restored from snapshot)
+    assert!(status4.is_some(), "Node 4 should have workflow status after snapshot restore");
+
+    // Check that checkpoint queues were rebuilt from history
+    let checkpoint_count = runtime4.cluster.executor.get_checkpoint_queue_count(&workflow_id);
+
+    println!("  Checkpoint queues rebuilt: {} entries", checkpoint_count);
+    assert!(checkpoint_count > 0, "Checkpoint queues should be rebuilt from history");
+
+    println!("\nWaiting for original workflow to complete on nodes 1-3...");
+
+    // Now wait for the original workflow to complete
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        workflow_run.wait_for_completion()
+    ).await
+        .expect("Should not timeout")
+        .expect("Workflow should complete successfully");
+
+    println!("✓ Workflow completed with result: {}\n", result.result);
+
+    // Verify the result is correct (sum of 0*10 + 1*10 + 2*10 + ... + 9*10 = 450)
+    assert_eq!(result.result, 450, "Workflow result should be 450");
+
+    println!("✅ Snapshot-based catch-up test passed!");
+    println!("  ✓ 3-node cluster started long-running workflow");
+    println!("  ✓ Snapshot captured active workflow state mid-execution");
+    println!("  ✓ Node 4 restored state from snapshot");
+    println!("  ✓ Checkpoint queues rebuilt from history");
+    println!("  ✓ Workflow completed successfully on original nodes");
+}

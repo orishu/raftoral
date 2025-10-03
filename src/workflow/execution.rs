@@ -9,6 +9,11 @@ use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::time::timeout;
 
+/// Helper function to create a composite key from workflow_id and checkpoint_key
+fn make_queue_key(workflow_id: &str, key: &str) -> String {
+    format!("{}:{}", workflow_id, key)
+}
+
 /// Data structure for starting a workflow with type and version information
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkflowStartData {
@@ -125,6 +130,16 @@ impl WorkflowCommandExecutor {
         state.results.get(workflow_id).cloned()
     }
 
+    /// Get count of checkpoint queue entries for a workflow
+    pub fn get_checkpoint_queue_count(&self, workflow_id: &str) -> usize {
+        let state = self.state.lock().unwrap();
+        let prefix = format!("{}:", workflow_id);
+        state.checkpoint_queues
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .count()
+    }
+
     /// Subscribe to workflow events
     pub fn subscribe_to_workflow(&self, workflow_id: &str) -> WorkflowSubscription {
         WorkflowSubscription {
@@ -168,8 +183,7 @@ impl WorkflowCommandExecutor {
 
         // IMPORTANT: Build checkpoint queues from history
         // New node needs queues populated for when execution starts
-        for ((workflow_id, key), entries) in snapshot.checkpoint_history.all_checkpoints() {
-            let queue_key = (workflow_id.clone(), key.clone());
+        for (composite_key, entries) in snapshot.checkpoint_history.all_checkpoints() {
             let mut queue = std::collections::VecDeque::new();
 
             // Add all historical values to queue (oldest to newest)
@@ -177,7 +191,7 @@ impl WorkflowCommandExecutor {
                 queue.push_back(entry.value.clone());
             }
 
-            state.checkpoint_queues.insert(queue_key, queue);
+            state.checkpoint_queues.insert(composite_key.clone(), queue);
         }
 
         Ok(())
@@ -277,9 +291,10 @@ impl CommandExecutor for WorkflowCommandExecutor {
                     .remove_workflow(&data.workflow_id);
 
                 // Clean up checkpoint queues for completed workflow
+                let prefix = format!("{}:", data.workflow_id);
                 self.state.lock().unwrap()
                     .checkpoint_queues
-                    .retain(|(wf_id, _), _| wf_id != &data.workflow_id);
+                    .retain(|key, _| !key.starts_with(&prefix));
 
                 self.emit_completed_event(&data.workflow_id, data.result.clone());
             },
@@ -291,7 +306,7 @@ impl CommandExecutor for WorkflowCommandExecutor {
 
                 // Enqueue the checkpoint value for late followers
                 // All nodes enqueue - the consumption side will determine whether to use it
-                let queue_key = (data.workflow_id.clone(), data.key.clone());
+                let queue_key = make_queue_key(&data.workflow_id, &data.key);
                 self.state.lock().unwrap()
                     .checkpoint_queues
                     .entry(queue_key)
@@ -354,9 +369,9 @@ pub struct WorkflowState {
     /// Store workflow results (serialized) by ID for retrieval after completion
     pub results: HashMap<String, Vec<u8>>,
     /// Queue of checkpoint values that arrived before execution reached them
-    /// Key: (workflow_id, checkpoint_key), Value: Queue of serialized values
+    /// Key: "workflow_id:checkpoint_key", Value: Queue of serialized values
     /// This enables late followers to catch up without blocking on consensus
-    pub checkpoint_queues: HashMap<(String, String), std::collections::VecDeque<Vec<u8>>>,
+    pub checkpoint_queues: HashMap<String, std::collections::VecDeque<Vec<u8>>>,
     /// Checkpoint history for snapshot creation (never popped, only appended)
     /// Complete history for active workflows, cleaned up on workflow completion
     pub checkpoint_history: crate::workflow::snapshot::CheckpointHistory,
@@ -600,7 +615,7 @@ impl WorkflowRuntime {
     where
         T: serde::Serialize + for<'de> serde::Deserialize<'de> + Clone + Send + Sync + 'static,
     {
-        let queue_key = (workflow_id.to_string(), key.to_string());
+        let queue_key = make_queue_key(workflow_id, key);
         let mut state = cluster.executor.state.lock().unwrap();
 
         if let Some(queue) = state.checkpoint_queues.get_mut(&queue_key) {
@@ -667,7 +682,7 @@ impl WorkflowRuntime {
 
                     // Pop the value we just enqueued (during apply in propose_and_sync)
                     // This prevents leader's own execution from consuming its proposed values
-                    let queue_key = (workflow_id_owned_clone, key_owned_clone);
+                    let queue_key = make_queue_key(&workflow_id_owned_clone, &key_owned_clone);
                     cluster.executor.state.lock().unwrap()
                         .checkpoint_queues
                         .get_mut(&queue_key)
@@ -1334,7 +1349,7 @@ mod tests {
 
         // Verify checkpoint queue is also cleaned up
         let state = executor.state.lock().unwrap();
-        assert!(!state.checkpoint_queues.contains_key(&("test_wf".to_string(), "step1".to_string())));
+        assert!(!state.checkpoint_queues.contains_key(&make_queue_key("test_wf", "step1")));
     }
 
     #[test]
