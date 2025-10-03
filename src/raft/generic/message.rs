@@ -7,8 +7,13 @@ pub trait CommandExecutor: Send + Sync + 'static {
     /// The command type that this executor handles
     type Command: Clone + Debug + Serialize + DeserializeOwned + Send + Sync + 'static;
 
-    /// Apply a command to the state machine
-    fn apply(&self, command: &Self::Command, logger: &slog::Logger) -> Result<(), Box<dyn std::error::Error>>;
+    /// Apply a command to the state machine with log index tracking
+    fn apply_with_index(&self, command: &Self::Command, logger: &slog::Logger, log_index: u64) -> Result<(), Box<dyn std::error::Error>>;
+
+    /// Apply a command to the state machine (backward compatibility)
+    fn apply(&self, command: &Self::Command, logger: &slog::Logger) -> Result<(), Box<dyn std::error::Error>> {
+        self.apply_with_index(command, logger, 0)
+    }
 }
 
 /// Wrapper for commands with optional tracking ID

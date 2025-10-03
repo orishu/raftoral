@@ -34,6 +34,9 @@ pub struct RaftNode<E: CommandExecutor> {
 
     // Track current role to detect changes
     current_role: StateRole,
+
+    // Track current committed index for checkpoint history
+    committed_index: u64,
 }
 
 impl<E: CommandExecutor + 'static> RaftNode<E> {
@@ -83,6 +86,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             executor,
             role_change_tx,
             current_role: StateRole::Follower, // Start as follower
+            committed_index: 0,
         })
     }
 
@@ -136,6 +140,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             executor,
             role_change_tx,
             current_role: StateRole::Follower, // Start as follower
+            committed_index: 0,
         })
     }
 
@@ -283,7 +288,10 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                 EntryType::EntryNormal => {
                     // All commands are now wrapped with CommandWrapper
                     if let Ok(wrapped_command) = serde_json::from_slice::<CommandWrapper<E::Command>>(&entry.data) {
-                        let result = self.apply_command(&wrapped_command.command);
+                        // Track committed index
+                        self.committed_index = entry.index;
+
+                        let result = self.apply_command(&wrapped_command.command, entry.index);
 
                         // Notify the waiting sync callback if there's a sync ID
                         if let Some(sync_id) = wrapped_command.id {
@@ -322,9 +330,9 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
         Ok(last_applied_index)
     }
 
-    fn apply_command(&mut self, command: &E::Command) -> Result<(), Box<dyn std::error::Error>> {
-        // Use the executor to apply the command
-        self.executor.apply(command, &self.logger)
+    fn apply_command(&mut self, command: &E::Command, log_index: u64) -> Result<(), Box<dyn std::error::Error>> {
+        // Use the executor to apply the command with log index
+        self.executor.apply_with_index(command, &self.logger, log_index)
     }
 
 
@@ -383,6 +391,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                 self.raft_group.raft.term,
                 self.raft_group.raft.leader_id)
     }
+
 
     // Main event loop for the node
     pub async fn run(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -482,6 +491,64 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                 slog::error!(self.logger, "Failed to process ready state"; "error" => %e);
             }
         }
+
+        Ok(())
+    }
+}
+
+// Snapshot methods - only available for WorkflowCommandExecutor
+impl RaftNode<crate::workflow::execution::WorkflowCommandExecutor> {
+    /// Create a snapshot of the current workflow state
+    pub fn create_snapshot(&mut self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let snapshot_state = self.executor.get_state_for_snapshot();
+
+        // Save len before moving
+        let active_workflows_count = snapshot_state.active_workflows.len();
+
+        // Get current cluster configuration
+        let conf_state = self.raft_group.raft.prs().conf().to_conf_state();
+
+        let snapshot = crate::workflow::snapshot::WorkflowSnapshot {
+            snapshot_index: self.committed_index,
+            timestamp: crate::workflow::snapshot::current_timestamp(),
+            active_workflows: snapshot_state.active_workflows,
+            checkpoint_history: snapshot_state.checkpoint_history,
+            metadata: crate::workflow::snapshot::SnapshotMetadata {
+                creator_node_id: self.node_id,
+                voters: conf_state.voters,
+                learners: conf_state.learners,
+            },
+        };
+
+        let snapshot_data = serde_json::to_vec(&snapshot)?;
+
+        slog::info!(self.logger, "Created snapshot";
+            "snapshot_index" => self.committed_index,
+            "active_workflows" => active_workflows_count,
+            "data_size" => snapshot_data.len()
+        );
+
+        Ok(snapshot_data)
+    }
+
+    /// Apply a snapshot to restore workflow state
+    pub fn apply_snapshot(&mut self, snapshot_data: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot: crate::workflow::snapshot::WorkflowSnapshot = serde_json::from_slice(&snapshot_data)?;
+
+        // Save snapshot_index before moving snapshot
+        let snapshot_index = snapshot.snapshot_index;
+
+        slog::info!(self.logger, "Applying snapshot";
+            "snapshot_index" => snapshot_index,
+            "active_workflows" => snapshot.active_workflows.len(),
+            "creator_node_id" => snapshot.metadata.creator_node_id
+        );
+
+        // Restore state via executor
+        self.executor.restore_from_snapshot(snapshot)?;
+
+        // Update committed index to snapshot index
+        self.committed_index = self.committed_index.max(snapshot_index);
 
         Ok(())
     }

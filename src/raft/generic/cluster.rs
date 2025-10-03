@@ -418,7 +418,7 @@ mod tests {
     impl CommandExecutor for TestCommandExecutor {
         type Command = TestCommand;
 
-        fn apply(&self, command: &Self::Command, _logger: &slog::Logger) -> Result<(), Box<dyn std::error::Error>> {
+        fn apply_with_index(&self, command: &Self::Command, _logger: &slog::Logger, _log_index: u64) -> Result<(), Box<dyn std::error::Error>> {
             let state = get_test_state();
             match command {
                 TestCommand::SetValue { key, value } => {

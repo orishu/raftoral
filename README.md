@@ -16,11 +16,12 @@ Raftoral provides a distributed workflow orchestration engine where workflows ex
 - ✅ Type-safe workflow registry with closure-based registration
 - ✅ Replicated variables for checkpointing workflow state
 - ✅ Late follower catch-up via checkpoint queues
+- ✅ Raft snapshots for new node state recovery
 - ✅ Leadership transition support
 - ✅ Transport abstraction (InMemoryClusterTransport)
 - ✅ Universal workflow initiation (any node can start)
 - ✅ Event-driven architecture (no polling)
-- ✅ Comprehensive test coverage (20 tests including multi-node)
+- ✅ Comprehensive test coverage (23 tests including multi-node)
 
 ## Quick Start
 
@@ -128,6 +129,16 @@ let api_result = context.create_replicated_var_with_computation(
 - Deterministic execution ensures correctness
 - Leader cleanup prevents self-consumption
 - Cluster progresses even with slow followers
+
+### 5. Raft Snapshots for State Recovery
+
+**Problem**: New nodes need complete checkpoint history, but queues are consumed during execution
+
+**Solution**: Dual storage - queues for execution, history for snapshots
+- Checkpoint history tracks all updates with log indices
+- Snapshots capture only active workflows
+- Queue reconstruction from history on snapshot restore
+- Enables new node catch-up without full log replay
 
 ## Architecture
 
@@ -257,12 +268,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - WorkflowRuntime::new() returns Arc<Self> and auto-registers
 - Clean 3-line setup (down from ~15 lines)
 
+**Milestone 11: Raft Snapshots** ✅
+- Dual storage: checkpoint queues + checkpoint history
+- CheckpointHistory tracks complete log with indices
+- Snapshot creation and application methods
+- On-demand snapshots for new node catch-up
+
 ### Next Steps 🚀
 
-**Milestone 11: Raft Snapshots**
-- State snapshots for new node catch-up
-- Checkpoint history tracking
-- Snapshot creation and application
+**Enhanced Snapshot Testing**
+- Multi-node snapshot integration tests
+- New node joining via snapshot restoration
+- Snapshot during active workflow execution
 
 **Future Enhancements**
 - GrpcClusterTransport for distributed deployment
@@ -286,7 +303,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### Current Limitations
 - Workflow functions must be registered identically on all nodes
 - No built-in compensation/rollback (implement in workflow logic)
-- In-memory storage only (snapshots coming in Milestone 11)
+- In-memory storage only (persistent storage coming later)
 
 ## Installation
 
@@ -311,7 +328,8 @@ src/
 ├── workflow/
 │   ├── execution.rs    # WorkflowRuntime, events
 │   ├── registry.rs     # Type-safe workflow storage
-│   └── replicated_var.rs # Checkpointed variables
+│   ├── replicated_var.rs # Checkpointed variables
+│   └── snapshot.rs     # Snapshot data structures
 └── lib.rs              # Public API
 
 tests/

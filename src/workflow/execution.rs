@@ -132,12 +132,62 @@ impl WorkflowCommandExecutor {
             target_workflow_id: workflow_id.to_string(),
         }
     }
+
+    /// Get state for snapshot creation (only active workflows)
+    pub fn get_state_for_snapshot(&self) -> crate::workflow::snapshot::SnapshotState {
+        let state = self.state.lock().unwrap();
+
+        // Only include active workflows
+        let active_workflows: HashMap<String, WorkflowStatus> = state.workflows
+            .iter()
+            .filter(|(_, status)| matches!(status, WorkflowStatus::Running))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        crate::workflow::snapshot::SnapshotState {
+            active_workflows,
+            checkpoint_history: state.checkpoint_history.clone(),
+        }
+    }
+
+    /// Restore state from snapshot
+    pub fn restore_from_snapshot(&self, snapshot: crate::workflow::snapshot::WorkflowSnapshot) -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = self.state.lock().unwrap();
+
+        // Clear current state
+        state.workflows.clear();
+        state.checkpoint_history = crate::workflow::snapshot::CheckpointHistory::default();
+
+        // Restore active workflows
+        for (workflow_id, status) in snapshot.active_workflows {
+            state.workflows.insert(workflow_id, status);
+        }
+
+        // Restore checkpoint history
+        state.checkpoint_history = snapshot.checkpoint_history.clone();
+
+        // IMPORTANT: Build checkpoint queues from history
+        // New node needs queues populated for when execution starts
+        for ((workflow_id, key), entries) in snapshot.checkpoint_history.all_checkpoints() {
+            let queue_key = (workflow_id.clone(), key.clone());
+            let mut queue = std::collections::VecDeque::new();
+
+            // Add all historical values to queue (oldest to newest)
+            for entry in entries {
+                queue.push_back(entry.value.clone());
+            }
+
+            state.checkpoint_queues.insert(queue_key, queue);
+        }
+
+        Ok(())
+    }
 }
 
 impl CommandExecutor for WorkflowCommandExecutor {
     type Command = WorkflowCommand;
 
-    fn apply(&self, command: &Self::Command, logger: &slog::Logger) -> Result<(), Box<dyn std::error::Error>> {
+    fn apply_with_index(&self, command: &Self::Command, logger: &slog::Logger, log_index: u64) -> Result<(), Box<dyn std::error::Error>> {
         match command {
             WorkflowCommand::WorkflowStart(data) => {
                 slog::info!(logger, "Started workflow";
@@ -221,6 +271,16 @@ impl CommandExecutor for WorkflowCommandExecutor {
                 // Store the result in state for later retrieval
                 self.state.lock().unwrap().results.insert(data.workflow_id.clone(), data.result.clone());
 
+                // Clean up checkpoint history for completed workflow
+                self.state.lock().unwrap()
+                    .checkpoint_history
+                    .remove_workflow(&data.workflow_id);
+
+                // Clean up checkpoint queues for completed workflow
+                self.state.lock().unwrap()
+                    .checkpoint_queues
+                    .retain(|(wf_id, _), _| wf_id != &data.workflow_id);
+
                 self.emit_completed_event(&data.workflow_id, data.result.clone());
             },
             WorkflowCommand::SetCheckpoint(data) => {
@@ -238,6 +298,26 @@ impl CommandExecutor for WorkflowCommandExecutor {
                     .or_insert_with(std::collections::VecDeque::new)
                     .push_back(data.value.clone());
 
+                // Add to checkpoint history for snapshots (only for active workflows)
+                {
+                    let state = self.state.lock().unwrap();
+                    if let Some(status) = state.workflows.get(&data.workflow_id) {
+                        if matches!(status, WorkflowStatus::Running) {
+                            drop(state); // Release lock before getting mutable access
+                            let timestamp = crate::workflow::snapshot::current_timestamp();
+                            self.state.lock().unwrap().checkpoint_history.add_checkpoint(
+                                data.workflow_id.clone(),
+                                data.key.clone(),
+                                crate::workflow::snapshot::CheckpointEntry {
+                                    value: data.value.clone(),
+                                    log_index,
+                                    timestamp,
+                                }
+                            );
+                        }
+                    }
+                }
+
                 self.emit_checkpoint_event(&data.workflow_id, &data.key, data.value.clone());
             },
         }
@@ -246,7 +326,7 @@ impl CommandExecutor for WorkflowCommandExecutor {
 }
 
 /// Status of a workflow
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum WorkflowStatus {
     Running,
     Completed,
@@ -277,6 +357,9 @@ pub struct WorkflowState {
     /// Key: (workflow_id, checkpoint_key), Value: Queue of serialized values
     /// This enables late followers to catch up without blocking on consensus
     pub checkpoint_queues: HashMap<(String, String), std::collections::VecDeque<Vec<u8>>>,
+    /// Checkpoint history for snapshot creation (never popped, only appended)
+    /// Complete history for active workflows, cleaned up on workflow completion
+    pub checkpoint_history: crate::workflow::snapshot::CheckpointHistory,
 }
 
 
@@ -1140,5 +1223,179 @@ impl std::fmt::Display for WorkflowError {
 
 impl std::error::Error for WorkflowError {}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use slog::{Drain, Logger, o};
 
+    fn test_logger() -> Logger {
+        let decorator = slog_term::PlainSyncDecorator::new(std::io::sink());
+        let drain = slog_term::FullFormat::new(decorator).build().fuse();
+        Logger::root(drain, o!())
+    }
+
+    #[test]
+    fn test_checkpoint_history_tracking() {
+        // Create executor
+        let executor = WorkflowCommandExecutor::new();
+        let logger = test_logger();
+
+        // Start a workflow
+        let start_cmd = WorkflowCommand::WorkflowStart(WorkflowStartData {
+            workflow_id: "test_wf".to_string(),
+            workflow_type: "test_type".to_string(),
+            version: 1,
+            input: vec![],
+        });
+        executor.apply_with_index(&start_cmd, &logger, 1).unwrap();
+
+        // Add checkpoint 1 at log index 2
+        let checkpoint_cmd1 = WorkflowCommand::SetCheckpoint(CheckpointData {
+            workflow_id: "test_wf".to_string(),
+            key: "step1".to_string(),
+            value: vec![1, 2, 3],
+        });
+        executor.apply_with_index(&checkpoint_cmd1, &logger, 2).unwrap();
+
+        // Add checkpoint 2 at log index 3
+        let checkpoint_cmd2 = WorkflowCommand::SetCheckpoint(CheckpointData {
+            workflow_id: "test_wf".to_string(),
+            key: "step2".to_string(),
+            value: vec![4, 5, 6],
+        });
+        executor.apply_with_index(&checkpoint_cmd2, &logger, 3).unwrap();
+
+        // Add another value for step1 at log index 4
+        let checkpoint_cmd3 = WorkflowCommand::SetCheckpoint(CheckpointData {
+            workflow_id: "test_wf".to_string(),
+            key: "step1".to_string(),
+            value: vec![7, 8, 9],
+        });
+        executor.apply_with_index(&checkpoint_cmd3, &logger, 4).unwrap();
+
+        // Verify checkpoint history
+        let snapshot_state = executor.get_state_for_snapshot();
+
+        // Check step1 has 2 entries
+        let step1_checkpoints = snapshot_state.checkpoint_history
+            .get_checkpoints("test_wf", "step1")
+            .unwrap();
+        assert_eq!(step1_checkpoints.len(), 2);
+        assert_eq!(step1_checkpoints[0].value, vec![1, 2, 3]);
+        assert_eq!(step1_checkpoints[0].log_index, 2);
+        assert_eq!(step1_checkpoints[1].value, vec![7, 8, 9]);
+        assert_eq!(step1_checkpoints[1].log_index, 4);
+
+        // Check step2 has 1 entry
+        let step2_checkpoints = snapshot_state.checkpoint_history
+            .get_checkpoints("test_wf", "step2")
+            .unwrap();
+        assert_eq!(step2_checkpoints.len(), 1);
+        assert_eq!(step2_checkpoints[0].value, vec![4, 5, 6]);
+        assert_eq!(step2_checkpoints[0].log_index, 3);
+    }
+
+    #[test]
+    fn test_checkpoint_history_cleanup_on_workflow_end() {
+        let executor = WorkflowCommandExecutor::new();
+        let logger = test_logger();
+
+        // Start workflow
+        let start_cmd = WorkflowCommand::WorkflowStart(WorkflowStartData {
+            workflow_id: "test_wf".to_string(),
+            workflow_type: "test_type".to_string(),
+            version: 1,
+            input: vec![],
+        });
+        executor.apply_with_index(&start_cmd, &logger, 1).unwrap();
+
+        // Add checkpoint
+        let checkpoint_cmd = WorkflowCommand::SetCheckpoint(CheckpointData {
+            workflow_id: "test_wf".to_string(),
+            key: "step1".to_string(),
+            value: vec![1, 2, 3],
+        });
+        executor.apply_with_index(&checkpoint_cmd, &logger, 2).unwrap();
+
+        // Verify checkpoint exists
+        let snapshot_state = executor.get_state_for_snapshot();
+        assert!(snapshot_state.checkpoint_history.get_checkpoints("test_wf", "step1").is_some());
+
+        // End workflow
+        let end_cmd = WorkflowCommand::WorkflowEnd(WorkflowEndData {
+            workflow_id: "test_wf".to_string(),
+            result: vec![],
+        });
+        executor.apply_with_index(&end_cmd, &logger, 3).unwrap();
+
+        // Verify checkpoint history is cleaned up
+        let snapshot_state = executor.get_state_for_snapshot();
+        assert!(snapshot_state.checkpoint_history.get_checkpoints("test_wf", "step1").is_none());
+
+        // Verify checkpoint queue is also cleaned up
+        let state = executor.state.lock().unwrap();
+        assert!(!state.checkpoint_queues.contains_key(&("test_wf".to_string(), "step1".to_string())));
+    }
+
+    #[test]
+    fn test_checkpoint_history_only_active_workflows() {
+        let executor = WorkflowCommandExecutor::new();
+        let logger = test_logger();
+
+        // Start workflow 1
+        let start_cmd1 = WorkflowCommand::WorkflowStart(WorkflowStartData {
+            workflow_id: "wf1".to_string(),
+            workflow_type: "test_type".to_string(),
+            version: 1,
+            input: vec![],
+        });
+        executor.apply_with_index(&start_cmd1, &logger, 1).unwrap();
+
+        // Add checkpoint to workflow 1
+        let checkpoint_cmd1 = WorkflowCommand::SetCheckpoint(CheckpointData {
+            workflow_id: "wf1".to_string(),
+            key: "step1".to_string(),
+            value: vec![1, 2, 3],
+        });
+        executor.apply_with_index(&checkpoint_cmd1, &logger, 2).unwrap();
+
+        // End workflow 1
+        let end_cmd1 = WorkflowCommand::WorkflowEnd(WorkflowEndData {
+            workflow_id: "wf1".to_string(),
+            result: vec![],
+        });
+        executor.apply_with_index(&end_cmd1, &logger, 3).unwrap();
+
+        // Start workflow 2
+        let start_cmd2 = WorkflowCommand::WorkflowStart(WorkflowStartData {
+            workflow_id: "wf2".to_string(),
+            workflow_type: "test_type".to_string(),
+            version: 1,
+            input: vec![],
+        });
+        executor.apply_with_index(&start_cmd2, &logger, 4).unwrap();
+
+        // Add checkpoint to workflow 2
+        let checkpoint_cmd2 = WorkflowCommand::SetCheckpoint(CheckpointData {
+            workflow_id: "wf2".to_string(),
+            key: "step1".to_string(),
+            value: vec![4, 5, 6],
+        });
+        executor.apply_with_index(&checkpoint_cmd2, &logger, 5).unwrap();
+
+        // Get snapshot state - should only include active workflow (wf2)
+        let snapshot_state = executor.get_state_for_snapshot();
+
+        // wf1 should not be in snapshot (completed)
+        assert_eq!(snapshot_state.active_workflows.len(), 1);
+        assert!(snapshot_state.active_workflows.contains_key("wf2"));
+        assert!(!snapshot_state.active_workflows.contains_key("wf1"));
+
+        // wf1 checkpoints should be cleaned up
+        assert!(snapshot_state.checkpoint_history.get_checkpoints("wf1", "step1").is_none());
+
+        // wf2 checkpoints should still exist
+        assert!(snapshot_state.checkpoint_history.get_checkpoints("wf2", "step1").is_some());
+    }
+}
 
