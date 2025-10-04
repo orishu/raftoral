@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, mpsc, broadcast};
-use raft::{prelude::*, storage::MemStorage, StateRole};
+use raft::{prelude::*, StateRole};
+use super::storage::MemStorageWithSnapshot;
 use slog::{Drain, Logger};
 use protobuf::Message as PbMessage;
 use crate::raft::generic::message::{Message, CommandExecutor, CommandWrapper};
@@ -39,7 +40,7 @@ impl Default for SnapshotConfig {
 }
 
 pub struct RaftNode<E: CommandExecutor> {
-    raft_group: RawNode<MemStorage>,
+    raft_group: RawNode<MemStorageWithSnapshot>,
     #[allow(dead_code)] // Reserved for future use
     storage: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     node_id: u64,
@@ -89,7 +90,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             ..Default::default()
         };
 
-        let storage = MemStorage::new();
+        let storage = MemStorageWithSnapshot::new();
 
         // For single-node cluster, initialize with ourselves as voter
         let mut initial_state = ConfState::default();
@@ -139,7 +140,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             ..Default::default()
         };
 
-        let storage = MemStorage::new();
+        let storage = MemStorageWithSnapshot::new();
 
         // Set up the initial cluster configuration
         let mut initial_state = ConfState::default();
@@ -219,7 +220,22 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
 
         // Handle snapshots first
         if !ready.snapshot().is_empty() {
-            store.wl().apply_snapshot(ready.snapshot().clone())?;
+            let snapshot = ready.snapshot().clone();
+
+            // Extract and restore executor state from snapshot data
+            let snapshot_data = snapshot.get_data();
+            if !snapshot_data.is_empty() {
+                self.executor.restore_from_snapshot(snapshot_data)?;
+                self.committed_index = snapshot.get_metadata().get_index();
+
+                slog::info!(self.logger, "Restored state from snapshot";
+                    "snapshot_index" => snapshot.get_metadata().get_index(),
+                    "data_size" => snapshot_data.len()
+                );
+            }
+
+            // Apply to Raft storage (using our custom method that preserves data)
+            store.apply_snapshot_with_data(snapshot)?;
         }
 
         // Handle committed entries BEFORE persisting new entries
@@ -607,8 +623,8 @@ impl<E: CommandExecutor> RaftNode<E> {
         snapshot_metadata.set_conf_state(conf_state);
         raft_snapshot.set_metadata(snapshot_metadata);
 
-        // Apply to storage
-        store.wl().apply_snapshot(raft_snapshot)?;
+        // Apply to storage (using our custom method that preserves data)
+        store.apply_snapshot_with_data(raft_snapshot)?;
 
         slog::info!(self.logger, "Created automatic snapshot";
             "snapshot_index" => last_applied,
