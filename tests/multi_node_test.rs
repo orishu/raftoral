@@ -321,7 +321,7 @@ async fn test_snapshot_based_catch_up() {
     let restored_snapshot: raftoral::workflow::snapshot::WorkflowSnapshot =
         serde_json::from_slice(&snapshot_data).expect("Should deserialize snapshot");
 
-    runtime4.cluster.executor.restore_from_snapshot(restored_snapshot)
+    runtime4.cluster.executor.restore_from_workflow_snapshot(restored_snapshot)
         .expect("Should apply snapshot");
 
     println!("✓ Snapshot applied to node 4");

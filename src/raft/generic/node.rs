@@ -11,6 +11,33 @@ use crate::raft::generic::cluster::RoleChange;
 
 pub type SyncCallback = tokio::sync::oneshot::Sender<Result<(), Box<dyn std::error::Error + Send + Sync>>>;
 
+/// Configuration for automatic snapshot creation and management
+#[derive(Clone, Debug)]
+pub struct SnapshotConfig {
+    /// Create snapshot every N log entries
+    pub snapshot_interval: u64,
+
+    /// Maximum log entries before forcing snapshot
+    pub max_log_size: u64,
+
+    /// Compact logs older than latest snapshot
+    pub auto_compact: bool,
+
+    /// Keep at least N log entries before snapshot for safety
+    pub entries_before_snapshot: u64,
+}
+
+impl Default for SnapshotConfig {
+    fn default() -> Self {
+        Self {
+            snapshot_interval: 1000,
+            max_log_size: 10000,
+            auto_compact: true,
+            entries_before_snapshot: 100,
+        }
+    }
+}
+
 pub struct RaftNode<E: CommandExecutor> {
     raft_group: RawNode<MemStorage>,
     #[allow(dead_code)] // Reserved for future use
@@ -37,6 +64,9 @@ pub struct RaftNode<E: CommandExecutor> {
 
     // Track current committed index for checkpoint history
     committed_index: u64,
+
+    // Snapshot configuration
+    snapshot_config: SnapshotConfig,
 }
 
 impl<E: CommandExecutor + 'static> RaftNode<E> {
@@ -87,6 +117,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             role_change_tx,
             current_role: StateRole::Follower, // Start as follower
             committed_index: 0,
+            snapshot_config: SnapshotConfig::default(),
         })
     }
 
@@ -141,6 +172,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             role_change_tx,
             current_role: StateRole::Follower, // Start as follower
             committed_index: 0,
+            snapshot_config: SnapshotConfig::default(),
         })
     }
 
@@ -171,6 +203,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
         self.raft_group.tick();
     }
 
+    /// Process ready state - can be overridden in implementations
     pub fn on_ready(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if !self.raft_group.has_ready() {
             return Ok(());
@@ -340,7 +373,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                 },
                 ConfChangeType::RemoveNode => {
                     slog::info!(self.logger, "Removing node from cluster (v2)"; "node_id" => node_id);
-                    // Notify the executor so it can handle workflow reassignment
+                    // Notify the executor so it can handle ownership reassignment
                     self.executor.on_node_removed(node_id, &self.logger);
                 },
                 ConfChangeType::AddLearnerNode => {
@@ -484,66 +517,165 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             if let Err(e) = self.on_ready() {
                 slog::error!(self.logger, "Failed to process ready state"; "error" => %e);
             }
+
+            // Check if we should create a snapshot after processing ready state
+            if let Err(e) = self.check_and_create_snapshot() {
+                slog::error!(self.logger, "Failed to check/create snapshot"; "error" => %e);
+            }
         }
 
         Ok(())
     }
 }
 
-// Snapshot methods - only available for WorkflowCommandExecutor
-impl RaftNode<crate::workflow::executor::WorkflowCommandExecutor> {
-    /// Create a snapshot of the current workflow state
-    pub fn create_snapshot(&mut self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        let snapshot_state = self.executor.get_state_for_snapshot();
+// Generic snapshot methods - available for all executors
+impl<E: CommandExecutor> RaftNode<E> {
 
-        // Save len before moving
-        let active_workflows_count = snapshot_state.active_workflows.len();
-
-        // Get current cluster configuration
-        let conf_state = self.raft_group.raft.prs().conf().to_conf_state();
-
-        let snapshot = crate::workflow::snapshot::WorkflowSnapshot {
-            snapshot_index: self.committed_index,
-            timestamp: crate::workflow::snapshot::current_timestamp(),
-            active_workflows: snapshot_state.active_workflows,
-            checkpoint_history: snapshot_state.checkpoint_history,
-            metadata: crate::workflow::snapshot::SnapshotMetadata {
-                creator_node_id: self.node_id,
-                voters: conf_state.voters,
-                learners: conf_state.learners,
-            },
-        };
-
-        let snapshot_data = serde_json::to_vec(&snapshot)?;
+    /// Create a snapshot using the executor's snapshot implementation
+    pub fn create_snapshot(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let snapshot_data = self.executor.create_snapshot(self.committed_index)?;
 
         slog::info!(self.logger, "Created snapshot";
             "snapshot_index" => self.committed_index,
-            "active_workflows" => active_workflows_count,
             "data_size" => snapshot_data.len()
         );
 
         Ok(snapshot_data)
     }
 
-    /// Apply a snapshot to restore workflow state
-    pub fn apply_snapshot(&mut self, snapshot_data: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
-        let snapshot: crate::workflow::snapshot::WorkflowSnapshot = serde_json::from_slice(&snapshot_data)?;
-
-        // Save snapshot_index before moving snapshot
-        let snapshot_index = snapshot.snapshot_index;
-
+    /// Apply a snapshot to restore state using the executor's restore implementation
+    pub fn apply_snapshot(&mut self, snapshot_data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
         slog::info!(self.logger, "Applying snapshot";
-            "snapshot_index" => snapshot_index,
-            "active_workflows" => snapshot.active_workflows.len(),
-            "creator_node_id" => snapshot.metadata.creator_node_id
+            "data_size" => snapshot_data.len()
         );
 
         // Restore state via executor
-        self.executor.restore_from_snapshot(snapshot)?;
-
-        // Update committed index to snapshot index
-        self.committed_index = self.committed_index.max(snapshot_index);
+        self.executor.restore_from_snapshot(snapshot_data)?;
 
         Ok(())
+    }
+
+    /// Check if a snapshot should be created based on log size
+    /// Delegates to executor for custom logic
+    fn should_create_snapshot(&self) -> Result<bool, Box<dyn std::error::Error>> {
+        let store = self.raft_group.raft.raft_log.store.clone();
+        let first_index = store.first_index()?;
+        let last_applied = self.committed_index;
+
+        // Calculate log size
+        let log_size = if last_applied >= first_index {
+            last_applied - first_index + 1
+        } else {
+            0
+        };
+
+        // Delegate to executor for custom logic
+        let should_snapshot = self.executor.should_create_snapshot(log_size, self.snapshot_config.snapshot_interval);
+
+        if should_snapshot {
+            slog::debug!(self.logger, "Snapshot check triggered";
+                "log_size" => log_size,
+                "first_index" => first_index,
+                "last_applied" => last_applied,
+                "threshold" => self.snapshot_config.snapshot_interval
+            );
+        }
+
+        Ok(should_snapshot)
+    }
+
+    /// Trigger automatic snapshot creation using executor's implementation
+    fn trigger_snapshot_creation(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let last_applied = self.committed_index;
+
+        // Get snapshot data from executor
+        let snapshot_data = self.executor.create_snapshot(last_applied)?;
+        let data_size = snapshot_data.len(); // Save size before moving
+
+        // Get raft metadata
+        let store = self.raft_group.raft.raft_log.store.clone();
+        let term = store.term(last_applied)?;
+        let conf_state = self.raft_group.raft.prs().conf().to_conf_state();
+
+        // Create raft snapshot
+        let mut raft_snapshot = Snapshot::default();
+        raft_snapshot.set_data(snapshot_data.into());
+
+        let mut snapshot_metadata = SnapshotMetadata::default();
+        snapshot_metadata.set_index(last_applied);
+        snapshot_metadata.set_term(term);
+        snapshot_metadata.set_conf_state(conf_state);
+        raft_snapshot.set_metadata(snapshot_metadata);
+
+        // Apply to storage
+        store.wl().apply_snapshot(raft_snapshot)?;
+
+        slog::info!(self.logger, "Created automatic snapshot";
+            "snapshot_index" => last_applied,
+            "data_size" => data_size
+        );
+
+        // Compact logs if configured
+        if self.snapshot_config.auto_compact {
+            self.compact_log(last_applied)?;
+        }
+
+        Ok(())
+    }
+
+    /// Compact log up to the given index
+    fn compact_log(&mut self, up_to_index: u64) -> Result<(), Box<dyn std::error::Error>> {
+        // Keep some entries before snapshot for safety
+        let compact_index = up_to_index.saturating_sub(self.snapshot_config.entries_before_snapshot);
+
+        if compact_index > 0 {
+            let store = self.raft_group.raft.raft_log.store.clone();
+            store.wl().compact(compact_index)?;
+
+            slog::info!(self.logger, "Compacted log";
+                "compact_index" => compact_index,
+                "entries_removed" => compact_index
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Check and create snapshot if needed (generic implementation)
+    pub fn check_and_create_snapshot(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        // Check if snapshot is needed
+        if self.should_create_snapshot()? {
+            self.trigger_snapshot_creation()?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_snapshot_config_default() {
+        let config = SnapshotConfig::default();
+        assert_eq!(config.snapshot_interval, 1000);
+        assert_eq!(config.max_log_size, 10000);
+        assert_eq!(config.auto_compact, true);
+        assert_eq!(config.entries_before_snapshot, 100);
+    }
+
+    #[test]
+    fn test_snapshot_config_custom() {
+        let config = SnapshotConfig {
+            snapshot_interval: 500,
+            max_log_size: 5000,
+            auto_compact: false,
+            entries_before_snapshot: 50,
+        };
+
+        assert_eq!(config.snapshot_interval, 500);
+        assert_eq!(config.max_log_size, 5000);
+        assert_eq!(config.auto_compact, false);
+        assert_eq!(config.entries_before_snapshot, 50);
     }
 }

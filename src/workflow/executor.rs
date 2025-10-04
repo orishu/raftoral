@@ -183,7 +183,7 @@ impl WorkflowCommandExecutor {
     }
 
     /// Restore state from snapshot
-    pub fn restore_from_snapshot(&self, snapshot: crate::workflow::snapshot::WorkflowSnapshot) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn restore_from_workflow_snapshot(&self, snapshot: crate::workflow::snapshot::WorkflowSnapshot) -> Result<(), Box<dyn std::error::Error>> {
         let mut state = self.state.lock().unwrap();
 
         // Clear current state
@@ -458,5 +458,40 @@ impl CommandExecutor for WorkflowCommandExecutor {
                 }
             });
         }
+    }
+
+    /// Create a snapshot of the current workflow state
+    fn create_snapshot(&self, snapshot_index: u64) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let snapshot_state = self.get_state_for_snapshot();
+
+        // Note: We don't have access to conf_state here, so we create a minimal snapshot
+        // The RaftNode will add raft metadata (term, conf_state) separately
+        let snapshot = crate::workflow::snapshot::WorkflowSnapshot {
+            snapshot_index,
+            timestamp: crate::workflow::snapshot::current_timestamp(),
+            active_workflows: snapshot_state.active_workflows,
+            checkpoint_history: snapshot_state.checkpoint_history,
+            metadata: crate::workflow::snapshot::SnapshotMetadata {
+                creator_node_id: self.get_node_id().unwrap_or(0),
+                voters: vec![], // Will be filled by RaftNode
+                learners: vec![], // Will be filled by RaftNode
+            },
+        };
+
+        let snapshot_data = serde_json::to_vec(&snapshot)?;
+        Ok(snapshot_data)
+    }
+
+    /// Restore state from a snapshot (CommandExecutor trait implementation)
+    fn restore_from_snapshot(&self, snapshot_data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot: crate::workflow::snapshot::WorkflowSnapshot = serde_json::from_slice(snapshot_data)?;
+
+        // Delegate to the existing restore logic
+        self.restore_from_workflow_snapshot(snapshot)
+    }
+
+    /// Check if snapshot should be created based on log size
+    fn should_create_snapshot(&self, log_size: u64, snapshot_interval: u64) -> bool {
+        log_size >= snapshot_interval
     }
 }

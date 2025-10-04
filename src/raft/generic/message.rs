@@ -27,6 +27,27 @@ pub trait CommandExecutor: Send + Sync + 'static {
         // Default implementation does nothing
         // WorkflowCommandExecutor overrides this for workflow reassignment
     }
+
+    /// Create a snapshot of the current state
+    /// Returns serialized snapshot data
+    fn create_snapshot(&self, _snapshot_index: u64) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        // Default implementation: no snapshot support
+        Ok(Vec::new())
+    }
+
+    /// Restore state from a snapshot
+    /// Called when receiving a snapshot from leader or during recovery
+    fn restore_from_snapshot(&self, _snapshot_data: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+        // Default implementation: no snapshot support
+        Ok(())
+    }
+
+    /// Check if snapshot should be created based on log size
+    /// Executors can override to implement custom logic
+    fn should_create_snapshot(&self, _log_size: u64, _snapshot_interval: u64) -> bool {
+        // Default implementation: use simple threshold check
+        false
+    }
 }
 
 /// Wrapper for commands with optional tracking ID
