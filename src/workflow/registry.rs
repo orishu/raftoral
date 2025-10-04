@@ -3,7 +3,8 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use crate::workflow::execution::{WorkflowError, WorkflowContext};
+use crate::workflow::error::WorkflowError;
+use crate::workflow::context::WorkflowContext;
 
 /// A trait for workflow functions that can be registered and executed
 ///
@@ -297,7 +298,7 @@ mod tests {
         let input_any: Box<dyn Any + Send> = Box::new(input_bytes);
 
         // Create mock context using WorkflowRuntime
-        let workflow_runtime = crate::workflow::execution::WorkflowRuntime::new_single_node(1).await.unwrap();
+        let workflow_runtime = crate::workflow::runtime::WorkflowRuntime::new_single_node(1).await.unwrap();
         let context = WorkflowContext {
             workflow_id: "test_instance".to_string(),
             runtime: workflow_runtime.clone(),
@@ -307,7 +308,7 @@ mod tests {
         let result_bytes = workflow.execute(input_any, context).await.unwrap();
 
         // Deserialize the Result
-        let output_result: Result<TestOutput, crate::workflow::execution::WorkflowError> =
+        let output_result: Result<TestOutput, crate::workflow::error::WorkflowError> =
             serde_json::from_slice(&result_bytes).unwrap();
 
         // Unwrap the Ok value

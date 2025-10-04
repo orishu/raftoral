@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use crate::workflow::execution::WorkflowStatus;
+use crate::workflow::error::WorkflowStatus;
 
 /// Helper function to create a composite key from workflow_id and checkpoint_key
 fn make_checkpoint_key(workflow_id: &str, key: &str) -> String {

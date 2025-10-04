@@ -491,7 +491,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
 }
 
 // Snapshot methods - only available for WorkflowCommandExecutor
-impl RaftNode<crate::workflow::execution::WorkflowCommandExecutor> {
+impl RaftNode<crate::workflow::executor::WorkflowCommandExecutor> {
     /// Create a snapshot of the current workflow state
     pub fn create_snapshot(&mut self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let snapshot_state = self.executor.get_state_for_snapshot();

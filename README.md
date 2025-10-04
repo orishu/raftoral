@@ -21,7 +21,8 @@ Raftoral provides a distributed workflow orchestration engine where workflows ex
 - ✅ Transport abstraction (InMemoryClusterTransport)
 - ✅ Universal workflow initiation (any node can start)
 - ✅ Event-driven architecture (no polling)
-- ✅ Comprehensive test coverage (23 tests including multi-node)
+- ✅ Comprehensive test coverage (19 tests including multi-node and doctests)
+- ✅ Clean modular code organization
 
 ## Quick Start
 
@@ -274,6 +275,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - Snapshot creation and application methods
 - On-demand snapshots for new node catch-up
 
+**Milestone 12: Code Organization Refactoring** ✅
+- Modular architecture (split 1622-line file into 5 focused modules)
+- Clear separation: commands, errors, executor, runtime, context
+- All tests passing after refactoring
+- Improved maintainability and readability
+
 ### Next Steps 🚀
 
 **Enhanced Snapshot Testing**
@@ -326,14 +333,20 @@ src/
 │   ├── transport.rs    # ClusterTransport abstraction
 │   └── message.rs      # Message types
 ├── workflow/
-│   ├── execution.rs    # WorkflowRuntime, events
+│   ├── commands.rs     # Command definitions
+│   ├── error.rs        # Error types and status
+│   ├── executor.rs     # CommandExecutor implementation
+│   ├── runtime.rs      # WorkflowRuntime and subscriptions
+│   ├── context.rs      # WorkflowContext and WorkflowRun
 │   ├── registry.rs     # Type-safe workflow storage
 │   ├── replicated_var.rs # Checkpointed variables
-│   └── snapshot.rs     # Snapshot data structures
+│   ├── snapshot.rs     # Snapshot data structures
+│   └── ownership.rs    # Workflow ownership tracking
 └── lib.rs              # Public API
 
 tests/
-└── multi_node_test.rs  # 3-node integration tests
+├── multi_node_test.rs       # 3-node integration tests
+└── node_failure_test.rs     # Failover and reassignment tests
 
 examples/
 ├── typed_workflow_example.rs

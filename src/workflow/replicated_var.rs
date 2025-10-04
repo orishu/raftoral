@@ -1,7 +1,8 @@
 use std::future::Future;
 use serde::{Serialize, Deserialize};
 use std::sync::Arc;
-use crate::workflow::execution::{WorkflowError, WorkflowRun};
+use crate::workflow::error::WorkflowError;
+use crate::workflow::context::WorkflowRun;
 
 /// A type-safe replicated variable that stores its value as a checkpoint in the Raft cluster.
 ///
@@ -243,7 +244,7 @@ impl From<WorkflowError> for ReplicatedVarError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::workflow::execution::WorkflowRuntime;
+    use crate::workflow::runtime::WorkflowRuntime;
     use std::time::Duration;
 
     #[tokio::test]
