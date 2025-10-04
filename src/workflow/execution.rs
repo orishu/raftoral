@@ -157,6 +157,14 @@ impl WorkflowCommandExecutor {
         let _ = self.event_tx.send(event);
     }
 
+    fn emit_ownership_changed_event(&self, workflow_id: &str, new_owner_node_id: u64) {
+        let event = WorkflowEvent::OwnershipChanged {
+            workflow_id: workflow_id.to_string(),
+            new_owner_node_id,
+        };
+        let _ = self.event_tx.send(event);
+    }
+
     /// Get workflow status from executor state
     pub fn get_workflow_status(&self, workflow_id: &str) -> Option<WorkflowStatus> {
         let state = self.state.lock().unwrap();
@@ -398,6 +406,10 @@ impl CommandExecutor for WorkflowCommandExecutor {
                 // Update ownership map (all nodes)
                 self.ownership_map.set_owner(data.workflow_id.clone(), data.new_owner_node_id);
 
+                // Emit event to wake up waiting workflow executions on the new owner node
+                // This allows followers that were waiting on checkpoints to immediately become active owners
+                self.emit_ownership_changed_event(&data.workflow_id, data.new_owner_node_id);
+
                 // If we're the new owner, spawn workflow execution
                 // The workflow state and checkpoint queues are already populated from previous SetCheckpoint commands
                 let is_new_owner = self.get_node_id()
@@ -519,6 +531,8 @@ pub enum WorkflowEvent {
     Failed { workflow_id: String, error: Vec<u8> },
     /// A checkpoint was set for a workflow
     CheckpointSet { workflow_id: String, key: String, value: Vec<u8> },
+    /// Workflow ownership changed (e.g., due to node failure)
+    OwnershipChanged { workflow_id: String, new_owner_node_id: u64 },
 }
 
 /// Workflow state for tracking workflows across the cluster
@@ -603,6 +617,7 @@ impl WorkflowSubscription {
             WorkflowEvent::Completed { workflow_id, .. } => workflow_id == &self.target_workflow_id,
             WorkflowEvent::Failed { workflow_id, .. } => workflow_id == &self.target_workflow_id,
             WorkflowEvent::CheckpointSet { workflow_id, .. } => workflow_id == &self.target_workflow_id,
+            WorkflowEvent::OwnershipChanged { workflow_id, .. } => workflow_id == &self.target_workflow_id,
         }
     }
 }
@@ -675,7 +690,7 @@ impl WorkflowRuntime {
         WorkflowRun::start(workflow_id, self, input).await
     }
 
-    /// Execute a leader/follower operation with retry logic for leadership changes
+    /// Execute a leader/follower operation with retry logic for leadership changes and ownership promotion
     async fn execute_leader_follower_operation<F, Fut, E, T>(
         &self,
         workflow_id: &str,
@@ -690,31 +705,44 @@ impl WorkflowRuntime {
         E: Fn(&WorkflowEvent) -> Option<T> + Send + Sync + Clone,
         T: Send + 'static,
     {
-        // Retry loop to handle leadership changes
-        let max_retries = 3;
+        // Retry loop to handle leadership changes and ownership promotion
+        let max_retries = 10; // Increased to handle multiple ownership changes
         for attempt in 0..max_retries {
             // Subscribe first to avoid race conditions
             let subscription = self.subscribe_to_workflow(workflow_id);
 
-            // Check if we're the leader
-            if cluster.is_leader().await {
-                // Leader behavior: Execute the provided operation
+            // Check if we're the leader OR the owner of this workflow
+            let is_leader = cluster.is_leader().await;
+            let is_owner = self.is_workflow_owner(workflow_id, cluster).await;
+
+            if is_leader || is_owner {
+                // Active node behavior: Execute the provided operation
+                // This happens if we're the leader OR if we've been promoted to owner due to failover
                 return leader_operation().await;
             } else {
-                // Follower behavior: Wait for command to be applied by leader
-                // Use a shorter timeout to allow retrying if we become leader or use provided timeout on final attempt
+                // Passive follower behavior: Wait for command to be applied by active node
+                // Use a shorter timeout to allow retrying if we become leader/owner
                 let timeout_duration = if attempt < max_retries - 1 {
                     Some(Duration::from_secs(5)) // Shorter timeout for retry attempts
                 } else {
                     follower_timeout // Use provided timeout for final attempt (could be None for indefinite wait)
                 };
 
-                match WorkflowRuntime::wait_for_specific_event(workflow_id, subscription, wait_for_event_fn.clone(), timeout_duration).await {
-                    Ok(value) => return Ok(value),
+                // Wait for either:
+                // 1. The expected event (e.g., CheckpointSet)
+                // 2. OwnershipChanged event (which means we should re-check if we're now the owner)
+                match WorkflowRuntime::wait_for_event_or_ownership_change(
+                    workflow_id,
+                    subscription,
+                    wait_for_event_fn.clone(),
+                    timeout_duration
+                ).await {
+                    Ok(Some(value)) => return Ok(value), // Got the expected event
+                    Ok(None) => continue, // Got OwnershipChanged - retry to check if we're now owner
                     Err(WorkflowError::Timeout) => {
-                        // Timeout - check if we became leader and should retry
-                        if cluster.is_leader().await {
-                            continue; // Retry as leader
+                        // Timeout - check if we became leader or owner and should retry
+                        if cluster.is_leader().await || self.is_workflow_owner(workflow_id, cluster).await {
+                            continue; // Retry as active node
                         } else if attempt == max_retries - 1 {
                             return Err(WorkflowError::Timeout); // Final attempt failed
                         }
@@ -728,7 +756,54 @@ impl WorkflowRuntime {
         Err(WorkflowError::Timeout) // Should not reach here, but just in case
     }
 
-    /// Wait for a specific event with state checking
+    /// Wait for a specific event OR an ownership change event
+    /// Returns Ok(Some(value)) if the expected event occurred
+    /// Returns Ok(None) if an OwnershipChanged event occurred (caller should re-check ownership)
+    /// Returns Err if timeout or other error
+    async fn wait_for_event_or_ownership_change<E, T>(
+        workflow_id: &str,
+        mut subscription: WorkflowSubscription,
+        event_extractor: E,
+        timeout_duration: Option<Duration>
+    ) -> Result<Option<T>, WorkflowError>
+    where
+        E: Fn(&WorkflowEvent) -> Option<T> + Send + Sync + Clone,
+        T: Send + 'static,
+    {
+        let workflow_id = workflow_id.to_string();
+        let filtered_extractor = move |event: &WorkflowEvent| {
+            // First check if this event is for our workflow_id
+            let event_workflow_id = match event {
+                WorkflowEvent::Started { workflow_id } => workflow_id,
+                WorkflowEvent::Completed { workflow_id, .. } => workflow_id,
+                WorkflowEvent::Failed { workflow_id, .. } => workflow_id,
+                WorkflowEvent::CheckpointSet { workflow_id, .. } => workflow_id,
+                WorkflowEvent::OwnershipChanged { workflow_id, .. } => workflow_id,
+            };
+
+            if event_workflow_id != &workflow_id {
+                return None; // Not for our workflow
+            }
+
+            // Check if this is an ownership change event
+            if matches!(event, WorkflowEvent::OwnershipChanged { .. }) {
+                // Signal that we should re-check ownership by returning a special marker
+                // We'll use Option<Option<T>> internally: Some(None) = ownership changed
+                return Some(None);
+            }
+
+            // Apply the user's event extractor and wrap in Some
+            event_extractor(event).map(Some)
+        };
+
+        match subscription.wait_for_event(filtered_extractor, timeout_duration).await {
+            Ok(Some(value)) => Ok(Some(value)), // Got expected event
+            Ok(None) => Ok(None), // Got OwnershipChanged
+            Err(e) => Err(e), // Timeout or other error
+        }
+    }
+
+    /// Wait for a specific event with state checking (legacy method, kept for compatibility)
     async fn wait_for_specific_event<E, T>(
         workflow_id: &str,
         mut subscription: WorkflowSubscription,
@@ -747,6 +822,7 @@ impl WorkflowRuntime {
                 WorkflowEvent::Completed { workflow_id, .. } => workflow_id,
                 WorkflowEvent::Failed { workflow_id, .. } => workflow_id,
                 WorkflowEvent::CheckpointSet { workflow_id, .. } => workflow_id,
+                WorkflowEvent::OwnershipChanged { workflow_id, .. } => workflow_id,
             };
 
             if event_workflow_id != &workflow_id {
@@ -760,6 +836,20 @@ impl WorkflowRuntime {
         subscription.wait_for_event(filtered_extractor, timeout_duration).await
     }
 
+    /// Check if this node owns the given workflow
+    async fn is_workflow_owner(
+        &self,
+        workflow_id: &str,
+        cluster: &RaftCluster<WorkflowCommandExecutor>,
+    ) -> bool {
+        // Check ownership map to see if we're the owner
+        if let Some(owner_node_id) = cluster.executor.ownership_map.get_owner(workflow_id) {
+            if let Some(our_node_id) = cluster.executor.get_node_id() {
+                return owner_node_id == our_node_id;
+            }
+        }
+        false
+    }
 
     /// Try to get a queued checkpoint value for a late follower (internal use)
     /// Returns Some(value) if a queued checkpoint exists, None otherwise

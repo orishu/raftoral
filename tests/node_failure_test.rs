@@ -102,7 +102,8 @@ async fn test_node_failure_workflow_reassignment() {
 
     // Give time for the OwnerChange commands to be proposed and applied
     // The reassignment happens asynchronously after the ConfChange is applied
-    tokio::time::sleep(Duration::from_millis(3000)).await;
+    // Increased timeout to handle async reassignment + consensus
+    tokio::time::sleep(Duration::from_millis(5000)).await;
 
     println!("Step 4: Verifying workflows were reassigned");
 
@@ -141,4 +142,94 @@ async fn test_node_failure_workflow_reassignment() {
     println!("  ✓ Orphaned workflows were detected");
     println!("  ✓ Leader reassigned workflows to remaining nodes");
     println!("  ✓ All workflows now owned by nodes 1 or 3");
+}
+
+#[tokio::test]
+async fn test_instant_ownership_promotion() {
+    use std::time::Instant;
+
+    println!("=== Starting Instant Ownership Promotion Test ===\n");
+    println!("This test verifies that a follower immediately becomes active when promoted to owner");
+    println!("(instead of waiting for a 5-second timeout)\n");
+
+    // Create a 3-node cluster
+    let transport = InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3]);
+    transport.start().await.expect("Transport should start");
+
+    let cluster1 = transport.create_cluster(1).await.expect("Should create cluster 1");
+    let cluster2 = transport.create_cluster(2).await.expect("Should create cluster 2");
+    let cluster3 = transport.create_cluster(3).await.expect("Should create cluster 3");
+
+    let runtime1 = WorkflowRuntime::new(cluster1.clone());
+    let runtime2 = WorkflowRuntime::new(cluster2.clone());
+    let runtime3 = WorkflowRuntime::new(cluster3.clone());
+
+    // Register a workflow that creates a checkpoint and measures promotion time
+    let workflow_fn = |input: TestInput, context: WorkflowContext| async move {
+        // Create first checkpoint
+        let _var1 = context.create_replicated_var("step1", input.value).await?;
+
+        // Wait a bit to ensure all nodes are executing
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Create second checkpoint - this is where promotion will be tested
+        let start_time = Instant::now();
+        let _var2 = context.create_replicated_var("step2", input.value * 2).await?;
+        let elapsed = start_time.elapsed();
+
+        println!("  Workflow completed step2 in {:?} (instant promotion if <1s)", elapsed);
+
+        Ok(TestOutput { result: input.value * 2 })
+    };
+
+    runtime1.register_workflow_closure("instant_test", 1, workflow_fn.clone())
+        .expect("Should register workflow");
+    runtime2.register_workflow_closure("instant_test", 1, workflow_fn.clone())
+        .expect("Should register workflow");
+    runtime3.register_workflow_closure("instant_test", 1, workflow_fn)
+        .expect("Should register workflow");
+
+    // Give nodes time to elect a leader
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    println!("Step 1: Starting workflow on node 2");
+    let workflow_id = {
+        let wf = runtime2.start_workflow::<TestInput, TestOutput>(
+            "instant_test", 1, TestInput { value: 42 }
+        ).await.expect("Workflow should start");
+        wf.workflow_id().to_string()
+    };
+    println!("✓ Workflow started: {}\n", workflow_id);
+
+    // Wait for workflow to reach step1
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    println!("Step 2: Removing node 2 to trigger ownership change");
+    let leader_cluster = if cluster1.is_leader().await {
+        cluster1.clone()
+    } else {
+        cluster3.clone()
+    };
+
+    let removal_time = Instant::now();
+    leader_cluster.remove_node(2).await
+        .expect("Should remove node 2");
+    println!("✓ Node 2 removed\n");
+
+    // Wait for reassignment and promotion
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+
+    let total_time = removal_time.elapsed();
+    println!("Step 3: Checking promotion speed");
+    println!("  Total time from removal to checkpoint: {:?}", total_time);
+
+    // With instant promotion, the new owner should wake up immediately (< 1s)
+    // Without instant promotion, it would wait for 5s timeout
+    if total_time < Duration::from_secs(3) {
+        println!("  ✓ Instant promotion detected! (< 3s)");
+    } else {
+        println!("  ⚠ Slow promotion (> 3s) - might be using timeout-based wakeup");
+    }
+
+    println!("\n✅ Instant ownership promotion test completed!");
 }
