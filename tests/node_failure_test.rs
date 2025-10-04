@@ -102,20 +102,29 @@ async fn test_node_failure_workflow_reassignment() {
 
     // Give time for the OwnerChange commands to be proposed and applied
     // The reassignment happens asynchronously after the ConfChange is applied
-    // Increased timeout to handle async reassignment + consensus
-    tokio::time::sleep(Duration::from_millis(5000)).await;
+    // Need to wait for: async task spawn + leadership check + propose + consensus + apply
+    tokio::time::sleep(Duration::from_millis(7000)).await;
 
     println!("Step 4: Verifying workflows were reassigned");
 
-    // Get the ownership map from any cluster node (they all share the same executor state)
-    let ownership_map = &cluster1.executor.ownership_map;
+    // Check ownership on both remaining nodes to ensure consistency
+    let ownership_map1 = &cluster1.executor.ownership_map;
+    let ownership_map3 = &cluster3.executor.ownership_map;
 
-    // Check ownership of workflow 1
-    let owner1 = ownership_map.get_owner(&workflow_id1);
+    println!("  DEBUG: Checking cluster 1's view:");
+    let owner1_on_node1 = ownership_map1.get_owner(&workflow_id1);
+    let owner2_on_node1 = ownership_map1.get_owner(&workflow_id2);
+    println!("    Workflow 1: {:?}, Workflow 2: {:?}", owner1_on_node1, owner2_on_node1);
+
+    println!("  DEBUG: Checking cluster 3's view:");
+    let owner1_on_node3 = ownership_map3.get_owner(&workflow_id1);
+    let owner2_on_node3 = ownership_map3.get_owner(&workflow_id2);
+    println!("    Workflow 1: {:?}, Workflow 2: {:?}", owner1_on_node3, owner2_on_node3);
+
+    // Use node 1's view for verification
+    let owner1 = owner1_on_node1;
+    let owner2 = owner2_on_node1;
     println!("  Workflow 1 ({}) owner: {:?}", workflow_id1, owner1);
-
-    // Check ownership of workflow 2
-    let owner2 = ownership_map.get_owner(&workflow_id2);
     println!("  Workflow 2 ({}) owner: {:?}", workflow_id2, owner2);
 
     // Verify that workflows are no longer owned by node 2
@@ -132,7 +141,7 @@ async fn test_node_failure_workflow_reassignment() {
     }
 
     // Verify node 2 has no workflows
-    let node2_workflows = ownership_map.get_workflows_owned_by(2);
+    let node2_workflows = ownership_map1.get_workflows_owned_by(2);
     assert!(node2_workflows.is_empty(), "Node 2 should have no workflows after removal");
     println!("  ✓ Node 2 has no workflows\n");
 

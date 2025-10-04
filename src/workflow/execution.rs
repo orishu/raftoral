@@ -407,38 +407,11 @@ impl CommandExecutor for WorkflowCommandExecutor {
                 self.ownership_map.set_owner(data.workflow_id.clone(), data.new_owner_node_id);
 
                 // Emit event to wake up waiting workflow executions on the new owner node
-                // This allows followers that were waiting on checkpoints to immediately become active owners
+                // This allows the waiting workflow execution to immediately become active
+                // No need to spawn new execution - the workflow is already running on all nodes,
+                // waiting on checkpoints. The OwnershipChanged event will wake up the new owner's
+                // execution, which will then check ownership and continue executing actively.
                 self.emit_ownership_changed_event(&data.workflow_id, data.new_owner_node_id);
-
-                // If we're the new owner, spawn workflow execution
-                // The workflow state and checkpoint queues are already populated from previous SetCheckpoint commands
-                let is_new_owner = self.get_node_id()
-                    .map(|node_id| node_id == data.new_owner_node_id)
-                    .unwrap_or(false);
-
-                if is_new_owner {
-                    // Get workflow info from state
-                    let state = self.state.lock().unwrap();
-                    let workflow_status = state.workflows.get(&data.workflow_id).cloned();
-                    drop(state);
-
-                    if let Some(WorkflowStatus::Running) = workflow_status {
-                        // Workflow is still running - we need to take over execution
-                        // The checkpoint queues already have all the data we need
-                        // Just spawn execution and it will consume from queues
-
-                        // Note: This is complex - for now, we just log that we're the new owner
-                        // Full implementation would need to reconstruct workflow execution state
-                        // and resume from the last checkpoint
-                        slog::warn!(logger, "New owner taking over workflow execution";
-                                   "workflow_id" => &data.workflow_id,
-                                   "new_owner" => data.new_owner_node_id);
-
-                        // TODO: Implement workflow resume mechanism
-                        // For now, the workflow may just stall, which is acceptable
-                        // since this only happens during node failures
-                    }
-                }
             },
         }
         Ok(())
@@ -474,7 +447,13 @@ impl CommandExecutor for WorkflowCommandExecutor {
             // Spawn a task to handle reassignment asynchronously
             // This avoids blocking the ConfChange application
             tokio::spawn(async move {
-                // Only the leader should reassign workflows
+                // Only the leader should reassign workflows, and it can't be the removed node
+                let our_node_id = runtime.cluster.node_id();
+                if our_node_id == removed_node_id {
+                    // We're the node being removed - don't try to reassign
+                    return;
+                }
+
                 if !runtime.cluster.is_leader().await {
                     return;
                 }
@@ -690,14 +669,18 @@ impl WorkflowRuntime {
         WorkflowRun::start(workflow_id, self, input).await
     }
 
-    /// Execute a leader/follower operation with retry logic for leadership changes and ownership promotion
-    async fn execute_leader_follower_operation<F, Fut, E, T>(
+    /// Execute an operation based on workflow ownership with retry logic for ownership changes
+    ///
+    /// If this node owns the workflow, execute the operation immediately.
+    /// If not, wait for the owner to execute and propagate the result via events.
+    /// Handles ownership changes (e.g., due to failover) by re-checking ownership on OwnershipChanged events.
+    async fn execute_owner_or_wait<F, Fut, E, T>(
         &self,
         workflow_id: &str,
         cluster: &RaftCluster<WorkflowCommandExecutor>,
-        leader_operation: F,
+        owner_operation: F,
         wait_for_event_fn: E,
-        follower_timeout: Option<Duration>,
+        passive_timeout: Option<Duration>,
     ) -> Result<T, WorkflowError>
     where
         F: Fn() -> Fut + Send,
@@ -705,31 +688,31 @@ impl WorkflowRuntime {
         E: Fn(&WorkflowEvent) -> Option<T> + Send + Sync + Clone,
         T: Send + 'static,
     {
-        // Retry loop to handle leadership changes and ownership promotion
+        // Retry loop to handle ownership changes (e.g., due to failover)
         let max_retries = 10; // Increased to handle multiple ownership changes
         for attempt in 0..max_retries {
             // Subscribe first to avoid race conditions
             let subscription = self.subscribe_to_workflow(workflow_id);
 
-            // Check if we're the leader OR the owner of this workflow
-            let is_leader = cluster.is_leader().await;
+            // Check if we're the owner of this workflow
+            // Note: Ownership is independent of Raft leadership
             let is_owner = self.is_workflow_owner(workflow_id, cluster).await;
 
-            if is_leader || is_owner {
-                // Active node behavior: Execute the provided operation
-                // This happens if we're the leader OR if we've been promoted to owner due to failover
-                return leader_operation().await;
+            if is_owner {
+                // Active owner: Execute the operation
+                // This happens if we own this workflow (either from the start or due to failover promotion)
+                return owner_operation().await;
             } else {
-                // Passive follower behavior: Wait for command to be applied by active node
-                // Use a shorter timeout to allow retrying if we become leader/owner
+                // Passive non-owner: Wait for the owner to execute and propagate results
+                // Use a shorter timeout to allow retrying if we become owner
                 let timeout_duration = if attempt < max_retries - 1 {
                     Some(Duration::from_secs(5)) // Shorter timeout for retry attempts
                 } else {
-                    follower_timeout // Use provided timeout for final attempt (could be None for indefinite wait)
+                    passive_timeout // Use provided timeout for final attempt (could be None for indefinite wait)
                 };
 
                 // Wait for either:
-                // 1. The expected event (e.g., CheckpointSet)
+                // 1. The expected event (e.g., CheckpointSet from the owner)
                 // 2. OwnershipChanged event (which means we should re-check if we're now the owner)
                 match WorkflowRuntime::wait_for_event_or_ownership_change(
                     workflow_id,
@@ -740,9 +723,9 @@ impl WorkflowRuntime {
                     Ok(Some(value)) => return Ok(value), // Got the expected event
                     Ok(None) => continue, // Got OwnershipChanged - retry to check if we're now owner
                     Err(WorkflowError::Timeout) => {
-                        // Timeout - check if we became leader or owner and should retry
-                        if cluster.is_leader().await || self.is_workflow_owner(workflow_id, cluster).await {
-                            continue; // Retry as active node
+                        // Timeout - check if we became owner and should retry
+                        if self.is_workflow_owner(workflow_id, cluster).await {
+                            continue; // Retry as owner
                         } else if attempt == max_retries - 1 {
                             return Err(WorkflowError::Timeout); // Final attempt failed
                         }
@@ -801,39 +784,6 @@ impl WorkflowRuntime {
             Ok(None) => Ok(None), // Got OwnershipChanged
             Err(e) => Err(e), // Timeout or other error
         }
-    }
-
-    /// Wait for a specific event with state checking (legacy method, kept for compatibility)
-    async fn wait_for_specific_event<E, T>(
-        workflow_id: &str,
-        mut subscription: WorkflowSubscription,
-        event_extractor: E,
-        timeout_duration: Option<Duration>
-    ) -> Result<T, WorkflowError>
-    where
-        E: Fn(&WorkflowEvent) -> Option<T> + Send + Sync + Clone,
-        T: Send + 'static,
-    {
-        let workflow_id = workflow_id.to_string();
-        let filtered_extractor = move |event: &WorkflowEvent| {
-            // First check if this event is for our workflow_id
-            let event_workflow_id = match event {
-                WorkflowEvent::Started { workflow_id } => workflow_id,
-                WorkflowEvent::Completed { workflow_id, .. } => workflow_id,
-                WorkflowEvent::Failed { workflow_id, .. } => workflow_id,
-                WorkflowEvent::CheckpointSet { workflow_id, .. } => workflow_id,
-                WorkflowEvent::OwnershipChanged { workflow_id, .. } => workflow_id,
-            };
-
-            if event_workflow_id != &workflow_id {
-                return None; // Not for our workflow
-            }
-
-            // Then apply the user's event extractor
-            event_extractor(event)
-        };
-
-        subscription.wait_for_event(filtered_extractor, timeout_duration).await
     }
 
     /// Check if this node owns the given workflow
@@ -910,8 +860,8 @@ impl WorkflowRuntime {
         let serialized_value = serde_json::to_vec(&value)
             .map_err(|e| WorkflowError::ClusterError(format!("Serialization error: {}", e)))?;
 
-        // Use the reusable leader/follower pattern with return value
-        self.execute_leader_follower_operation(
+        // Use the reusable owner/wait pattern with return value
+        self.execute_owner_or_wait(
             workflow_id,
             cluster,
             || {
@@ -920,7 +870,7 @@ impl WorkflowRuntime {
                 let workflow_id_owned_clone = workflow_id_owned.clone();
                 let key_owned_clone = key_owned.clone();
                 async move {
-                    // Leader operation: Propose SetCheckpoint command and return the value
+                    // Owner operation: Propose SetCheckpoint command and return the value
                     let command = WorkflowCommand::SetCheckpoint(CheckpointData {
                         workflow_id: workflow_id_owned_clone.clone(),
                         key: key_owned_clone.clone(),
@@ -1195,14 +1145,14 @@ impl WorkflowRun {
         // Serialize the input
         let input_bytes = serde_json::to_vec(&input).map_err(|e| WorkflowError::SerializationError(e.to_string()))?;
 
-        // Use the reusable leader/follower pattern to start the workflow
+        // Use the reusable owner/wait pattern to start the workflow
         let workflow_id_owned = workflow_id.to_string();
 
-        runtime.execute_leader_follower_operation(
+        runtime.execute_owner_or_wait(
             workflow_id,
             &cluster,
             || async {
-                // Leader operation: Propose WorkflowStart command with input
+                // Owner operation: Propose WorkflowStart command with input
                 // Note: workflow_type and version are empty when not using start_workflow_typed()
                 let command = WorkflowCommand::WorkflowStart(WorkflowStartData {
                     workflow_id: workflow_id_owned.clone(),
@@ -1283,11 +1233,11 @@ impl WorkflowRun {
         let workflow_id_owned = self.context.workflow_id.clone();
         let result_bytes_owned = result_bytes.clone();
 
-        self.runtime.execute_leader_follower_operation(
+        self.runtime.execute_owner_or_wait(
             &self.context.workflow_id,
             &self.runtime.cluster,
             || async {
-                // Leader operation: Propose WorkflowEnd command with result
+                // Owner operation: Propose WorkflowEnd command with result
                 let command = WorkflowCommand::WorkflowEnd(WorkflowEndData {
                     workflow_id: workflow_id_owned.clone(),
                     result: result_bytes_owned.clone(),
@@ -1329,11 +1279,11 @@ impl WorkflowRun {
         }
 
         // Wait for completion event
-        self.runtime.execute_leader_follower_operation(
+        self.runtime.execute_owner_or_wait(
             &self.context.workflow_id,
             &self.runtime.cluster,
             || async {
-                // For followers, we don't need to do anything - just wait for the event
+                // For non-owners, we don't need to do anything - just wait for the event
                 Ok(())
             },
             |event| {
