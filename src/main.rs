@@ -96,6 +96,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cluster = transport.create_cluster(node_id).await?;
     println!("✓ Raft cluster initialized");
 
+    // If joining an existing cluster, add this node via ConfChange
+    if !args.bootstrap && !args.peers.is_empty() {
+        println!("   Adding node {} to existing cluster...", node_id);
+        match cluster.add_node(node_id).await {
+            Ok(_) => println!("✓ Node added to cluster"),
+            Err(e) => {
+                eprintln!("⚠ Failed to add node to cluster: {}", e);
+                eprintln!("   Continuing anyway - node may already be in cluster");
+            }
+        }
+    }
+
     // Start gRPC server
     let server_handle = start_grpc_server(
         args.address.clone(),
@@ -106,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("✓ gRPC server listening on {}", args.address);
 
     // Create workflow runtime
-    let _runtime = WorkflowRuntime::new(cluster);
+    let _runtime = WorkflowRuntime::new(cluster.clone());
     println!("✓ Workflow runtime ready");
 
     println!("\n🎉 Node {} is running!", node_id);
@@ -115,6 +127,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wait for shutdown signal
     signal::ctrl_c().await?;
     println!("\n🛑 Shutdown signal received, stopping gracefully...");
+
+    // Remove this node from the cluster before shutting down
+    println!("   Removing node {} from cluster...", node_id);
+    match cluster.remove_node(node_id).await {
+        Ok(_) => println!("✓ Node removed from cluster"),
+        Err(e) => eprintln!("⚠ Failed to remove node from cluster: {}", e),
+    }
 
     server_handle.shutdown();
     println!("✓ Server stopped");

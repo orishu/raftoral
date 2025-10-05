@@ -1,8 +1,7 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, broadcast};
-use raft::prelude::*;
 use crate::raft::generic::message::{Message, CommandExecutor};
 use crate::raft::generic::node::RaftNode;
 
@@ -25,8 +24,8 @@ pub struct RaftCluster<E: CommandExecutor> {
     next_command_id: Arc<AtomicU64>,
     // Command executor for applying commands
     pub executor: Arc<E>,
-    // Track if this node is currently the leader
-    is_leader: Arc<AtomicBool>,
+    // Track the current leader node ID (0 = unknown)
+    leader_id: Arc<AtomicU64>,
     // The ID of this node
     node_id: u64,
 }
@@ -67,7 +66,8 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
 
         // Determine if this is a single-node or multi-node setup
         let is_single_node = peer_senders.is_empty();
-        let is_leader_arc = Arc::new(AtomicBool::new(is_single_node)); // Single nodes start as leader
+
+        let leader_id_arc = Arc::new(AtomicU64::new(0)); // 0 = unknown
 
         let cluster = RaftCluster {
             node_senders,
@@ -75,27 +75,18 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
             role_change_tx: role_change_tx.clone(),
             next_command_id: Arc::new(AtomicU64::new(1)),
             executor: executor_arc.clone(),
-            is_leader: is_leader_arc.clone(),
+            leader_id: leader_id_arc.clone(),
             node_id,
         };
 
-        // Spawn a task to listen for role changes and update is_leader
-        let is_leader_listener = is_leader_arc.clone();
-        let mut role_rx = role_change_tx.subscribe();
-        let listen_node_id = node_id;
+        // Spawn a task to listen for role changes and update leader_id
+        let leader_id_listener = leader_id_arc.clone();
+        let role_change_tx_clone = role_change_tx.clone();
         tokio::spawn(async move {
+            let mut role_rx = role_change_tx_clone.subscribe();
             while let Ok(role_change) = role_rx.recv().await {
-                match role_change {
-                    RoleChange::BecameLeader(id) if id == listen_node_id => {
-                        is_leader_listener.store(true, Ordering::SeqCst);
-                    }
-                    RoleChange::BecameFollower(id) if id == listen_node_id => {
-                        is_leader_listener.store(false, Ordering::SeqCst);
-                    }
-                    RoleChange::BecameCandidate(id) if id == listen_node_id => {
-                        is_leader_listener.store(false, Ordering::SeqCst);
-                    }
-                    _ => {}
+                if let RoleChange::BecameLeader(id) = role_change {
+                    leader_id_listener.store(id, Ordering::SeqCst);
                 }
             }
         });
@@ -103,21 +94,11 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
         // Create and spawn the Raft node
         let role_tx_for_node = role_change_tx.clone();
         tokio::spawn(async move {
-            let mut node = if is_single_node {
-                match RaftNode::<E>::new_single_node(node_id, receiver, peer_senders, executor_arc.clone(), role_tx_for_node) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        eprintln!("Failed to create single-node RaftNode {}: {}", node_id, e);
-                        return;
-                    }
-                }
-            } else {
-                match RaftNode::<E>::new(node_id, receiver, peer_senders, executor_arc.clone(), role_tx_for_node) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        eprintln!("Failed to create RaftNode {}: {}", node_id, e);
-                        return;
-                    }
+            let mut node = match RaftNode::<E>::new(node_id, receiver, peer_senders, executor_arc.clone(), role_tx_for_node) {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("Failed to create RaftNode {}: {}", node_id, e);
+                    return;
                 }
             };
 
@@ -150,7 +131,8 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
         let (role_change_tx, _role_change_rx) = broadcast::channel(100);
 
         let executor_arc = Arc::new(executor);
-        let is_leader_arc = Arc::new(AtomicBool::new(true)); // Single node starts as leader
+
+        let leader_id_arc = Arc::new(AtomicU64::new(node_id)); // Single node is always leader
 
         let cluster = RaftCluster {
             node_senders,
@@ -158,7 +140,7 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
             role_change_tx: role_change_tx.clone(),
             next_command_id: Arc::new(AtomicU64::new(1)),
             executor: executor_arc.clone(),
-            is_leader: is_leader_arc.clone(),
+            leader_id: leader_id_arc.clone(),
             node_id,
         };
 
@@ -207,85 +189,139 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
         }
     }
 
-    /// Propose a command and wait until it's applied to the state machine
-    /// Uses precise tracking with unique command IDs to wait for exact completion
-    pub async fn propose_and_sync(&self, command: E::Command) -> Result<(), Box<dyn std::error::Error>> {
-        // Retry up to 10 times with exponential backoff to handle leader elections
-        let max_retries = 10;
+    /// Send a message to the leader node with retry logic
+    /// This is the common implementation used by propose_and_sync, add_node, and remove_node
+    async fn send_to_leader<R>(
+        &self,
+        create_message: impl Fn(tokio::sync::oneshot::Sender<R>) -> Message<E::Command>,
+        max_retries: usize,
+    ) -> Result<R, Box<dyn std::error::Error>>
+    where
+        R: Send + 'static,
+    {
         let mut retry_delay_ms = 100;
 
         for retry in 0..max_retries {
-            // If this node is the leader, send directly to self
-            if self.is_leader.load(Ordering::SeqCst) {
-                let (sender, receiver) = tokio::sync::oneshot::channel();
-                if let Some(node_sender) = self.node_senders.get(&self.node_id) {
-                    node_sender.send(Message::Propose {
-                        id: 0,
-                        callback: None,
-                        sync_callback: Some(sender),
-                        command: command.clone(),
-                    })?;
+            // If this node is the leader, try sending to self first
+            if self.leader_id.load(Ordering::SeqCst) == self.node_id {
+                if let Some(self_sender) = self.node_senders.get(&self.node_id) {
+                    let (sender, receiver) = tokio::sync::oneshot::channel();
+                    let message = create_message(sender);
 
-                    // Wait for the specific command to be applied
-                    return match receiver.await {
-                        Ok(result) => result.map_err(|e| -> Box<dyn std::error::Error> { format!("Command application error: {}", e).into() }),
-                        Err(e) => Err(format!("Command callback error: {}", e).into()),
-                    };
-                }
-            }
-
-            // Not the leader - try all nodes until one succeeds (simple leader discovery)
-            // In a real implementation, we'd track the leader ID from Raft messages
-            for (_node_id, node_sender) in &self.node_senders {
-                let (sender, receiver) = tokio::sync::oneshot::channel();
-
-                // Clone the command for each attempt (in case of retries)
-                let command_clone = command.clone();
-
-                if node_sender.send(Message::Propose {
-                    id: 0,
-                    callback: None,
-                    sync_callback: Some(sender),
-                    command: command_clone,
-                }).is_err() {
-                    continue; // Node channel closed, try next
-                }
-
-                // Wait for response with a short timeout
-                match tokio::time::timeout(std::time::Duration::from_millis(500), receiver).await {
-                    Ok(Ok(Ok(_))) => {
-                        // Success! This node was the leader
-                        return Ok(());
-                    },
-                    Ok(Ok(Err(e))) => {
-                        // Command application error - likely not the leader, try next node
-                        if e.to_string().contains("raft: proposal dropped") || e.to_string().contains("not leader") {
-                            continue;
-                        } else {
-                            // Different error, propagate it
-                            return Err(e);
+                    if self_sender.send(message).is_ok() {
+                        match tokio::time::timeout(std::time::Duration::from_millis(500), receiver).await {
+                            Ok(Ok(result)) => return Ok(result),
+                            _ => {
+                                // Failed as leader
+                            }
                         }
-                    },
-                    Ok(Err(_)) | Err(_) => {
-                        // Channel error or timeout, try next node
-                        continue;
                     }
                 }
             }
 
-            // No leader found in this round - sleep and retry
+            // Check if we know the leader from role changes
+            let known_leader_id = self.leader_id.load(Ordering::SeqCst);
+
+            // Try sending to known leader
+            if known_leader_id != 0 && known_leader_id != self.node_id {
+                if let Some(leader_sender) = self.node_senders.get(&known_leader_id) {
+                    let (sender, receiver) = tokio::sync::oneshot::channel();
+                    let message = create_message(sender);
+
+                    if leader_sender.send(message).is_ok() {
+                        match tokio::time::timeout(std::time::Duration::from_millis(500), receiver).await {
+                            Ok(Ok(result)) => return Ok(result),
+                            _ => {
+                                // Known leader failed, will try discovery
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Leader unknown or failed - try scanning all nodes to find the leader
+            // This is a fallback for when the role change subscription misses the initial election
+            for (node_id, sender) in &self.node_senders {
+                let (test_sender, test_receiver) = tokio::sync::oneshot::channel();
+                let test_message = create_message(test_sender);
+
+                if sender.send(test_message).is_ok() {
+                    match tokio::time::timeout(std::time::Duration::from_millis(500), test_receiver).await {
+                        Ok(Ok(result)) => {
+                            // Found the leader! Update our cached leader_id
+                            self.leader_id.store(*node_id, Ordering::SeqCst);
+                            return Ok(result);
+                        },
+                        _ => {
+                            // This node isn't the leader or failed, try next
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Still no leader found - subscribe to role changes and wait for one to emerge
+            let mut role_rx = self.role_change_tx.subscribe();
+
+            // Wait for a leader to emerge
+            let wait_result = tokio::time::timeout(
+                std::time::Duration::from_millis(retry_delay_ms),
+                async {
+                    while let Ok(role_change) = role_rx.recv().await {
+                        if let RoleChange::BecameLeader(leader_id) = role_change {
+                            return Some(leader_id);
+                        }
+                    }
+                    None
+                }
+            ).await;
+
+            if let Ok(Some(leader_id)) = wait_result {
+                // We learned who the leader is, try sending to them
+                if let Some(leader_sender) = self.node_senders.get(&leader_id) {
+                    let (sender, receiver) = tokio::sync::oneshot::channel();
+                    let message = create_message(sender);
+
+                    if leader_sender.send(message).is_ok() {
+                        match tokio::time::timeout(std::time::Duration::from_millis(500), receiver).await {
+                            Ok(Ok(result)) => return Ok(result),
+                            _ => {
+                                // Failed, will retry
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Increase retry delay with exponential backoff
             if retry < max_retries - 1 {
                 tokio::time::sleep(std::time::Duration::from_millis(retry_delay_ms)).await;
-                retry_delay_ms = (retry_delay_ms * 2).min(1000); // Exponential backoff, max 1s
+                retry_delay_ms = (retry_delay_ms * 2).min(2000);
             }
         }
 
-        Err("Failed to propose command: no leader found after retries".into())
+        Err("Failed to send message to leader after retries".into())
+    }
+
+    /// Propose a command and wait until it's applied to the state machine
+    /// Uses precise tracking with unique command IDs to wait for exact completion
+    pub async fn propose_and_sync(&self, command: E::Command) -> Result<(), Box<dyn std::error::Error>> {
+        let cmd = command; // Move ownership
+        let _ = self.send_to_leader(
+            move |sender| Message::Propose {
+                id: 0,
+                callback: None,
+                sync_callback: Some(sender),
+                command: cmd.clone(),
+            },
+            10, // max_retries
+        ).await?;
+        Ok(())
     }
 
     /// Check if this cluster is currently the leader
     pub async fn is_leader(&self) -> bool {
-        self.is_leader.load(Ordering::SeqCst)
+        self.leader_id.load(Ordering::SeqCst) == self.node_id
     }
 
     /// Subscribe to role change notifications
@@ -299,51 +335,33 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
     }
 
 
-    pub async fn add_node(&self, node_id: u64) -> Result<bool, Box<dyn std::error::Error>> {
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-
-        // Create modern ConfChangeV2
-        let mut conf_change = ConfChangeV2::default();
-        let mut change = ConfChangeSingle::default();
-        change.change_type = ConfChangeType::AddNode.into();
-        change.node_id = node_id;
-        conf_change.changes.push(change);
-
-        if let Some(node_sender) = self.node_senders.get(&self.node_id) {
-            node_sender.send(Message::ConfChangeV2 {
-                id: 0,
+    /// Add a node to the Raft cluster
+    /// Automatically finds the leader and sends the request
+    pub async fn add_node(&self, node_id: u64) -> Result<(), Box<dyn std::error::Error>> {
+        match self.send_to_leader(
+            move |sender| Message::AddNode {
+                node_id,
                 callback: Some(sender),
-                change: conf_change,
-            })?;
-
-            let result = receiver.await?;
-            Ok(result)
-        } else {
-            Err("Local node sender not found".into())
+            },
+            10, // max_retries
+        ).await? {
+            Ok(()) => Ok(()),
+            Err(e) => Err(format!("{}", e).into()),
         }
     }
 
-    pub async fn remove_node(&self, node_id: u64) -> Result<bool, Box<dyn std::error::Error>> {
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-
-        // Create modern ConfChangeV2
-        let mut conf_change = ConfChangeV2::default();
-        let mut change = ConfChangeSingle::default();
-        change.change_type = ConfChangeType::RemoveNode.into();
-        change.node_id = node_id;
-        conf_change.changes.push(change);
-
-        if let Some(node_sender) = self.node_senders.get(&self.node_id) {
-            node_sender.send(Message::ConfChangeV2 {
-                id: 0,
+    /// Remove a node from the Raft cluster
+    /// Automatically finds the leader and sends the request
+    pub async fn remove_node(&self, node_id: u64) -> Result<(), Box<dyn std::error::Error>> {
+        match self.send_to_leader(
+            move |sender| Message::RemoveNode {
+                node_id,
                 callback: Some(sender),
-                change: conf_change,
-            })?;
-
-            let result = receiver.await?;
-            Ok(result)
-        } else {
-            Err("Local node sender not found".into())
+            },
+            10, // max_retries
+        ).await? {
+            Ok(()) => Ok(()),
+            Err(e) => Err(format!("{}", e).into()),
         }
     }
 

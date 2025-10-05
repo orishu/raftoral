@@ -71,57 +71,6 @@ pub struct RaftNode<E: CommandExecutor> {
 }
 
 impl<E: CommandExecutor + 'static> RaftNode<E> {
-    pub fn new_single_node(
-        node_id: u64,
-        mailbox: mpsc::UnboundedReceiver<Message<E::Command>>,
-        peers: HashMap<u64, mpsc::UnboundedSender<Message<E::Command>>>,
-        executor: Arc<E>,
-        role_change_tx: broadcast::Sender<RoleChange>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let config = Config {
-            id: node_id,
-            election_tick: 10,
-            heartbeat_tick: 3,
-            applied: 0,
-            max_size_per_msg: 1024 * 1024 * 1024,
-            max_inflight_msgs: 256,
-            check_quorum: false, // Important: disable for single node
-            pre_vote: false, // Disable pre-vote for single node
-            ..Default::default()
-        };
-
-        let storage = MemStorageWithSnapshot::new();
-
-        // For single-node cluster, initialize with ourselves as voter
-        let mut initial_state = ConfState::default();
-        initial_state.voters.push(node_id);
-        storage.wl().set_conf_state(initial_state);
-
-        // Create logger for this node
-        let decorator = slog_term::TermDecorator::new().build();
-        let drain = slog_term::FullFormat::new(decorator).build().fuse();
-        let drain = slog_async::Async::new(drain).build().fuse();
-        let logger = slog::Logger::root(drain, slog::o!("node_id" => node_id));
-
-        let raft_group = RawNode::new(&config, storage, &logger)?;
-
-        Ok(RaftNode {
-            raft_group,
-            storage: Arc::new(RwLock::new(HashMap::new())),
-            node_id,
-            logger,
-            mailbox,
-            peers,
-            sync_commands: HashMap::new(),
-            next_command_id: AtomicU64::new(1),
-            executor,
-            role_change_tx,
-            current_role: StateRole::Follower, // Start as follower
-            committed_index: 0,
-            snapshot_config: SnapshotConfig::default(),
-        })
-    }
-
     pub fn new(
         node_id: u64,
         mailbox: mpsc::UnboundedReceiver<Message<E::Command>>,
@@ -129,6 +78,8 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
         executor: Arc<E>,
         role_change_tx: broadcast::Sender<RoleChange>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let is_single_node = peers.is_empty();
+
         let config = Config {
             id: node_id,
             election_tick: 10,
@@ -136,7 +87,8 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             applied: 0,
             max_size_per_msg: 1024 * 1024 * 1024,
             max_inflight_msgs: 256,
-            check_quorum: peers.len() > 0, // Disable quorum check for single-node
+            check_quorum: !is_single_node, // Disable quorum check for single-node
+            pre_vote: !is_single_node, // Disable pre-vote for single node
             ..Default::default()
         };
 
@@ -146,7 +98,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
         let mut initial_state = ConfState::default();
         // Add ourselves as a voter
         initial_state.voters.push(node_id);
-        // Add all peers as voters
+        // Add all peers as voters (if multi-node)
         for &peer_id in peers.keys() {
             initial_state.voters.push(peer_id);
         }
@@ -511,6 +463,56 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                                     slog::error!(self.logger, "Failed to start campaign"; "error" => %e);
                                     if let Some(cb) = callback {
                                         let _ = cb.send(false);
+                                    }
+                                }
+                            }
+                        },
+                        Some(Message::AddNode { node_id, callback }) => {
+                            // Create ConfChangeV2 for adding node
+                            let mut conf_change = ConfChangeV2::default();
+                            let mut change = ConfChangeSingle::default();
+                            change.change_type = ConfChangeType::AddNode.into();
+                            change.node_id = node_id;
+                            conf_change.changes.push(change);
+
+                            match self.propose_conf_change_v2(conf_change) {
+                                Ok(_) => {
+                                    slog::info!(self.logger, "Proposed adding node"; "node_id" => node_id);
+                                    if let Some(cb) = callback {
+                                        let _ = cb.send(Ok(()));
+                                    }
+                                },
+                                Err(e) => {
+                                    slog::error!(self.logger, "Failed to propose add node"; "error" => %e, "node_id" => node_id);
+                                    if let Some(cb) = callback {
+                                        let err_msg = format!("Failed to add node: {}", e);
+                                        let err: Box<dyn std::error::Error + Send + Sync> = err_msg.into();
+                                        let _ = cb.send(Err(err));
+                                    }
+                                }
+                            }
+                        },
+                        Some(Message::RemoveNode { node_id, callback }) => {
+                            // Create ConfChangeV2 for removing node
+                            let mut conf_change = ConfChangeV2::default();
+                            let mut change = ConfChangeSingle::default();
+                            change.change_type = ConfChangeType::RemoveNode.into();
+                            change.node_id = node_id;
+                            conf_change.changes.push(change);
+
+                            match self.propose_conf_change_v2(conf_change) {
+                                Ok(_) => {
+                                    slog::info!(self.logger, "Proposed removing node"; "node_id" => node_id);
+                                    if let Some(cb) = callback {
+                                        let _ = cb.send(Ok(()));
+                                    }
+                                },
+                                Err(e) => {
+                                    slog::error!(self.logger, "Failed to propose remove node"; "error" => %e, "node_id" => node_id);
+                                    if let Some(cb) = callback {
+                                        let err_msg = format!("Failed to remove node: {}", e);
+                                        let err: Box<dyn std::error::Error + Send + Sync> = err_msg.into();
+                                        let _ = cb.send(Err(err));
                                     }
                                 }
                             }

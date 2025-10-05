@@ -477,26 +477,13 @@ async fn test_automatic_snapshot_on_node_join() {
 
     println!("Node 4 created (but not yet part of Raft cluster)");
 
-    // Determine which node is the leader
-    let leader_runtime = if runtime1.cluster.is_leader().await {
-        println!("Node 1 is the leader");
-        &runtime1
-    } else if runtime2.cluster.is_leader().await {
-        println!("Node 2 is the leader");
-        &runtime2
-    } else {
-        println!("Node 3 is the leader");
-        &runtime3
-    };
-
-    // Add node 4 to the cluster via configuration change from the leader
+    // Add node 4 to the cluster - the add_node method automatically finds the leader
     // NOTE: This is where Raft would automatically send snapshot if node 4 is too far behind
     println!("Adding node 4 to Raft cluster via ConfChange...");
 
-    let added = leader_runtime.cluster.add_node(4).await
+    runtime1.cluster.add_node(4).await
         .expect("Should add node 4");
 
-    assert!(added, "Node 4 should be successfully added");
     println!("✓ Node 4 added to cluster, waiting for sync...");
 
     // Wait for node 4 to catch up (either via log replay or snapshot)

@@ -102,4 +102,12 @@ where
     Campaign {
         callback: Option<tokio::sync::oneshot::Sender<bool>>,
     },
+    AddNode {
+        node_id: u64,
+        callback: Option<tokio::sync::oneshot::Sender<Result<(), Box<dyn std::error::Error + Send + Sync>>>>,
+    },
+    RemoveNode {
+        node_id: u64,
+        callback: Option<tokio::sync::oneshot::Sender<Result<(), Box<dyn std::error::Error + Send + Sync>>>>,
+    },
 }
