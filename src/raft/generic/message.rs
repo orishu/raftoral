@@ -83,6 +83,31 @@ where
     }
 }
 
+/// Serializable version of Message (without callbacks)
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound = "C: Clone + Debug + Serialize + DeserializeOwned")]
+pub enum SerializableMessage<C>
+where
+    C: Clone + Debug + Serialize + DeserializeOwned,
+{
+    Propose {
+        id: u8,
+        command: C,
+    },
+    Raft(Vec<u8>), // Serialized raft::prelude::Message
+    ConfChangeV2 {
+        id: u8,
+        change_bytes: Vec<u8>, // Serialized raft::prelude::ConfChangeV2
+    },
+    Campaign,
+    AddNode {
+        node_id: u64,
+    },
+    RemoveNode {
+        node_id: u64,
+    },
+}
+
 pub enum Message<C>
 where
     C: Clone + Debug + Serialize + DeserializeOwned + Send + Sync + 'static,
@@ -110,4 +135,64 @@ where
         node_id: u64,
         callback: Option<tokio::sync::oneshot::Sender<Result<(), Box<dyn std::error::Error + Send + Sync>>>>,
     },
+}
+
+impl<C> Message<C>
+where
+    C: Clone + Debug + Serialize + DeserializeOwned + Send + Sync + 'static,
+{
+    /// Convert to serializable form (loses callbacks)
+    pub fn to_serializable(&self) -> Result<SerializableMessage<C>, Box<dyn std::error::Error>> {
+        use protobuf::Message as ProtobufMessage;
+
+        Ok(match self {
+            Message::Propose { id, command, .. } => SerializableMessage::Propose {
+                id: *id,
+                command: command.clone(),
+            },
+            Message::Raft(raft_msg) => {
+                let bytes = raft_msg.write_to_bytes()?;
+                SerializableMessage::Raft(bytes)
+            },
+            Message::ConfChangeV2 { id, change, .. } => {
+                let bytes = change.write_to_bytes()?;
+                SerializableMessage::ConfChangeV2 {
+                    id: *id,
+                    change_bytes: bytes,
+                }
+            },
+            Message::Campaign { .. } => SerializableMessage::Campaign,
+            Message::AddNode { node_id, .. } => SerializableMessage::AddNode { node_id: *node_id },
+            Message::RemoveNode { node_id, .. } => SerializableMessage::RemoveNode { node_id: *node_id },
+        })
+    }
+
+    /// Create from serializable form (without callbacks)
+    pub fn from_serializable(msg: SerializableMessage<C>) -> Result<Self, Box<dyn std::error::Error>> {
+        use protobuf::Message as ProtobufMessage;
+
+        Ok(match msg {
+            SerializableMessage::Propose { id, command } => Message::Propose {
+                id,
+                callback: None,
+                sync_callback: None,
+                command,
+            },
+            SerializableMessage::Raft(bytes) => {
+                let raft_msg = raft::prelude::Message::parse_from_bytes(&bytes)?;
+                Message::Raft(raft_msg)
+            },
+            SerializableMessage::ConfChangeV2 { id, change_bytes } => {
+                let change = raft::prelude::ConfChangeV2::parse_from_bytes(&change_bytes)?;
+                Message::ConfChangeV2 {
+                    id,
+                    callback: None,
+                    change,
+                }
+            },
+            SerializableMessage::Campaign => Message::Campaign { callback: None },
+            SerializableMessage::AddNode { node_id } => Message::AddNode { node_id, callback: None },
+            SerializableMessage::RemoveNode { node_id } => Message::RemoveNode { node_id, callback: None },
+        })
+    }
 }

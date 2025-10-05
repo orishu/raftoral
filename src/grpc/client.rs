@@ -1,8 +1,9 @@
 use tonic::transport::Channel;
 use std::sync::Arc;
 use crate::grpc::server::raft_proto::{
-    raft_service_client::RaftServiceClient, RaftMessage,
+    raft_service_client::RaftServiceClient, GenericMessage,
 };
+use crate::raft::generic::message::{Message, SerializableMessage};
 
 /// Type alias for channel creation function
 pub type ChannelBuilder = Arc<dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Channel, Box<dyn std::error::Error + Send + Sync>>> + Send>> + Send + Sync>;
@@ -56,12 +57,25 @@ impl RaftClient {
         Ok(Self { client })
     }
 
-    /// Send a Raft message to the peer node
-    pub async fn send_raft_message(
+    /// Send a generic message to the peer node
+    pub async fn send_message<C>(
         &mut self,
-        raft_msg: RaftMessage,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let response = self.client.send_message(raft_msg).await?;
+        message: &Message<C>,
+    ) -> Result<(), Box<dyn std::error::Error>>
+    where
+        C: Clone + std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+    {
+        // Convert to serializable form (strips callbacks)
+        let serializable: SerializableMessage<C> = message.to_serializable()?;
+
+        // Serialize to JSON
+        let serialized = serde_json::to_vec(&serializable)?;
+
+        let generic_msg = GenericMessage {
+            serialized_message: serialized,
+        };
+
+        let response = self.client.send_message(generic_msg).await?;
         let msg_response = response.into_inner();
 
         if !msg_response.success {

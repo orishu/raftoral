@@ -194,7 +194,7 @@ pub trait ClusterTransport<E: CommandExecutor> {
 ```
 
 - `InMemoryClusterTransport` - Local testing via tokio channels
-- `GrpcClusterTransport` - Distributed deployment via gRPC with automatic message forwarding
+- `GrpcClusterTransport` - Network deployment via generic gRPC (fully decoupled from workflow system)
 
 ### Event-Driven Coordination
 
@@ -312,14 +312,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - All tests passing after refactoring
 - Improved maintainability and readability
 
-**Milestone 13: Node Management & API Simplification** ✅
-- Message::AddNode and Message::RemoveNode for cluster membership
-- Automatic leader discovery (hybrid strategy: cache → scan → subscribe)
-- Production node lifecycle (graceful join/leave in main.rs)
-- Eliminated redundant is_leader state (derive from leader_id == node_id)
-- Consolidated RaftNode::new (single method for single/multi-node)
-- Fixed scan loop bug that caused test flakiness
-- All 27 tests passing consistently
+**Milestone 13: Generic gRPC Transport** ✅
+- Completely decoupled gRPC layer from workflow system
+- Proto file reduced to 41 lines of pure infrastructure (from 82 lines)
+- SerializableMessage<C> architecture for network serialization
+- Single generic send_message() for all message types
+- Works with ANY command type implementing standard Rust traits
+- Custom ChannelBuilder support for TLS/authentication
+- All 23 library tests + examples passing
 
 ### Next Steps 🚀
 
@@ -329,7 +329,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - Snapshot during active workflow execution
 
 **Future Enhancements**
-- GrpcClusterTransport for distributed deployment
+- Multi-node gRPC cluster testing (infrastructure is ready)
 - Advanced workflow patterns (child workflows, compensation)
 - Observability and metrics
 - Performance benchmarking
@@ -398,7 +398,7 @@ examples/
 
 Contributions welcome! Areas of interest:
 - Multi-node fault injection testing
-- GrpcClusterTransport implementation
+- Multi-node gRPC cluster testing
 - Advanced workflow patterns
 - Performance benchmarking
 - Documentation improvements

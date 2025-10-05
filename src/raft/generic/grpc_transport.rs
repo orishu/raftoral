@@ -5,7 +5,6 @@ use crate::raft::generic::message::{Message, CommandExecutor};
 use crate::raft::generic::cluster::RaftCluster;
 use crate::raft::generic::transport::ClusterTransport;
 use crate::grpc::client::{RaftClient, ChannelBuilder, default_channel_builder};
-use protobuf::Message as ProtobufMessage;
 
 /// Configuration for a node in the gRPC cluster
 #[derive(Clone, Debug)]
@@ -161,33 +160,16 @@ impl<E: CommandExecutor> GrpcClusterTransport<E> {
             loop {
                 tokio::select! {
                     Some(message) = forwarder_rx.recv() => {
-                        // Only forward Raft protocol messages over gRPC
-                        if let Message::Raft(raft_msg) = message {
-                            // Get the gRPC client for this node
-                            let clients = grpc_clients.read().await;
-                            if let Some(client) = clients.get(&target_node_id) {
-                                let mut client = client.lock().await;
+                        // Get the gRPC client for this node
+                        let clients = grpc_clients.read().await;
+                        if let Some(client) = clients.get(&target_node_id) {
+                            let mut client = client.lock().await;
 
-                                // Serialize the Raft message
-                                match raft_msg.write_to_bytes() {
-                                    Ok(bytes) => {
-                                        let grpc_msg = crate::grpc::server::raft_proto::RaftMessage {
-                                            raft_message: bytes,
-                                            command: None, // Raft messages don't carry commands
-                                        };
-
-                                        if let Err(e) = client.send_raft_message(grpc_msg).await {
-                                            eprintln!("Failed to send message to node {}: {}", target_node_id, e);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Failed to serialize Raft message: {}", e);
-                                    }
-                                }
+                            // Simply forward the message via gRPC - completely generic!
+                            if let Err(e) = client.send_message(&message).await {
+                                eprintln!("Failed to send message to node {}: {}", target_node_id, e);
                             }
                         }
-                        // Other message types (Propose, Campaign, etc.) are local-only
-                        // They should never be sent to remote nodes
                     }
                     _ = shutdown_rx.recv() => {
                         break;
@@ -306,6 +288,7 @@ impl<E: CommandExecutor + Default + 'static> ClusterTransport<E> for GrpcCluster
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raft::generic::message::SerializableMessage;
     use serde::{Deserialize, Serialize};
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::time::{timeout, Duration};
@@ -383,26 +366,33 @@ mod tests {
         use tonic::transport::Server;
         use crate::grpc::server::raft_proto::{
             raft_service_server::{RaftService, RaftServiceServer},
-            RaftMessage, MessageResponse,
+            GenericMessage, MessageResponse,
         };
         use tonic::{Request, Response, Status};
 
         struct TestService {
             addr: String,
-            received_message: Arc<TokioMutex<Option<raft::prelude::Message>>>,
+            received_command: Arc<TokioMutex<Option<TestCommand>>>,
         }
 
         #[tonic::async_trait]
         impl RaftService for TestService {
             async fn send_message(
                 &self,
-                request: Request<RaftMessage>,
+                request: Request<GenericMessage>,
             ) -> Result<Response<MessageResponse>, Status> {
-                let raft_msg = request.into_inner();
+                let generic_msg = request.into_inner();
 
-                // Deserialize and store the Raft message
-                if let Ok(msg) = protobuf::Message::parse_from_bytes(&raft_msg.raft_message) {
-                    *self.received_message.lock().await = Some(msg);
+                // Deserialize to SerializableMessage first
+                let serializable: SerializableMessage<TestCommand> = serde_json::from_slice(&generic_msg.serialized_message)
+                    .map_err(|e| Status::invalid_argument(format!("Failed to deserialize: {}", e)))?;
+
+                // Convert to Message and extract the command if it's a Propose
+                let message = Message::<TestCommand>::from_serializable(serializable)
+                    .map_err(|e| Status::invalid_argument(format!("Failed to convert: {}", e)))?;
+
+                if let Message::Propose { command, .. } = message {
+                    *self.received_command.lock().await = Some(command);
                 }
 
                 Ok(Response::new(MessageResponse {
@@ -427,9 +417,9 @@ mod tests {
         let test_addr = addr.parse().expect("Should parse address");
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-        // Shared storage for received message
-        let received_message = Arc::new(TokioMutex::new(None));
-        let received_message_clone = received_message.clone();
+        // Shared storage for received command
+        let received_command = Arc::new(TokioMutex::new(None));
+        let received_command_clone = received_command.clone();
 
         // Start test server in background
         let addr_for_service = addr.clone();
@@ -437,7 +427,7 @@ mod tests {
             Server::builder()
                 .add_service(RaftServiceServer::new(TestService {
                     addr: addr_for_service,
-                    received_message: received_message_clone,
+                    received_command: received_command_clone,
                 }))
                 .serve_with_shutdown(test_addr, async {
                     shutdown_rx.await.ok();
@@ -454,24 +444,19 @@ mod tests {
             .await
             .expect("Should connect to test server");
 
-        // Create a test Raft message
-        let mut raft_msg = raft::prelude::Message::default();
-        raft_msg.set_msg_type(raft::prelude::MessageType::MsgHeartbeat);
-        raft_msg.set_to(1);
-        raft_msg.set_from(2);
-
-        let msg_bytes = protobuf::Message::write_to_bytes(&raft_msg)
-            .expect("Should serialize message");
-
-        let grpc_msg = RaftMessage {
-            raft_message: msg_bytes,
-            command: None,
+        // Create a test message with a command
+        let test_command = TestCommand::TestMessage("Hello gRPC!".to_string());
+        let message = Message::Propose {
+            id: 1,
+            callback: None,
+            sync_callback: None,
+            command: test_command.clone(),
         };
 
         // Send message
         let result = timeout(
             Duration::from_secs(5),
-            client.send_raft_message(grpc_msg)
+            client.send_message(&message)
         ).await;
 
         assert!(result.is_ok(), "Message send should not timeout");
@@ -480,21 +465,18 @@ mod tests {
         // Give server time to process the message
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Verify the received message payload
-        let received = received_message.lock().await;
-        assert!(received.is_some(), "Server should have received a message");
+        // Verify the received command payload
+        let received = received_command.lock().await;
+        assert!(received.is_some(), "Server should have received a command");
 
-        let received_msg = received.as_ref().unwrap();
-        assert_eq!(received_msg.get_msg_type(), raft::prelude::MessageType::MsgHeartbeat,
-                   "Message type should be MsgHeartbeat");
-        assert_eq!(received_msg.get_to(), 1, "Message 'to' field should be 1");
-        assert_eq!(received_msg.get_from(), 2, "Message 'from' field should be 2");
-
-        println!("Test completed successfully");
-        println!("Verified message: type={:?}, from={}, to={}",
-                 received_msg.get_msg_type(),
-                 received_msg.get_from(),
-                 received_msg.get_to());
+        let received_cmd = received.as_ref().unwrap();
+        if let TestCommand::TestMessage(msg) = received_cmd {
+            assert_eq!(msg, "Hello gRPC!", "Command payload should match");
+            println!("Test completed successfully");
+            println!("Verified command payload: {}", msg);
+        } else {
+            panic!("Expected TestMessage variant");
+        }
 
         // Cleanup
         let _ = shutdown_tx.send(());

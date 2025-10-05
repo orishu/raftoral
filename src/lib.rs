@@ -11,4 +11,4 @@ pub use workflow::{
     WorkflowCommandExecutor, WorkflowError,
     ReplicatedVar, ReplicatedVarError, WorkflowRuntime, WorkflowRun, WorkflowContext
 };
-pub use grpc::{start_grpc_server, start_grpc_server_blocking, GrpcServerHandle, RaftClient, discover_peers, DiscoveredPeer, bootstrap};
+pub use grpc::{start_grpc_server, start_grpc_server_with_config, GrpcServerHandle, RaftClient, discover_peers, DiscoveredPeer, bootstrap};

@@ -112,7 +112,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server_handle = start_grpc_server(
         args.address.clone(),
         transport.clone(),
-        cluster.clone(),
         node_id,
     ).await?;
     println!("✓ gRPC server listening on {}", args.address);

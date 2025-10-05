@@ -2,57 +2,15 @@ syntax = "proto3";
 
 package raftoral;
 
-// Workflow-specific command types
-message WorkflowStartData {
-    string workflow_id = 1;
-    string workflow_type = 2;
-    uint32 version = 3;
-    bytes input = 4;
-    uint64 owner_node_id = 5;
-}
-
-message WorkflowEndData {
-    string workflow_id = 1;
-    bytes result = 2;
-}
-
-message CheckpointData {
-    string workflow_id = 1;
-    string key = 2;
-    bytes value = 3;
-}
-
-enum OwnerChangeReason {
-    NODE_FAILURE = 0;
-    LOAD_BALANCING = 1;
-}
-
-message OwnerChangeData {
-    string workflow_id = 1;
-    uint64 old_owner_node_id = 2;
-    uint64 new_owner_node_id = 3;
-    OwnerChangeReason reason = 4;
-}
-
-message WorkflowCommand {
-    oneof command {
-        WorkflowStartData workflow_start = 1;
-        WorkflowEndData workflow_end = 2;
-        CheckpointData checkpoint = 3;
-        OwnerChangeData owner_change = 4;
-    }
-}
-
-// Generic Raft message wrapper
-message RaftMessage {
-    bytes raft_message = 1;  // Serialized raft::prelude::Message
-    WorkflowCommand command = 2;  // Optional: only set for proposal messages
+// Generic message envelope for any Message<Command> type
+message GenericMessage {
+    bytes serialized_message = 1;  // JSON-serialized Message<Command>
 }
 
 // gRPC service for Raft communication
 service RaftService {
-    // Send a Raft message to a peer node
-    rpc SendMessage(RaftMessage) returns (MessageResponse);
+    // Send any generic Message<Command> to a peer node
+    rpc SendMessage(GenericMessage) returns (MessageResponse);
 
     // Discover node information (for bootstrap)
     rpc Discover(DiscoveryRequest) returns (DiscoveryResponse);
