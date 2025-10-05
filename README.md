@@ -19,9 +19,12 @@ Raftoral provides a distributed workflow orchestration engine where workflows ex
 - ✅ Raft snapshots for new node state recovery
 - ✅ Leadership transition support
 - ✅ Transport abstraction (InMemoryClusterTransport)
+- 🚧 GrpcClusterTransport (partial implementation - needs client integration)
 - ✅ Universal workflow initiation (any node can start)
+- ✅ Automatic leader discovery for node operations
+- ✅ Graceful node join and leave operations
 - ✅ Event-driven architecture (no polling)
-- ✅ Comprehensive test coverage (19 tests including multi-node and doctests)
+- ✅ Comprehensive test coverage (22 library tests + 5 multi-node tests)
 - ✅ Clean modular code organization
 
 ## Quick Start
@@ -141,6 +144,35 @@ let api_result = context.create_replicated_var_with_computation(
 - Queue reconstruction from history on snapshot restore
 - Enables new node catch-up without full log replay
 
+### 6. Automatic Leader Discovery & Node Management
+
+**No manual leader tracking required** - nodes automatically find the leader:
+
+```rust
+// Add node from ANY node in the cluster
+cluster.add_node(4).await?;  // Automatically routes to leader
+
+// Remove node gracefully
+cluster.remove_node(4).await?;  // Works from any node
+```
+
+**Hybrid discovery strategy:**
+1. Check cached leader ID (fast path)
+2. Scan all nodes to find current leader
+3. Subscribe to role changes for new leader
+4. Exponential backoff retry
+
+**Production node lifecycle:**
+```rust
+// main.rs automatically handles join and leave
+if !args.bootstrap {
+    cluster.add_node(node_id).await?;  // Join on startup
+}
+
+signal::ctrl_c().await?;
+cluster.remove_node(node_id).await?;   // Clean shutdown
+```
+
 ## Architecture
 
 ### Execution Flow
@@ -162,8 +194,8 @@ pub trait ClusterTransport<E: CommandExecutor> {
 }
 ```
 
-- `InMemoryClusterTransport` - Local testing via tokio channels
-- Future: `GrpcClusterTransport` - Distributed deployment
+- `InMemoryClusterTransport` - Local testing via tokio channels (production-ready)
+- `GrpcClusterTransport` - Partial implementation (has scaffolding, needs client forwarding)
 
 ### Event-Driven Coordination
 
@@ -280,6 +312,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - Clear separation: commands, errors, executor, runtime, context
 - All tests passing after refactoring
 - Improved maintainability and readability
+
+**Milestone 13: Node Management & API Simplification** ✅
+- Message::AddNode and Message::RemoveNode for cluster membership
+- Automatic leader discovery (hybrid strategy: cache → scan → subscribe)
+- Production node lifecycle (graceful join/leave in main.rs)
+- Eliminated redundant is_leader state (derive from leader_id == node_id)
+- Consolidated RaftNode::new (single method for single/multi-node)
+- Fixed scan loop bug that caused test flakiness
+- All 27 tests passing consistently
 
 ### Next Steps 🚀
 
