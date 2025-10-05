@@ -208,6 +208,9 @@ pub fn convert_workflow_command_to_proto(cmd: &WorkflowCommand) -> ProtoWorkflow
     }
 }
 
+/// Type alias for server configuration function
+pub type ServerConfigurator = Box<dyn Fn(Server) -> Server + Send + Sync>;
+
 /// gRPC server handle with graceful shutdown support
 pub struct GrpcServerHandle {
     shutdown_tx: oneshot::Sender<()>,
@@ -227,13 +230,60 @@ pub async fn start_grpc_server(
     cluster: Arc<RaftCluster<WorkflowCommandExecutor>>,
     node_id: u64,
 ) -> Result<GrpcServerHandle, Box<dyn std::error::Error>> {
+    start_grpc_server_with_config(address, transport, cluster, node_id, None).await
+}
+
+/// Start a gRPC server with custom server configuration
+///
+/// This allows customization of the gRPC server with features like:
+/// - TLS/SSL configuration
+/// - Interceptors for authentication
+/// - Custom timeout settings
+/// - Compression options
+/// - Max message size limits
+///
+/// # Example
+/// ```no_run
+/// use raftoral::grpc::server::start_grpc_server_with_config;
+/// use tonic::transport::Server;
+/// use std::sync::Arc;
+///
+/// let server_config = Box::new(|server: Server| {
+///     server
+///         .timeout(std::time::Duration::from_secs(30))
+///         .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
+/// });
+///
+/// let handle = start_grpc_server_with_config(
+///     "127.0.0.1:5001".to_string(),
+///     transport,
+///     cluster,
+///     1,
+///     Some(server_config)
+/// ).await?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub async fn start_grpc_server_with_config(
+    address: String,
+    transport: Arc<GrpcClusterTransport<WorkflowCommandExecutor>>,
+    cluster: Arc<RaftCluster<WorkflowCommandExecutor>>,
+    node_id: u64,
+    server_config: Option<ServerConfigurator>,
+) -> Result<GrpcServerHandle, Box<dyn std::error::Error>> {
     let addr = address.parse()?;
     let service = RaftServiceImpl::new(transport, cluster, node_id, address);
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     tokio::spawn(async move {
-        Server::builder()
+        let mut server = Server::builder();
+
+        // Apply custom configuration if provided
+        if let Some(config_fn) = server_config {
+            server = config_fn(server);
+        }
+
+        server
             .add_service(RaftServiceServer::new(service))
             .serve_with_shutdown(addr, async {
                 shutdown_rx.await.ok();

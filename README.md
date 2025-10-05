@@ -18,8 +18,7 @@ Raftoral provides a distributed workflow orchestration engine where workflows ex
 - ✅ Late follower catch-up via checkpoint queues
 - ✅ Raft snapshots for new node state recovery
 - ✅ Leadership transition support
-- ✅ Transport abstraction (InMemoryClusterTransport)
-- 🚧 GrpcClusterTransport (partial implementation - needs client integration)
+- ✅ Transport abstraction (InMemoryClusterTransport, GrpcClusterTransport)
 - ✅ Universal workflow initiation (any node can start)
 - ✅ Automatic leader discovery for node operations
 - ✅ Graceful node join and leave operations
@@ -194,8 +193,8 @@ pub trait ClusterTransport<E: CommandExecutor> {
 }
 ```
 
-- `InMemoryClusterTransport` - Local testing via tokio channels (production-ready)
-- `GrpcClusterTransport` - Partial implementation (has scaffolding, needs client forwarding)
+- `InMemoryClusterTransport` - Local testing via tokio channels
+- `GrpcClusterTransport` - Distributed deployment via gRPC with automatic message forwarding
 
 ### Event-Driven Coordination
 
