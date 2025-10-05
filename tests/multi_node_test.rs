@@ -175,7 +175,7 @@ async fn test_three_node_cluster_basic_consensus() {
 #[tokio::test]
 async fn test_cluster_node_count() {
     let transport = InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3, 4, 5]);
-    assert_eq!(transport.node_ids(), vec![1, 2, 3, 4, 5]);
+    assert_eq!(transport.node_ids().await, vec![1, 2, 3, 4, 5]);
 
     transport.start().await.expect("Transport should start");
 

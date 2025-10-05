@@ -29,7 +29,7 @@ pub trait ClusterTransport<E: CommandExecutor>: Send + Sync {
     ) -> impl std::future::Future<Output = Result<Arc<RaftCluster<E>>, Box<dyn std::error::Error>>> + Send;
 
     /// Get the list of all node IDs in this transport configuration
-    fn node_ids(&self) -> Vec<u64>;
+    fn node_ids(&self) -> impl std::future::Future<Output = Vec<u64>> + Send;
 
     /// Start the transport layer (e.g., background message routing tasks)
     fn start(&self) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> + Send;
@@ -133,7 +133,7 @@ impl<E: CommandExecutor + Default + 'static> ClusterTransport<E> for InMemoryClu
         Ok(Arc::new(cluster))
     }
 
-    fn node_ids(&self) -> Vec<u64> {
+    async fn node_ids(&self) -> Vec<u64> {
         self.node_ids.clone()
     }
 
@@ -176,7 +176,7 @@ mod tests {
     #[tokio::test]
     async fn test_in_memory_transport_creation() {
         let transport = InMemoryClusterTransport::<TestExecutor>::new(vec![1, 2, 3]);
-        assert_eq!(transport.node_ids(), vec![1, 2, 3]);
+        assert_eq!(transport.node_ids().await, vec![1, 2, 3]);
     }
 
     #[tokio::test]
