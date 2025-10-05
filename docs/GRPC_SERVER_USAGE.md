@@ -2,11 +2,27 @@
 
 ## Overview
 
-Raftoral now includes a production-ready gRPC server with:
+Raftoral includes a **production-ready, generic gRPC server** with:
+- **Fully generic transport** - Works with any command type, not just workflows
 - **Graceful shutdown** support
 - **Peer discovery** via RPC
 - **Auto node ID assignment** for joining nodes
+- **Automatic node addition/removal** on join/leave
 - **CLI interface** for easy deployment
+- **TLS/authentication support** via custom ChannelBuilder
+
+## Key Feature: Generic Architecture ✅
+
+The gRPC server is **completely decoupled from the workflow system**. It can be used for:
+- Workflow orchestration (WorkflowCommandExecutor)
+- Distributed databases
+- Configuration management
+- Any Raft-based application
+
+The server works with ANY command type `C` implementing:
+```rust
+Clone + Debug + Serialize + DeserializeOwned + Send + Sync + 'static
+```
 
 ## Starting a Cluster
 
@@ -26,6 +42,8 @@ Output:
    Node ID: 1
    Cluster nodes: 1 total
 ✓ Raft cluster initialized
+   Adding node 1 to existing cluster...
+✓ Node added to cluster
 ✓ gRPC server listening on 127.0.0.1:5001
 ✓ Workflow runtime ready
 
@@ -45,6 +63,7 @@ The node will:
 1. Discover the existing peer(s)
 2. Query their highest known node ID
 3. Auto-assign itself the next available node ID
+4. **Automatically add itself to the cluster via ConfChange**
 
 Output:
 ```
@@ -56,6 +75,8 @@ Output:
    Auto-assigned node ID: 2
    Cluster nodes: 2 total
 ✓ Raft cluster initialized
+   Adding node 2 to existing cluster...
+✓ Node added to cluster
 ✓ gRPC server listening on 127.0.0.1:5002
 ✓ Workflow runtime ready
 
@@ -114,10 +135,16 @@ When a node starts in join mode:
    - Assigns itself: `max(highest_known_node_id) + 1`
    - Falls back to `1` if no peers discovered
 
+4. **Cluster Join**:
+   - Automatically calls `cluster.add_node(node_id)` after initialization
+   - Uses automatic leader discovery (no manual leader tracking needed)
+   - Leader applies ConfChange to add the new node
+
 ### Discovery RPC Definition
 
 ```protobuf
 service RaftService {
+    rpc SendMessage(GenericMessage) returns (MessageResponse);
     rpc Discover(DiscoveryRequest) returns (DiscoveryResponse);
 }
 
@@ -140,17 +167,22 @@ Press `Ctrl+C` to trigger graceful shutdown:
 ```
 ^C
 🛑 Shutdown signal received, stopping gracefully...
+   Removing node 2 from cluster...
+✓ Node removed from cluster
 ✓ Server stopped
 ```
 
-The server uses tonic's `serve_with_shutdown` to:
-- Stop accepting new connections
-- Complete in-flight requests
-- Clean up resources
+The shutdown process:
+1. **Removes node from cluster** via ConfChange (automatic leader discovery)
+2. **Stops accepting new connections**
+3. **Completes in-flight requests**
+4. **Cleans up resources**
+
+The server uses tonic's `serve_with_shutdown` for clean termination.
 
 ## Programmatic Usage
 
-### Starting a Server
+### Starting a Server (Basic)
 
 ```rust
 use raftoral::raft::generic::grpc_transport::{GrpcClusterTransport, NodeConfig};
@@ -161,19 +193,81 @@ let nodes = vec![
     NodeConfig { node_id: 1, address: "127.0.0.1:5001".to_string() }
 ];
 
-let transport = Arc::new(GrpcClusterTransport::new(nodes));
-let cluster = transport.create_cluster(1).await?;
+let transport = Arc::new(
+    GrpcClusterTransport::<WorkflowCommandExecutor>::new(nodes)
+);
+transport.start().await?;
 
 // Returns a handle for graceful shutdown
 let server_handle = start_grpc_server(
     "127.0.0.1:5001".to_string(),
-    transport,
-    cluster,
-    1
+    transport.clone(),
+    1  // node_id
 ).await?;
 
 // Later, shutdown gracefully
 server_handle.shutdown();
+```
+
+### Starting a Server with TLS
+
+```rust
+use raftoral::grpc::start_grpc_server_with_config;
+use tonic::transport::{Server, ServerTlsConfig, Identity};
+
+// Load TLS certificate and key
+let cert = std::fs::read("server.crt")?;
+let key = std::fs::read("server.key")?;
+let identity = Identity::from_pem(cert, key);
+
+// Custom server configuration
+let server_config = Box::new(|server: Server| {
+    let tls = ServerTlsConfig::new()
+        .identity(identity);
+
+    server.tls_config(tls).unwrap()
+});
+
+// Start server with TLS
+let server_handle = start_grpc_server_with_config(
+    "127.0.0.1:5001".to_string(),
+    transport,
+    1,
+    Some(server_config)
+).await?;
+```
+
+### Custom Channel Builder (Client TLS)
+
+```rust
+use raftoral::grpc::client::{ChannelBuilder, default_channel_builder};
+use raftoral::raft::generic::grpc_transport::GrpcClusterTransport;
+use tonic::transport::ClientTlsConfig;
+
+// Custom TLS channel builder
+let ca_cert = std::fs::read("ca.crt")?;
+let client_cert = std::fs::read("client.crt")?;
+let client_key = std::fs::read("client.key")?;
+let client_identity = Identity::from_pem(client_cert, client_key);
+
+let channel_builder: ChannelBuilder = Arc::new(|address: String| {
+    Box::pin(async move {
+        let tls = ClientTlsConfig::new()
+            .ca_certificate(tonic::transport::Certificate::from_pem(ca_cert))
+            .identity(client_identity);
+
+        Channel::from_shared(format!("https://{}", address))?
+            .tls_config(tls)?
+            .connect()
+            .await
+    })
+});
+
+// Create transport with custom TLS
+let transport = GrpcClusterTransport::new_with_channel_builder(
+    nodes,
+    channel_builder
+);
 ```
 
 ### Discovery API
@@ -192,19 +286,76 @@ let my_node_id = next_node_id(&peers);
 println!("Assigned node ID: {}", my_node_id);
 ```
 
+## Generic Message Flow
+
+### How Messages Are Sent Over gRPC
+
+**Sender Side**:
+```
+Application creates Message<C>
+  ↓
+Message::Propose { command: MyCommand::Foo, ... }
+  ↓
+to_serializable() → SerializableMessage<C>
+  ↓
+serde_json::to_vec() → JSON bytes
+  ↓
+GenericMessage { serialized_message: bytes }
+  ↓
+gRPC SendMessage RPC
+  ↓
+Network
+```
+
+**Receiver Side**:
+```
+Network
+  ↓
+gRPC receives GenericMessage
+  ↓
+Extract bytes from serialized_message field
+  ↓
+serde_json::from_slice() → SerializableMessage<C>
+  ↓
+from_serializable() → Message<C>
+  ↓
+Inject into local node's mailbox
+  ↓
+Raft processes message
+```
+
+**Key Points**:
+- Server is generic over `CommandExecutor` type
+- No knowledge of specific command types
+- All serialization handled via JSON
+- Raft protocol messages use protobuf internally
+
+### Supported Message Types
+
+All message types work seamlessly:
+- `Message::Propose` - Command proposals
+- `Message::Raft` - Raft protocol messages
+- `Message::ConfChangeV2` - Configuration changes
+- `Message::Campaign` - Leadership election
+- `Message::AddNode` - Add node (with automatic leader discovery)
+- `Message::RemoveNode` - Remove node (with automatic leader discovery)
+
 ## Testing
 
 ### Run gRPC Tests
 
 ```bash
-cargo test --test grpc_test
+# All gRPC transport tests
+cargo test --lib grpc_transport
+
+# With output
+cargo test --lib grpc_transport -- --nocapture
 ```
 
 Tests include:
-- `test_grpc_message_passing`: Verifies message transmission over gRPC
-- `test_grpc_transport_node_management`: Tests dynamic node add/remove
-- `test_grpc_transport_node_ids`: Validates node ID retrieval
-- `test_discovery_rpc`: Tests peer discovery protocol
+- `test_grpc_transport_creation`: Node configuration and address lookup
+- `test_add_remove_node`: Dynamic node management
+- `test_grpc_client_connect`: **Generic message forwarding with payload verification**
 
 ### Bootstrap Tests
 
@@ -232,6 +383,12 @@ cargo run --release -- --address 10.0.1.11:5001 --peers 10.0.1.10:5001
 ```bash
 cargo run --release -- --address 10.0.1.12:5001 --peers 10.0.1.10:5001,10.0.1.11:5001
 ```
+
+Each node will:
+1. Auto-assign node ID
+2. Start gRPC server
+3. **Automatically add itself to cluster** via ConfChange
+4. Begin participating in Raft consensus
 
 ### Docker Deployment
 
@@ -269,17 +426,66 @@ services:
 ### Components
 
 1. **GrpcServerHandle**: Manages server lifecycle with graceful shutdown
-2. **RaftServiceImpl**: Implements gRPC service with:
-   - `SendMessage`: Raft protocol communication
+2. **RaftServiceImpl<E>**: Generic gRPC service implementation
+   - `SendMessage`: Generic message forwarding (any command type)
    - `Discover`: Peer discovery for bootstrap
-3. **Bootstrap Module**: Node ID assignment and peer discovery logic
+3. **SerializableMessage<C>**: Wire format without callbacks
+4. **Bootstrap Module**: Node ID assignment and peer discovery
+5. **GrpcClusterTransport<E>**: Generic transport implementation
 
 ### Key Design Decisions
 
+- **Complete Genericity**: Works with any CommandExecutor type
 - **Graceful Shutdown**: Uses `oneshot` channel to signal shutdown
 - **Auto Node ID**: Prevents manual coordination during cluster growth
-- **Discovery-based Join**: Nodes automatically learn cluster topology
-- **Transport Integration**: Works seamlessly with `GrpcClusterTransport`
+- **Automatic Join/Leave**: Nodes add/remove themselves via ConfChange
+- **Automatic Leader Discovery**: No manual leader tracking needed
+- **SerializableMessage Pattern**: Enables network serialization without callbacks
+- **Minimal Proto File**: 41 lines, zero business logic
+
+## Generic Architecture Benefits
+
+### 1. Reusable Across Applications
+
+The same gRPC infrastructure can be used for:
+```rust
+// Workflow orchestration
+GrpcClusterTransport::<WorkflowCommandExecutor>::new(nodes)
+
+// Custom distributed database
+struct DbExecutor;
+impl CommandExecutor for DbExecutor {
+    type Command = DbCommand;
+    // ...
+}
+GrpcClusterTransport::<DbExecutor>::new(nodes)  // Works!
+```
+
+### 2. Type Safety Maintained
+
+Despite being generic, compile-time checking is preserved:
+```rust
+// This compiles
+let msg = Message::Propose {
+    command: MyCommand::Write { key: "foo", value: "bar" },
+    ...
+};
+grpc_client.send_message(&msg).await?;
+
+// This fails at compile time
+let msg = Message::Propose {
+    command: WrongCommand::Delete,  // Type error!
+    ...
+};
+```
+
+### 3. Minimal Protocol Definition
+
+Proto file is **41 lines** with zero business logic:
+- `GenericMessage` - JSON bytes envelope
+- `RaftService` - Two RPC methods
+- Discovery messages - Generic cluster info
+- No workflow-specific types
 
 ## Troubleshooting
 
@@ -292,13 +498,14 @@ services:
 - Ensure peer nodes are running
 - Check network connectivity and firewall rules
 
-### "Node ID already exists"
+### "Failed to add node to cluster"
 
-**Cause**: Manually specified node ID conflicts with existing node.
+**Cause**: Leader not available or ConfChange rejected.
 
-**Solution**:
-- Remove `--node-id` flag to use auto-assignment
-- Or choose a unique node ID
+**Solutions**:
+- Main.rs handles this gracefully with "Continuing anyway" message
+- Node may already be in cluster
+- Check that bootstrap node is running and healthy
 
 ### Server fails to bind
 
@@ -309,25 +516,49 @@ services:
 - Kill process using the port: `lsof -ti:5001 | xargs kill`
 - Use `0.0.0.0` instead of `127.0.0.1` for Docker deployments
 
+### "Message deserialization failed"
+
+**Cause**: Command type mismatch between nodes.
+
+**Solutions**:
+- Ensure all nodes use same CommandExecutor type
+- Verify command definitions match across nodes
+- Check serde versions are compatible
+
 ## Future Enhancements
 
 Potential improvements:
-- **TLS/mTLS**: Secure gRPC connections
+- **Compression**: gRPC built-in compression for large messages
 - **Health checks**: Dedicated health check endpoint
 - **Metrics**: Prometheus metrics export
-- **Dynamic membership**: Add Raft `ConfChange` integration
-- **Persistence**: Snapshot and WAL storage configuration
+- **Retry logic**: Exponential backoff for transient failures
 - **Load balancing**: Smart peer selection for discovery
+- **Persistence**: Snapshot and WAL storage configuration
 
-## Files Modified
+## Files Overview
 
-**New Files**:
+**Core Implementation**:
+- `proto/raft.proto` - 41 lines of generic protocol
+- `src/grpc/server.rs` - Generic gRPC server
+- `src/grpc/client.rs` - Generic gRPC client with custom ChannelBuilder support
 - `src/grpc/bootstrap.rs` - Peer discovery and node ID logic
-- `docs/GRPC_SERVER_USAGE.md` - This guide
+- `src/raft/generic/grpc_transport.rs` - Generic transport implementation
+- `src/raft/generic/message.rs` - SerializableMessage architecture
 
-**Modified Files**:
-- `proto/raft.proto` - Added `Discover` RPC and messages
-- `src/grpc/server.rs` - Added graceful shutdown and discovery handler
-- `src/main.rs` - Complete rewrite with CLI interface
-- `Cargo.toml` - Added `clap` for CLI parsing
-- `tests/grpc_test.rs` - Added discovery test
+**Application**:
+- `src/main.rs` - CLI with automatic join/leave
+- `Cargo.toml` - Dependencies (tonic, prost, serde_json)
+
+## Summary
+
+The gRPC server provides a **production-ready, generic Raft communication layer**:
+
+✅ **Zero workflow coupling** - Works with any command type
+✅ **Automatic cluster management** - Join/leave handled automatically
+✅ **Automatic leader discovery** - No manual tracking needed
+✅ **Type-safe** - Full compile-time checking
+✅ **Secure** - TLS/mTLS support via custom builders
+✅ **Graceful shutdown** - Clean termination with ConfChange removal
+✅ **Production-ready** - CLI, Docker support, error handling
+
+The implementation is a **reusable Raft infrastructure** suitable for any distributed consensus application.
