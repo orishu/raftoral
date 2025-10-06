@@ -49,6 +49,7 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
         peer_senders: HashMap<u64, mpsc::UnboundedSender<Message<E::Command>>>,
         self_sender: mpsc::UnboundedSender<Message<E::Command>>,
         executor: E,
+        transport_updater: Option<Arc<dyn crate::raft::generic::transport::TransportUpdater>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Create role change broadcast channel
         let (role_change_tx, _role_change_rx) = broadcast::channel(100);
@@ -94,7 +95,7 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
         // Create and spawn the Raft node
         let role_tx_for_node = role_change_tx.clone();
         tokio::spawn(async move {
-            let mut node = match RaftNode::<E>::new(node_id, receiver, peer_senders, executor_arc.clone(), role_tx_for_node) {
+            let mut node = match RaftNode::<E>::new(node_id, receiver, peer_senders, executor_arc.clone(), role_tx_for_node, transport_updater) {
                 Ok(n) => n,
                 Err(e) => {
                     eprintln!("Failed to create RaftNode {}: {}", node_id, e);
@@ -147,7 +148,7 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
         // Create and run the single node using the multi-node constructor
         let role_tx_clone = role_change_tx.clone();
         tokio::spawn(async move {
-            let mut node = match RaftNode::<E>::new(node_id, receiver, peers, executor_arc.clone(), role_tx_clone) {
+            let mut node = match RaftNode::<E>::new(node_id, receiver, peers, executor_arc.clone(), role_tx_clone, None) {
                 Ok(n) => n,
                 Err(e) => {
                     eprintln!("Failed to create RaftNode {}: {}", node_id, e);
@@ -337,10 +338,11 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
 
     /// Add a node to the Raft cluster
     /// Automatically finds the leader and sends the request
-    pub async fn add_node(&self, node_id: u64) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn add_node(&self, node_id: u64, address: String) -> Result<(), Box<dyn std::error::Error>> {
         match self.send_to_leader(
             move |sender| Message::AddNode {
                 node_id,
+                address: address.clone(),
                 callback: Some(sender),
             },
             10, // max_retries

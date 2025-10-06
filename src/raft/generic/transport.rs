@@ -1,8 +1,42 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use serde::{Serialize, Deserialize};
 use crate::raft::generic::message::{Message, CommandExecutor};
 use crate::raft::generic::cluster::RaftCluster;
+
+/// Trait for handling transport updates from RaftNode
+/// Implemented by ClusterTransport to handle dynamic peer management
+pub trait TransportUpdater: Send + Sync {
+    /// Add a peer to the transport
+    fn update_add_peer(&self, node_id: u64, address: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Remove a peer from the transport
+    fn update_remove_peer(&self, node_id: u64) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// Metadata about a node's transport address
+/// Embedded in ConfChangeV2.context field for dynamic node discovery
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NodeMetadata {
+    pub node_id: u64,
+    pub address: String,  // For GrpcClusterTransport: "host:port"
+}
+
+impl NodeMetadata {
+    /// Serialize to bytes for ConfChangeV2.context
+    pub fn to_bytes(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        Ok(serde_json::to_vec(self)?)
+    }
+
+    /// Deserialize from ConfChangeV2.context bytes
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
+        if bytes.is_empty() {
+            return Err("Empty metadata bytes".into());
+        }
+        Ok(serde_json::from_slice(bytes)?)
+    }
+}
 
 /// Transport layer abstraction for Raft cluster communication
 ///
@@ -24,7 +58,7 @@ pub trait ClusterTransport<E: CommandExecutor>: Send + Sync {
     /// # Returns
     /// A RaftCluster instance configured to communicate with peers via this transport
     fn create_cluster(
-        &self,
+        self: &Arc<Self>,
         node_id: u64,
     ) -> impl std::future::Future<Output = Result<Arc<RaftCluster<E>>, Box<dyn std::error::Error>>> + Send;
 
@@ -36,6 +70,13 @@ pub trait ClusterTransport<E: CommandExecutor>: Send + Sync {
 
     /// Shutdown the transport layer gracefully
     fn shutdown(&self) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> + Send;
+
+    /// Add a peer node dynamically (called when ConfChange is applied)
+    /// Returns Ok(()) if peer was added or already exists
+    fn add_peer(&self, node_id: u64, address: String) -> Result<(), Box<dyn std::error::Error>>;
+
+    /// Remove a peer node dynamically (called when node is removed)
+    fn remove_peer(&self, node_id: u64) -> Result<(), Box<dyn std::error::Error>>;
 }
 
 /// In-memory transport for local multi-node testing
@@ -48,10 +89,11 @@ pub trait ClusterTransport<E: CommandExecutor>: Send + Sync {
 /// ```no_run
 /// use raftoral::raft::generic::transport::{ClusterTransport, InMemoryClusterTransport};
 /// use raftoral::workflow::WorkflowCommandExecutor;
+/// use std::sync::Arc;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// // Create transport for 3-node cluster
-/// let transport = InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3]);
+/// let transport = Arc::new(InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3]));
 /// transport.start().await?;
 ///
 /// // Create cluster instances for each node (executors created internally)
@@ -96,7 +138,7 @@ impl<E: CommandExecutor + 'static> InMemoryClusterTransport<E> {
 
 impl<E: CommandExecutor + Default + 'static> ClusterTransport<E> for InMemoryClusterTransport<E> {
     async fn create_cluster(
-        &self,
+        self: &Arc<Self>,
         node_id: u64,
     ) -> Result<Arc<RaftCluster<E>>, Box<dyn std::error::Error>> {
         // Create a new executor instance
@@ -122,12 +164,14 @@ impl<E: CommandExecutor + Default + 'static> ClusterTransport<E> for InMemoryClu
             .clone();
 
         // Create the cluster with the receiver, peer senders, and self sender
+        // In-memory transport has fixed nodes, so no transport update channel needed
         let cluster = RaftCluster::new_with_transport(
             node_id,
             receiver,
             peer_senders,
             self_sender,
             executor,
+            None, // No transport updates for in-memory (fixed nodes)
         ).await?;
 
         Ok(Arc::new(cluster))
@@ -148,6 +192,17 @@ impl<E: CommandExecutor + Default + 'static> ClusterTransport<E> for InMemoryClu
         if let Some(tx) = &self.shutdown_tx {
             let _ = tx.send(());
         }
+        Ok(())
+    }
+
+    fn add_peer(&self, _node_id: u64, _address: String) -> Result<(), Box<dyn std::error::Error>> {
+        // In-memory transport has fixed nodes at construction time
+        // This is a no-op for testing - nodes are pre-configured
+        Ok(())
+    }
+
+    fn remove_peer(&self, _node_id: u64) -> Result<(), Box<dyn std::error::Error>> {
+        // In-memory transport - no-op
         Ok(())
     }
 }
@@ -181,7 +236,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_in_memory_transport_cluster_creation() {
-        let transport = InMemoryClusterTransport::<TestExecutor>::new(vec![1, 2, 3]);
+        let transport = Arc::new(InMemoryClusterTransport::<TestExecutor>::new(vec![1, 2, 3]));
         transport.start().await.expect("Transport start should succeed");
 
         // Create cluster for node 1

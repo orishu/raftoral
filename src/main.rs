@@ -99,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // If joining an existing cluster, add this node via ConfChange
     if !args.bootstrap && !args.peers.is_empty() {
         println!("   Adding node {} to existing cluster...", node_id);
-        match cluster.add_node(node_id).await {
+        match cluster.add_node(node_id, args.address.clone()).await {
             Ok(_) => println!("✓ Node added to cluster"),
             Err(e) => {
                 eprintln!("⚠ Failed to add node to cluster: {}", e);

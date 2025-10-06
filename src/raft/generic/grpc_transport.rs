@@ -182,7 +182,7 @@ impl<E: CommandExecutor> GrpcClusterTransport<E> {
 
 impl<E: CommandExecutor + Default + 'static> ClusterTransport<E> for GrpcClusterTransport<E> {
     async fn create_cluster(
-        &self,
+        self: &Arc<Self>,
         node_id: u64,
     ) -> Result<Arc<RaftCluster<E>>, Box<dyn std::error::Error>> {
         // Create a new executor instance
@@ -229,12 +229,14 @@ impl<E: CommandExecutor + Default + 'static> ClusterTransport<E> for GrpcCluster
         drop(senders); // Release the read lock
 
         // Create the cluster with the receiver, peer senders, and self sender
+        // Pass self as the transport updater (implements TransportUpdater trait)
         let cluster = RaftCluster::new_with_transport(
             node_id,
             receiver,
             peer_senders,
             self_sender,
             executor,
+            Some(Arc::clone(self) as Arc<dyn crate::raft::generic::transport::TransportUpdater>),
         ).await?;
 
         Ok(Arc::new(cluster))
@@ -282,6 +284,82 @@ impl<E: CommandExecutor + Default + 'static> ClusterTransport<E> for GrpcCluster
             let _ = tx.send(());
         }
         Ok(())
+    }
+
+    fn add_peer(&self, node_id: u64, address: String) -> Result<(), Box<dyn std::error::Error>> {
+        // Check if already exists (using blocking lock)
+        {
+            let nodes = self.nodes.blocking_read();
+            if nodes.contains_key(&node_id) {
+                return Ok(()); // Already added
+            }
+        }
+
+        // Create node config
+        let node_config = NodeConfig { node_id, address: address.clone() };
+
+        // Add to nodes map (blocking)
+        {
+            let mut nodes = self.nodes.blocking_write();
+            nodes.insert(node_id, node_config.clone());
+        }
+
+        // Create sender/receiver pair for this node
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        {
+            let mut senders = self.node_senders.blocking_write();
+            senders.insert(node_id, tx);
+        }
+
+        {
+            let mut receivers = self.node_receivers.blocking_lock();
+            receivers.insert(node_id, rx);
+        }
+
+        // Spawn async task to create gRPC client (can't block here)
+        let grpc_clients = self.grpc_clients.clone();
+        let channel_builder = self.channel_builder.clone();
+        tokio::spawn(async move {
+            let client_result = RaftClient::connect_with_channel_builder(
+                address.clone(),
+                channel_builder
+            ).await;
+            // Drop Result (contains non-Send error) before next await
+            let client_opt = client_result.ok();
+
+            if let Some(client) = client_opt {
+                let mut clients = grpc_clients.write().await;
+                clients.insert(node_id, Arc::new(Mutex::new(client)));
+            }
+        });
+
+        Ok(())
+    }
+
+    fn remove_peer(&self, node_id: u64) -> Result<(), Box<dyn std::error::Error>> {
+        // Remove from maps (blocking)
+        self.nodes.blocking_write().remove(&node_id);
+        self.grpc_clients.blocking_write().remove(&node_id);
+        self.node_senders.blocking_write().remove(&node_id);
+        // Note: receiver is consumed when cluster is created, can't remove
+        // Forwarder will stop when shutdown_rx fires or sender is dropped
+
+        Ok(())
+    }
+}
+
+impl<E: CommandExecutor + Default + 'static> crate::raft::generic::transport::TransportUpdater for GrpcClusterTransport<E> {
+    fn update_add_peer(&self, node_id: u64, address: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.add_peer(node_id, address).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("{}", e).into()
+        })
+    }
+
+    fn update_remove_peer(&self, node_id: u64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.remove_peer(node_id).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("{}", e).into()
+        })
     }
 }
 

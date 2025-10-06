@@ -102,6 +102,7 @@ where
     Campaign,
     AddNode {
         node_id: u64,
+        address: String,
     },
     RemoveNode {
         node_id: u64,
@@ -129,6 +130,7 @@ where
     },
     AddNode {
         node_id: u64,
+        address: String,
         callback: Option<tokio::sync::oneshot::Sender<Result<(), Box<dyn std::error::Error + Send + Sync>>>>,
     },
     RemoveNode {
@@ -162,7 +164,10 @@ where
                 }
             },
             Message::Campaign { .. } => SerializableMessage::Campaign,
-            Message::AddNode { node_id, .. } => SerializableMessage::AddNode { node_id: *node_id },
+            Message::AddNode { node_id, address, .. } => SerializableMessage::AddNode {
+                node_id: *node_id,
+                address: address.clone(),
+            },
             Message::RemoveNode { node_id, .. } => SerializableMessage::RemoveNode { node_id: *node_id },
         })
     }
@@ -191,7 +196,11 @@ where
                 }
             },
             SerializableMessage::Campaign => Message::Campaign { callback: None },
-            SerializableMessage::AddNode { node_id } => Message::AddNode { node_id, callback: None },
+            SerializableMessage::AddNode { node_id, address } => Message::AddNode {
+                node_id,
+                address,
+                callback: None
+            },
             SerializableMessage::RemoveNode { node_id } => Message::RemoveNode { node_id, callback: None },
         })
     }

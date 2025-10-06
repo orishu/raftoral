@@ -68,6 +68,9 @@ pub struct RaftNode<E: CommandExecutor> {
 
     // Snapshot configuration
     snapshot_config: SnapshotConfig,
+
+    // Transport updater for dynamic peer management
+    transport_updater: Option<Arc<dyn crate::raft::generic::transport::TransportUpdater>>,
 }
 
 impl<E: CommandExecutor + 'static> RaftNode<E> {
@@ -77,6 +80,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
         peers: HashMap<u64, mpsc::UnboundedSender<Message<E::Command>>>,
         executor: Arc<E>,
         role_change_tx: broadcast::Sender<RoleChange>,
+        transport_updater: Option<Arc<dyn crate::raft::generic::transport::TransportUpdater>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let is_single_node = peers.is_empty();
 
@@ -126,6 +130,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             current_role: StateRole::Follower, // Start as follower
             committed_index: 0,
             snapshot_config: SnapshotConfig::default(),
+            transport_updater,
         })
     }
 
@@ -332,20 +337,82 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
     fn apply_conf_change_v2(&mut self, conf_change: &ConfChangeV2) -> Result<(), Box<dyn std::error::Error>> {
         slog::info!(self.logger, "Applying ConfChangeV2"; "transition" => ?conf_change.transition);
 
+        // Parse metadata from context if present
+        let metadata = if !conf_change.context.is_empty() {
+            match crate::raft::generic::transport::NodeMetadata::from_bytes(&conf_change.context) {
+                Ok(meta) => Some(meta),
+                Err(e) => {
+                    slog::warn!(self.logger, "Failed to parse ConfChange metadata"; "error" => ?e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         // Process individual changes in the ConfChangeV2
         for change in conf_change.changes.iter() {
             let node_id = change.node_id;
             match change.change_type {
                 ConfChangeType::AddNode => {
                     slog::info!(self.logger, "Adding node to cluster (v2)"; "node_id" => node_id);
+
+                    // Update transport if metadata is available
+                    if let Some(ref meta) = metadata {
+                        if meta.node_id == node_id {
+                            if let Some(ref updater) = self.transport_updater {
+                                match updater.update_add_peer(meta.node_id, meta.address.clone()) {
+                                    Ok(()) => {
+                                        slog::info!(self.logger, "Updated transport with new peer";
+                                                   "node_id" => node_id, "address" => &meta.address);
+                                    }
+                                    Err(e) => {
+                                        slog::error!(self.logger, "Failed to add peer to transport";
+                                                    "node_id" => node_id, "address" => &meta.address, "error" => %e);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 },
                 ConfChangeType::RemoveNode => {
                     slog::info!(self.logger, "Removing node from cluster (v2)"; "node_id" => node_id);
                     // Notify the executor so it can handle ownership reassignment
                     self.executor.on_node_removed(node_id, &self.logger);
+
+                    // Update transport to remove peer
+                    if let Some(ref updater) = self.transport_updater {
+                        match updater.update_remove_peer(node_id) {
+                            Ok(()) => {
+                                slog::info!(self.logger, "Removed peer from transport"; "node_id" => node_id);
+                            }
+                            Err(e) => {
+                                slog::error!(self.logger, "Failed to remove peer from transport";
+                                            "node_id" => node_id, "error" => %e);
+                            }
+                        }
+                    }
                 },
                 ConfChangeType::AddLearnerNode => {
                     slog::info!(self.logger, "Adding learner node to cluster (v2)"; "node_id" => node_id);
+
+                    // Same as AddNode for transport purposes
+                    if let Some(ref meta) = metadata {
+                        if meta.node_id == node_id {
+                            if let Some(ref updater) = self.transport_updater {
+                                match updater.update_add_peer(meta.node_id, meta.address.clone()) {
+                                    Ok(()) => {
+                                        slog::info!(self.logger, "Updated transport with new learner peer";
+                                                   "node_id" => node_id, "address" => &meta.address);
+                                    }
+                                    Err(e) => {
+                                        slog::error!(self.logger, "Failed to add learner peer to transport";
+                                                    "node_id" => node_id, "address" => &meta.address, "error" => %e);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 },
             }
         }
@@ -467,7 +534,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                                 }
                             }
                         },
-                        Some(Message::AddNode { node_id, callback }) => {
+                        Some(Message::AddNode { node_id, address, callback }) => {
                             // Create ConfChangeV2 for adding node
                             let mut conf_change = ConfChangeV2::default();
                             let mut change = ConfChangeSingle::default();
@@ -475,9 +542,30 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                             change.node_id = node_id;
                             conf_change.changes.push(change);
 
+                            // Embed NodeMetadata in context field
+                            use crate::raft::generic::transport::NodeMetadata;
+                            let metadata = NodeMetadata {
+                                node_id,
+                                address: address.clone(),
+                            };
+                            match metadata.to_bytes() {
+                                Ok(metadata_bytes) => {
+                                    conf_change.context = metadata_bytes.into();
+                                },
+                                Err(e) => {
+                                    slog::error!(self.logger, "Failed to serialize node metadata"; "error" => %e);
+                                    if let Some(cb) = callback {
+                                        let err: Box<dyn std::error::Error + Send + Sync> =
+                                            format!("Failed to serialize metadata: {}", e).into();
+                                        let _ = cb.send(Err(err));
+                                    }
+                                    continue;
+                                }
+                            }
+
                             match self.propose_conf_change_v2(conf_change) {
                                 Ok(_) => {
-                                    slog::info!(self.logger, "Proposed adding node"; "node_id" => node_id);
+                                    slog::info!(self.logger, "Proposed adding node"; "node_id" => node_id, "address" => address);
                                     if let Some(cb) = callback {
                                         let _ = cb.send(Ok(()));
                                     }
