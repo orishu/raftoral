@@ -107,7 +107,8 @@ pub struct InMemoryClusterTransport<E: CommandExecutor> {
     /// Node IDs in this cluster
     node_ids: Vec<u64>,
     /// Senders for each node (node_id -> sender to that node's receiver)
-    node_senders: HashMap<u64, mpsc::UnboundedSender<Message<E::Command>>>,
+    /// Shared with RaftNode instances for immediate visibility of changes
+    node_senders: Arc<std::sync::RwLock<HashMap<u64, mpsc::UnboundedSender<Message<E::Command>>>>>,
     /// Receivers for each node (held until create_cluster is called)
     node_receivers: Arc<tokio::sync::Mutex<HashMap<u64, mpsc::UnboundedReceiver<Message<E::Command>>>>>,
     /// Shutdown signal
@@ -117,19 +118,19 @@ pub struct InMemoryClusterTransport<E: CommandExecutor> {
 impl<E: CommandExecutor + 'static> InMemoryClusterTransport<E> {
     /// Create a new in-memory transport for the given node IDs
     pub fn new(node_ids: Vec<u64>) -> Self {
-        let mut node_senders = HashMap::new();
+        let mut node_senders_map = HashMap::new();
         let mut node_receivers_map = HashMap::new();
 
         // Create unbounded channels for each node
         for &node_id in &node_ids {
             let (sender, receiver) = mpsc::unbounded_channel();
-            node_senders.insert(node_id, sender);
+            node_senders_map.insert(node_id, sender);
             node_receivers_map.insert(node_id, receiver);
         }
 
         InMemoryClusterTransport {
             node_ids,
-            node_senders,
+            node_senders: Arc::new(std::sync::RwLock::new(node_senders_map)),
             node_receivers: Arc::new(tokio::sync::Mutex::new(node_receivers_map)),
             shutdown_tx: None,
         }
@@ -150,25 +151,20 @@ impl<E: CommandExecutor + Default + 'static> ClusterTransport<E> for InMemoryClu
                 .ok_or_else(|| format!("Node {} receiver already claimed or doesn't exist", node_id))?
         };
 
-        // Build peer senders (all OTHER nodes, excluding self)
-        let mut peer_senders = HashMap::new();
-        for (&peer_id, sender) in &self.node_senders {
-            if peer_id != node_id {
-                peer_senders.insert(peer_id, sender.clone());
-            }
-        }
-
         // Get the sender for this node (for cluster's propose methods to use)
-        let self_sender = self.node_senders.get(&node_id)
-            .ok_or_else(|| format!("Node {} sender not found", node_id))?
-            .clone();
+        let self_sender = {
+            let senders = self.node_senders.read().unwrap();
+            senders.get(&node_id)
+                .ok_or_else(|| format!("Node {} sender not found", node_id))?
+                .clone()
+        };
 
-        // Create the cluster with the receiver, peer senders, and self sender
+        // Create the cluster with shared node_senders
         // In-memory transport has fixed nodes, so no transport update channel needed
         let cluster = RaftCluster::new_with_transport(
             node_id,
             receiver,
-            peer_senders,
+            self.node_senders.clone(), // Share the same HashMap instance
             self_sender,
             executor,
             None, // No transport updates for in-memory (fixed nodes)

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, broadcast};
 use crate::raft::generic::message::{Message, CommandExecutor};
 use crate::raft::generic::node::RaftNode;
@@ -46,8 +46,8 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
     pub async fn new_with_transport(
         node_id: u64,
         receiver: mpsc::UnboundedReceiver<Message<E::Command>>,
-        peer_senders: HashMap<u64, mpsc::UnboundedSender<Message<E::Command>>>,
-        self_sender: mpsc::UnboundedSender<Message<E::Command>>,
+        node_senders: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<Message<E::Command>>>>>,
+        _self_sender: mpsc::UnboundedSender<Message<E::Command>>,
         executor: E,
         transport_updater: Option<Arc<dyn crate::raft::generic::transport::TransportUpdater>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -59,19 +59,18 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
         // Set node ID on executor (for ownership checks)
         executor_arc.set_node_id(node_id);
 
-        // Build node_senders map (this node + all peers)
-        let mut node_senders = peer_senders.clone();
-        node_senders.insert(node_id, self_sender);
-
-        let node_count = node_senders.len();
+        let node_count = node_senders.read().unwrap().len();
 
         // Determine if this is a single-node or multi-node setup
-        let is_single_node = peer_senders.is_empty();
+        let is_single_node = node_count == 1;
 
         let leader_id_arc = Arc::new(AtomicU64::new(0)); // 0 = unknown
 
+        // Build a flat node_senders HashMap for RaftCluster (keeps the old structure for now)
+        let node_senders_flat = node_senders.read().unwrap().clone();
+
         let cluster = RaftCluster {
-            node_senders,
+            node_senders: node_senders_flat,
             node_count,
             role_change_tx: role_change_tx.clone(),
             next_command_id: Arc::new(AtomicU64::new(1)),
@@ -92,10 +91,11 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
             }
         });
 
-        // Create and spawn the Raft node
+        // Create and spawn the Raft node with shared node_senders Arc
         let role_tx_for_node = role_change_tx.clone();
+        let node_senders_for_node = node_senders.clone();
         tokio::spawn(async move {
-            let mut node = match RaftNode::<E>::new(node_id, receiver, peer_senders, executor_arc.clone(), role_tx_for_node, transport_updater) {
+            let mut node = match RaftNode::<E>::new(node_id, receiver, node_senders_for_node, executor_arc.clone(), role_tx_for_node, transport_updater) {
                 Ok(n) => n,
                 Err(e) => {
                     eprintln!("Failed to create RaftNode {}: {}", node_id, e);
@@ -120,13 +120,13 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
     }
 
     pub async fn new_single_node(node_id: u64, executor: E) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut node_senders = HashMap::new();
+        let mut node_senders_map = HashMap::new();
         let (sender, receiver) = mpsc::unbounded_channel();
 
-        // For single node, it doesn't need peers but we still use the same structure
-        let peers = HashMap::new();
+        node_senders_map.insert(node_id, sender.clone());
 
-        node_senders.insert(node_id, sender.clone());
+        // Wrap in Arc<RwLock> for sharing with RaftNode
+        let node_senders_shared = Arc::new(RwLock::new(node_senders_map.clone()));
 
         // Create role change broadcast channel
         let (role_change_tx, _role_change_rx) = broadcast::channel(100);
@@ -136,7 +136,7 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
         let leader_id_arc = Arc::new(AtomicU64::new(node_id)); // Single node is always leader
 
         let cluster = RaftCluster {
-            node_senders,
+            node_senders: node_senders_map,
             node_count: 1,
             role_change_tx: role_change_tx.clone(),
             next_command_id: Arc::new(AtomicU64::new(1)),
@@ -145,10 +145,10 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
             node_id,
         };
 
-        // Create and run the single node using the multi-node constructor
+        // Create and run the single node with shared node_senders
         let role_tx_clone = role_change_tx.clone();
         tokio::spawn(async move {
-            let mut node = match RaftNode::<E>::new(node_id, receiver, peers, executor_arc.clone(), role_tx_clone, None) {
+            let mut node = match RaftNode::<E>::new(node_id, receiver, node_senders_shared, executor_arc.clone(), role_tx_clone, None) {
                 Ok(n) => n,
                 Err(e) => {
                     eprintln!("Failed to create RaftNode {}: {}", node_id, e);

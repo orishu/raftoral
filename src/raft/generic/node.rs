@@ -1,8 +1,8 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, mpsc, broadcast};
+use tokio::sync::{mpsc, broadcast};
 use raft::{prelude::*, StateRole};
 use super::storage::MemStorageWithSnapshot;
 use slog::{Drain, Logger};
@@ -48,7 +48,9 @@ pub struct RaftNode<E: CommandExecutor> {
 
     // For multi-node communication
     mailbox: mpsc::UnboundedReceiver<Message<E::Command>>,
-    peers: HashMap<u64, mpsc::UnboundedSender<Message<E::Command>>>,
+    /// Shared reference to peer senders - same HashMap instance used by transport
+    /// This eliminates the need for AddPeerSender/RemovePeerSender synchronization
+    peers: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<Message<E::Command>>>>>,
 
     // Sync command tracking (command_id -> completion callback)
     sync_commands: HashMap<u64, SyncCallback>,
@@ -77,12 +79,12 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
     pub fn new(
         node_id: u64,
         mailbox: mpsc::UnboundedReceiver<Message<E::Command>>,
-        peers: HashMap<u64, mpsc::UnboundedSender<Message<E::Command>>>,
+        peers: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<Message<E::Command>>>>>,
         executor: Arc<E>,
         role_change_tx: broadcast::Sender<RoleChange>,
         transport_updater: Option<Arc<dyn crate::raft::generic::transport::TransportUpdater>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let is_single_node = peers.is_empty();
+        let is_single_node = peers.read().unwrap().is_empty();
 
         let config = Config {
             id: node_id,
@@ -103,8 +105,11 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
         // Add ourselves as a voter
         initial_state.voters.push(node_id);
         // Add all peers as voters (if multi-node)
-        for &peer_id in peers.keys() {
-            initial_state.voters.push(peer_id);
+        {
+            let peers_guard = peers.read().unwrap();
+            for &peer_id in peers_guard.keys() {
+                initial_state.voters.push(peer_id);
+            }
         }
         storage.wl().set_conf_state(initial_state);
 
@@ -258,8 +263,9 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
     }
 
     fn send_messages(&self, messages: Vec<raft::prelude::Message>) -> Result<(), Box<dyn std::error::Error>> {
+        let peers = self.peers.read().unwrap();
         for msg in messages {
-            if let Some(sender) = self.peers.get(&msg.to) {
+            if let Some(sender) = peers.get(&msg.to) {
                 let msg_to = msg.to;
                 let raft_msg = Message::Raft(msg);
                 if let Err(e) = sender.send(raft_msg) {
@@ -605,13 +611,11 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                                 }
                             }
                         },
-                        Some(Message::AddPeerSender { peer_id, sender }) => {
-                            slog::info!(self.logger, "Adding peer sender"; "peer_id" => peer_id);
-                            self.peers.insert(peer_id, sender);
+                        Some(Message::AddPeerSender { .. }) => {
+                            // No longer needed - peers HashMap is shared with transport
                         },
-                        Some(Message::RemovePeerSender { peer_id }) => {
-                            slog::info!(self.logger, "Removing peer sender"; "peer_id" => peer_id);
-                            self.peers.remove(&peer_id);
+                        Some(Message::RemovePeerSender { .. }) => {
+                            // No longer needed - peers HashMap is shared with transport
                         },
                         Some(Message::QueryConfig { callback }) => {
                             // Get current voter configuration from Raft
