@@ -1,5 +1,6 @@
 use raftoral::raft::generic::transport::{ClusterTransport, InMemoryClusterTransport};
 use raftoral::workflow::{WorkflowCommandExecutor, WorkflowRuntime, WorkflowContext};
+use std::sync::Arc;
 use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
@@ -16,7 +17,7 @@ struct FibonacciOutput {
 #[tokio::test]
 async fn test_three_node_cluster_workflow_execution() {
     // Create a 3-node cluster transport
-    let transport = InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3]);
+    let transport = Arc::new(InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3]));
     transport.start().await.expect("Transport should start");
 
     // Create clusters and runtimes for all 3 nodes
@@ -100,7 +101,7 @@ async fn test_three_node_cluster_basic_consensus() {
     struct SimpleOutput {}
 
     // Create a 3-node cluster transport
-    let transport = InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3]);
+    let transport = Arc::new(InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3]));
     transport.start().await.expect("Transport should start");
 
     // Create clusters and runtimes for all 3 nodes
@@ -174,7 +175,7 @@ async fn test_three_node_cluster_basic_consensus() {
 
 #[tokio::test]
 async fn test_cluster_node_count() {
-    let transport = InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3, 4, 5]);
+    let transport = Arc::new(InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3, 4, 5]));
     assert_eq!(transport.node_ids().await, vec![1, 2, 3, 4, 5]);
 
     transport.start().await.expect("Transport should start");
@@ -209,7 +210,7 @@ async fn test_snapshot_based_catch_up() {
     println!("  5. Verify 4th node continues execution from snapshot state\n");
 
     // Create a 3-node cluster transport
-    let transport = InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3]);
+    let transport = Arc::new(InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3]));
     transport.start().await.expect("Transport should start");
 
     // Create clusters and runtimes for first 3 nodes
@@ -305,7 +306,7 @@ async fn test_snapshot_based_catch_up() {
     println!("=== Now adding node 4 with snapshot ===");
 
     // Create a new transport with 4 nodes to simulate adding a node
-    let transport4 = InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3, 4]);
+    let transport4 = Arc::new(InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3, 4]));
     transport4.start().await.expect("Transport should start");
 
     // Create node 4
@@ -384,7 +385,7 @@ async fn test_automatic_snapshot_on_node_join() {
     println!("  6. Verify 4th node has correct workflow state from snapshot\n");
 
     // Create a 4-node transport with all channels pre-created
-    let transport = InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3, 4]);
+    let transport = Arc::new(InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3, 4]));
     transport.start().await.expect("Transport should start");
 
     // Create clusters and runtimes for first 3 nodes
@@ -481,7 +482,7 @@ async fn test_automatic_snapshot_on_node_join() {
     // NOTE: This is where Raft would automatically send snapshot if node 4 is too far behind
     println!("Adding node 4 to Raft cluster via ConfChange...");
 
-    runtime1.cluster.add_node(4).await
+    runtime1.cluster.add_node(4, "in-memory".to_string()).await
         .expect("Should add node 4");
 
     println!("✓ Node 4 added to cluster, waiting for sync...");

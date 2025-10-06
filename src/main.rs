@@ -11,15 +11,20 @@ use tokio::signal;
 #[command(name = "raftoral")]
 #[command(about = "Raftoral distributed workflow orchestration", long_about = None)]
 struct Args {
-    /// Address to bind the gRPC server to (e.g., 127.0.0.1:5001)
-    #[arg(short, long)]
-    address: String,
+    /// Address to listen on for gRPC connections (e.g., 0.0.0.0:5001)
+    #[arg(short = 'l', long)]
+    listen: String,
+
+    /// Advertised address for other nodes to connect to (e.g., 192.168.1.10:5001)
+    /// If not specified, uses the listen address
+    #[arg(short = 'a', long)]
+    advertise: Option<String>,
 
     /// Node ID (optional, will be auto-assigned if joining existing cluster)
     #[arg(short, long)]
     node_id: Option<u64>,
 
-    /// Addresses of peer nodes to discover (e.g., 127.0.0.1:5001,127.0.0.1:5002)
+    /// Addresses of peer nodes to discover (e.g., 192.168.1.10:5001,192.168.1.11:5001)
     #[arg(short, long, value_delimiter = ',')]
     peers: Vec<String>,
 
@@ -32,8 +37,14 @@ struct Args {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
+    // Use advertise address if specified, otherwise use listen address
+    let advertise_addr = args.advertise.as_ref().unwrap_or(&args.listen).clone();
+
     println!("🚀 Starting Raftoral node...");
-    println!("   Address: {}", args.address);
+    println!("   Listen: {}", args.listen);
+    if args.advertise.is_some() {
+        println!("   Advertise: {}", advertise_addr);
+    }
 
     let node_id = if args.bootstrap {
         // Bootstrap mode: start as first node with ID 1
@@ -73,7 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build initial node configurations
     let mut nodes = vec![NodeConfig {
         node_id,
-        address: args.address.clone(),
+        address: advertise_addr.clone(),
     }];
 
     // If we have peers, add them to the initial configuration
@@ -99,7 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // If joining an existing cluster, add this node via ConfChange
     if !args.bootstrap && !args.peers.is_empty() {
         println!("   Adding node {} to existing cluster...", node_id);
-        match cluster.add_node(node_id, args.address.clone()).await {
+        match cluster.add_node(node_id, advertise_addr.clone()).await {
             Ok(_) => println!("✓ Node added to cluster"),
             Err(e) => {
                 eprintln!("⚠ Failed to add node to cluster: {}", e);
@@ -110,11 +121,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start gRPC server
     let server_handle = start_grpc_server(
-        args.address.clone(),
+        args.listen.clone(),
         transport.clone(),
+        cluster.clone(),
         node_id,
     ).await?;
-    println!("✓ gRPC server listening on {}", args.address);
+    println!("✓ gRPC server listening on {}", args.listen);
 
     // Create workflow runtime
     let _runtime = WorkflowRuntime::new(cluster.clone());

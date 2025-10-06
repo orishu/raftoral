@@ -1,5 +1,6 @@
 use raftoral::raft::generic::transport::{ClusterTransport, InMemoryClusterTransport};
 use raftoral::workflow::{WorkflowCommandExecutor, WorkflowRuntime, WorkflowContext};
+use std::sync::Arc;
 use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
@@ -18,7 +19,7 @@ async fn test_node_failure_workflow_reassignment() {
     println!("=== Starting Node Failure and Workflow Reassignment Test ===\n");
 
     // Create a 3-node cluster
-    let transport = InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3]);
+    let transport = Arc::new(InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3]));
     transport.start().await.expect("Transport should start");
 
     // Create clusters and runtimes for all 3 nodes
@@ -162,7 +163,7 @@ async fn test_instant_ownership_promotion() {
     println!("(instead of waiting for a 5-second timeout)\n");
 
     // Create a 3-node cluster
-    let transport = InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3]);
+    let transport = Arc::new(InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3]));
     transport.start().await.expect("Transport should start");
 
     let cluster1 = transport.create_cluster(1).await.expect("Should create cluster 1");

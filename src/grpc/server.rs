@@ -15,10 +15,12 @@ use raft_proto::{
 };
 
 use crate::raft::generic::message::{Message, SerializableMessage, CommandExecutor};
+use crate::raft::generic::cluster::RaftCluster;
 
 /// gRPC service implementation for Raft communication
 pub struct RaftServiceImpl<E: CommandExecutor> {
     transport: Arc<GrpcClusterTransport<E>>,
+    cluster: Arc<RaftCluster<E>>,
     node_id: u64,
     address: String,
 }
@@ -26,10 +28,11 @@ pub struct RaftServiceImpl<E: CommandExecutor> {
 impl<E: CommandExecutor> RaftServiceImpl<E> {
     pub fn new(
         transport: Arc<GrpcClusterTransport<E>>,
+        cluster: Arc<RaftCluster<E>>,
         node_id: u64,
         address: String,
     ) -> Self {
-        Self { transport, node_id, address }
+        Self { transport, cluster, node_id, address }
     }
 }
 
@@ -67,9 +70,9 @@ impl<E: CommandExecutor> RaftService for RaftServiceImpl<E> {
         &self,
         _request: Request<DiscoveryRequest>,
     ) -> Result<Response<DiscoveryResponse>, Status> {
-        // Get highest known node ID from transport's internal nodes list
-        let all_nodes = self.transport.get_all_nodes().await;
-        let highest_known_node_id = all_nodes.iter().map(|n| n.node_id).max().unwrap_or(self.node_id);
+        // Get highest known node ID from Raft configuration (most accurate source)
+        let node_ids = self.cluster.get_node_ids();
+        let highest_known_node_id = node_ids.iter().copied().max().unwrap_or(self.node_id);
 
         Ok(Response::new(DiscoveryResponse {
             node_id: self.node_id,
@@ -99,20 +102,22 @@ impl GrpcServerHandle {
 pub async fn start_grpc_server<E: CommandExecutor + 'static>(
     address: String,
     transport: Arc<GrpcClusterTransport<E>>,
+    cluster: Arc<RaftCluster<E>>,
     node_id: u64,
 ) -> Result<GrpcServerHandle, Box<dyn std::error::Error>> {
-    start_grpc_server_with_config(address, transport, node_id, None).await
+    start_grpc_server_with_config(address, transport, cluster, node_id, None).await
 }
 
 /// Start a gRPC server with custom server configuration
 pub async fn start_grpc_server_with_config<E: CommandExecutor + 'static>(
     address: String,
     transport: Arc<GrpcClusterTransport<E>>,
+    cluster: Arc<RaftCluster<E>>,
     node_id: u64,
     server_config: Option<ServerConfigurator>,
 ) -> Result<GrpcServerHandle, Box<dyn std::error::Error>> {
     let addr = address.parse()?;
-    let service = RaftServiceImpl::new(transport, node_id, address);
+    let service = RaftServiceImpl::new(transport, cluster, node_id, address);
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
