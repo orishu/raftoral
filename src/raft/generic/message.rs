@@ -1,6 +1,7 @@
 use serde::{Serialize, Deserialize};
 use serde::de::DeserializeOwned;
 use std::fmt::Debug;
+use tokio::sync::mpsc;
 
 /// Trait for executing commands that have been committed through Raft
 pub trait CommandExecutor: Send + Sync + 'static {
@@ -137,6 +138,19 @@ where
         node_id: u64,
         callback: Option<tokio::sync::oneshot::Sender<Result<(), Box<dyn std::error::Error + Send + Sync>>>>,
     },
+    /// Add a peer sender to the node's peer map (for dynamic peer discovery)
+    AddPeerSender {
+        peer_id: u64,
+        sender: mpsc::UnboundedSender<Message<C>>,
+    },
+    /// Remove a peer sender from the node's peer map
+    RemovePeerSender {
+        peer_id: u64,
+    },
+    /// Query the current Raft configuration (voter IDs)
+    QueryConfig {
+        callback: tokio::sync::oneshot::Sender<Vec<u64>>,
+    },
 }
 
 impl<C> Message<C>
@@ -169,6 +183,15 @@ where
                 address: address.clone(),
             },
             Message::RemoveNode { node_id, .. } => SerializableMessage::RemoveNode { node_id: *node_id },
+            Message::AddPeerSender { .. } => {
+                panic!("AddPeerSender messages are local-only and should not be serialized")
+            },
+            Message::RemovePeerSender { .. } => {
+                panic!("RemovePeerSender messages are local-only and should not be serialized")
+            },
+            Message::QueryConfig { .. } => {
+                panic!("QueryConfig messages are local-only and should not be serialized")
+            },
         })
     }
 

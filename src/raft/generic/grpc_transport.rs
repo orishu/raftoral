@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use tokio::sync::mpsc;
 use crate::raft::generic::message::{Message, CommandExecutor};
 use crate::raft::generic::cluster::RaftCluster;
 use crate::raft::generic::transport::ClusterTransport;
@@ -29,7 +29,7 @@ pub struct GrpcClusterTransport<E: CommandExecutor> {
     /// Senders for each node (node_id -> sender to that node's receiver)
     node_senders: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<Message<E::Command>>>>>,
     /// gRPC clients for sending to remote nodes (node_id -> client)
-    grpc_clients: Arc<RwLock<HashMap<u64, Arc<Mutex<RaftClient>>>>>,
+    grpc_clients: Arc<tokio::sync::RwLock<HashMap<u64, Arc<tokio::sync::Mutex<RaftClient>>>>>,
     /// Background task handles for message forwarding
     forwarder_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     /// Shutdown signal
@@ -93,7 +93,7 @@ impl<E: CommandExecutor> GrpcClusterTransport<E> {
             nodes: Arc::new(RwLock::new(node_map)),
             node_receivers: Arc::new(Mutex::new(node_receivers_map)),
             node_senders: Arc::new(RwLock::new(node_senders)),
-            grpc_clients: Arc::new(RwLock::new(HashMap::new())),
+            grpc_clients: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             forwarder_handles: Arc::new(Mutex::new(Vec::new())),
             shutdown_tx: Arc::new(Mutex::new(None)),
             channel_builder,
@@ -102,9 +102,9 @@ impl<E: CommandExecutor> GrpcClusterTransport<E> {
 
     /// Add a new node to the transport configuration
     pub async fn add_node(&self, node: NodeConfig) -> Result<(), Box<dyn std::error::Error>> {
-        let mut nodes = self.nodes.write().await;
-        let mut senders = self.node_senders.write().await;
-        let mut receivers = self.node_receivers.lock().await;
+        let mut nodes = self.nodes.write().unwrap();
+        let mut senders = self.node_senders.write().unwrap();
+        let mut receivers = self.node_receivers.lock().unwrap();
 
         // Create channel for the new node
         let (sender, receiver) = mpsc::unbounded_channel();
@@ -118,9 +118,9 @@ impl<E: CommandExecutor> GrpcClusterTransport<E> {
 
     /// Remove a node from the transport configuration
     pub async fn remove_node(&self, node_id: u64) -> Result<(), Box<dyn std::error::Error>> {
-        let mut nodes = self.nodes.write().await;
-        let mut senders = self.node_senders.write().await;
-        let mut receivers = self.node_receivers.lock().await;
+        let mut nodes = self.nodes.write().unwrap();
+        let mut senders = self.node_senders.write().unwrap();
+        let mut receivers = self.node_receivers.lock().unwrap();
 
         nodes.remove(&node_id);
         senders.remove(&node_id);
@@ -131,19 +131,19 @@ impl<E: CommandExecutor> GrpcClusterTransport<E> {
 
     /// Get the address for a specific node
     pub async fn get_node_address(&self, node_id: u64) -> Option<String> {
-        let nodes = self.nodes.read().await;
+        let nodes = self.nodes.read().unwrap();
         nodes.get(&node_id).map(|n| n.address.clone())
     }
 
     /// Get all node configurations
     pub async fn get_all_nodes(&self) -> Vec<NodeConfig> {
-        let nodes = self.nodes.read().await;
+        let nodes = self.nodes.read().unwrap();
         nodes.values().cloned().collect()
     }
 
     /// Internal method to get a sender for a specific node
     pub async fn get_node_sender(&self, node_id: u64) -> Option<mpsc::UnboundedSender<Message<E::Command>>> {
-        let senders = self.node_senders.read().await;
+        let senders = self.node_senders.read().unwrap();
         senders.get(&node_id).cloned()
     }
 
@@ -190,43 +190,50 @@ impl<E: CommandExecutor + Default + 'static> ClusterTransport<E> for GrpcCluster
 
         // Extract the receiver for this node
         let receiver = {
-            let mut receivers = self.node_receivers.lock().await;
+            let mut receivers = self.node_receivers.lock().unwrap();
             receivers.remove(&node_id)
                 .ok_or_else(|| format!("Node {} receiver already claimed or doesn't exist", node_id))?
         };
 
         // Get shutdown receiver
-        let shutdown_tx = self.shutdown_tx.lock().await;
-        let shutdown_rx = shutdown_tx.as_ref()
-            .ok_or("Transport not started - call start() before create_cluster()")?
-            .subscribe();
-        drop(shutdown_tx);
+        let shutdown_rx = {
+            let shutdown_tx = self.shutdown_tx.lock().unwrap();
+            shutdown_tx.as_ref()
+                .ok_or("Transport not started - call start() before create_cluster()")?
+                .subscribe()
+        };
 
         // Build peer senders - spawn forwarders for remote peers
-        let senders = self.node_senders.read().await;
-        let mut peer_senders = HashMap::new();
+        let (peer_senders, self_sender, forwarder_handles_vec) = {
+            let senders = self.node_senders.read().unwrap();
+            let mut peer_senders = HashMap::new();
+            let mut forwarder_handles_vec = Vec::new();
 
-        for (&peer_id, _sender) in senders.iter() {
-            if peer_id != node_id {
-                // For remote peers, create a forwarder channel
-                let (forwarder_tx, forwarder_rx) = mpsc::unbounded_channel();
-                peer_senders.insert(peer_id, forwarder_tx);
+            for (&peer_id, _sender) in senders.iter() {
+                if peer_id != node_id {
+                    // For remote peers, create a forwarder channel
+                    let (forwarder_tx, forwarder_rx) = mpsc::unbounded_channel();
+                    peer_senders.insert(peer_id, forwarder_tx);
 
-                // Spawn forwarder task for this peer
-                let handle = self.spawn_peer_forwarder(peer_id, forwarder_rx, shutdown_rx.resubscribe());
-
-                // Store the handle
-                let mut handles = self.forwarder_handles.lock().await;
-                handles.push(handle);
+                    // Spawn forwarder task for this peer
+                    let handle = self.spawn_peer_forwarder(peer_id, forwarder_rx, shutdown_rx.resubscribe());
+                    forwarder_handles_vec.push(handle);
+                }
             }
-        }
 
-        // Get the sender for this node (for cluster's propose methods to use)
-        let self_sender = senders.get(&node_id)
-            .ok_or_else(|| format!("Node {} sender not found", node_id))?
-            .clone();
+            // Get the sender for this node (for cluster's propose methods to use)
+            let self_sender = senders.get(&node_id)
+                .ok_or_else(|| format!("Node {} sender not found", node_id))?
+                .clone();
 
-        drop(senders); // Release the read lock
+            (peer_senders, self_sender, forwarder_handles_vec)
+        }; // senders guard dropped here
+
+        // Store all forwarder handles at once
+        {
+            let mut handles = self.forwarder_handles.lock().unwrap();
+            handles.extend(forwarder_handles_vec);
+        } // handles guard dropped here
 
         // Create the cluster with the receiver, peer senders, and self sender
         // Pass self as the transport updater (implements TransportUpdater trait)
@@ -243,19 +250,22 @@ impl<E: CommandExecutor + Default + 'static> ClusterTransport<E> for GrpcCluster
     }
 
     async fn node_ids(&self) -> Vec<u64> {
-        let nodes = self.nodes.read().await;
+        let nodes = self.nodes.read().unwrap();
         nodes.keys().copied().collect()
     }
 
     async fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
         // Create shutdown channel
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
-        *self.shutdown_tx.lock().await = Some(shutdown_tx.clone());
+        {
+            *self.shutdown_tx.lock().unwrap() = Some(shutdown_tx.clone());
+        }
 
         // Get all nodes
-        let nodes = self.nodes.read().await;
-        let node_list: Vec<NodeConfig> = nodes.values().cloned().collect();
-        drop(nodes);
+        let node_list: Vec<NodeConfig> = {
+            let nodes = self.nodes.read().unwrap();
+            nodes.values().cloned().collect()
+        };
 
         // Create gRPC clients for all nodes using the configured channel builder
         let mut clients = self.grpc_clients.write().await;
@@ -265,7 +275,7 @@ impl<E: CommandExecutor + Default + 'static> ClusterTransport<E> for GrpcCluster
                 self.channel_builder.clone()
             ).await {
                 Ok(client) => {
-                    clients.insert(node.node_id, Arc::new(Mutex::new(client)));
+                    clients.insert(node.node_id, Arc::new(tokio::sync::Mutex::new(client)));
                 }
                 Err(e) => {
                     eprintln!("Warning: Failed to connect to node {}: {}", node.node_id, e);
@@ -279,7 +289,7 @@ impl<E: CommandExecutor + Default + 'static> ClusterTransport<E> for GrpcCluster
     }
 
     async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let shutdown_tx = self.shutdown_tx.lock().await;
+        let shutdown_tx = self.shutdown_tx.lock().unwrap();
         if let Some(tx) = shutdown_tx.as_ref() {
             let _ = tx.send(());
         }
@@ -287,9 +297,9 @@ impl<E: CommandExecutor + Default + 'static> ClusterTransport<E> for GrpcCluster
     }
 
     fn add_peer(&self, node_id: u64, address: String) -> Result<(), Box<dyn std::error::Error>> {
-        // Check if already exists (using blocking lock)
+        // Check if already exists
         {
-            let nodes = self.nodes.blocking_read();
+            let nodes = self.nodes.read().unwrap();
             if nodes.contains_key(&node_id) {
                 return Ok(()); // Already added
             }
@@ -298,9 +308,9 @@ impl<E: CommandExecutor + Default + 'static> ClusterTransport<E> for GrpcCluster
         // Create node config
         let node_config = NodeConfig { node_id, address: address.clone() };
 
-        // Add to nodes map (blocking)
+        // Add to nodes map
         {
-            let mut nodes = self.nodes.blocking_write();
+            let mut nodes = self.nodes.write().unwrap();
             nodes.insert(node_id, node_config.clone());
         }
 
@@ -308,13 +318,56 @@ impl<E: CommandExecutor + Default + 'static> ClusterTransport<E> for GrpcCluster
         let (tx, rx) = mpsc::unbounded_channel();
 
         {
-            let mut senders = self.node_senders.blocking_write();
-            senders.insert(node_id, tx);
+            let mut senders = self.node_senders.write().unwrap();
+            senders.insert(node_id, tx.clone());
         }
 
         {
-            let mut receivers = self.node_receivers.blocking_lock();
+            let mut receivers = self.node_receivers.lock().unwrap();
             receivers.insert(node_id, rx);
+        }
+
+        // Get shutdown receiver for forwarders
+        let shutdown_rx = {
+            let shutdown_tx = self.shutdown_tx.lock().unwrap();
+            shutdown_tx.as_ref()
+                .ok_or("Transport not started")?
+                .subscribe()
+        };
+
+        // Create forwarder channels and notify all EXISTING nodes about the new peer
+        // This is necessary because existing RaftNodes need to update their peers HashMap
+        let existing_node_senders: Vec<(u64, mpsc::UnboundedSender<Message<E::Command>>)> = {
+            let senders = self.node_senders.read().unwrap();
+            senders.iter()
+                .filter(|(id, _)| **id != node_id) // Exclude the new node itself
+                .map(|(id, sender)| (*id, sender.clone()))
+                .collect()
+        };
+
+        // For each existing node, create a forwarder and send AddPeerSender message
+        let forwarder_handles_vec: Vec<tokio::task::JoinHandle<()>> = existing_node_senders.iter()
+            .map(|(_existing_node_id, _existing_sender)| {
+                // Create forwarder channel for existing_node -> new_peer communication
+                let (forwarder_tx, forwarder_rx) = mpsc::unbounded_channel();
+
+                // Send AddPeerSender message to the existing node's RaftNode
+                // This updates the RaftNode's peers HashMap so it can send messages to the new peer
+                let existing_sender_clone = _existing_sender.clone();
+                let _ = existing_sender_clone.send(Message::AddPeerSender {
+                    peer_id: node_id,
+                    sender: forwarder_tx,
+                });
+
+                // Spawn forwarder task for this peer connection
+                self.spawn_peer_forwarder(node_id, forwarder_rx, shutdown_rx.resubscribe())
+            })
+            .collect();
+
+        // Store forwarder handles
+        {
+            let mut handles = self.forwarder_handles.lock().unwrap();
+            handles.extend(forwarder_handles_vec);
         }
 
         // Spawn async task to create gRPC client (can't block here)
@@ -330,7 +383,7 @@ impl<E: CommandExecutor + Default + 'static> ClusterTransport<E> for GrpcCluster
 
             if let Some(client) = client_opt {
                 let mut clients = grpc_clients.write().await;
-                clients.insert(node_id, Arc::new(Mutex::new(client)));
+                clients.insert(node_id, Arc::new(tokio::sync::Mutex::new(client)));
             }
         });
 
@@ -338,12 +391,30 @@ impl<E: CommandExecutor + Default + 'static> ClusterTransport<E> for GrpcCluster
     }
 
     fn remove_peer(&self, node_id: u64) -> Result<(), Box<dyn std::error::Error>> {
-        // Remove from maps (blocking)
-        self.nodes.blocking_write().remove(&node_id);
-        self.grpc_clients.blocking_write().remove(&node_id);
-        self.node_senders.blocking_write().remove(&node_id);
+        // Notify all remaining nodes to remove peer sender
+        let remaining_node_senders: Vec<mpsc::UnboundedSender<Message<E::Command>>> = {
+            let senders = self.node_senders.read().unwrap();
+            senders.iter()
+                .filter(|(id, _)| **id != node_id) // Exclude the removed node
+                .map(|(_, sender)| sender.clone())
+                .collect()
+        };
+
+        for sender in remaining_node_senders {
+            let _ = sender.send(Message::RemovePeerSender { peer_id: node_id });
+        }
+
+        // Remove from maps (std::sync locks work fine in async context)
+        self.nodes.write().unwrap().remove(&node_id);
+        self.node_senders.write().unwrap().remove(&node_id);
         // Note: receiver is consumed when cluster is created, can't remove
         // Forwarder will stop when shutdown_rx fires or sender is dropped
+
+        // grpc_clients uses tokio::sync::RwLock, need to spawn task to remove
+        let grpc_clients = self.grpc_clients.clone();
+        tokio::spawn(async move {
+            grpc_clients.write().await.remove(&node_id);
+        });
 
         Ok(())
     }

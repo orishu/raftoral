@@ -71,7 +71,7 @@ impl<E: CommandExecutor> RaftService for RaftServiceImpl<E> {
         _request: Request<DiscoveryRequest>,
     ) -> Result<Response<DiscoveryResponse>, Status> {
         // Get highest known node ID from Raft configuration (most accurate source)
-        let node_ids = self.cluster.get_node_ids();
+        let node_ids = self.cluster.get_node_ids().await;
         let highest_known_node_id = node_ids.iter().copied().max().unwrap_or(self.node_id);
 
         Ok(Response::new(DiscoveryResponse {

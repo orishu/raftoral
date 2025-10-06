@@ -429,7 +429,8 @@ impl CommandExecutor for WorkflowCommandExecutor {
                 }
 
                 // Get list of available nodes (excluding the removed one)
-                let available_nodes: Vec<u64> = runtime.cluster.get_node_ids()
+                let node_ids = runtime.cluster.get_node_ids().await;
+                let available_nodes: Vec<u64> = node_ids
                     .into_iter()
                     .filter(|&id| id != removed_node_id)
                     .collect();

@@ -98,7 +98,8 @@ impl WorkflowRuntime {
     /// # use raftoral::raft::generic::transport::{ClusterTransport, InMemoryClusterTransport};
     /// # use raftoral::workflow::{WorkflowCommandExecutor, WorkflowRuntime};
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let transport = InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3]);
+    /// let transport = Arc::new(InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3]));
+    /// transport.start().await?;
     /// let cluster = transport.create_cluster(1).await?;
     /// let runtime = WorkflowRuntime::new(cluster);
     /// # Ok(())

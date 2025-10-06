@@ -371,8 +371,25 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
         self.node_count
     }
 
-    pub fn get_node_ids(&self) -> Vec<u64> {
-        self.node_senders.keys().copied().collect()
+    pub async fn get_node_ids(&self) -> Vec<u64> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+
+        // Send QueryConfig message to this node's RaftNode
+        if let Some(node_sender) = self.node_senders.get(&self.node_id) {
+            let _ = node_sender.send(Message::QueryConfig { callback: sender });
+
+            // Wait for response with timeout
+            match tokio::time::timeout(std::time::Duration::from_millis(100), receiver).await {
+                Ok(Ok(voters)) => voters,
+                _ => {
+                    // Fallback to transport view if query fails
+                    self.node_senders.keys().copied().collect()
+                }
+            }
+        } else {
+            // Fallback if we can't find our own sender
+            self.node_senders.keys().copied().collect()
+        }
     }
 
     /// Get the ID of this node

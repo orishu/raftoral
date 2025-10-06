@@ -605,6 +605,20 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                                 }
                             }
                         },
+                        Some(Message::AddPeerSender { peer_id, sender }) => {
+                            slog::info!(self.logger, "Adding peer sender"; "peer_id" => peer_id);
+                            self.peers.insert(peer_id, sender);
+                        },
+                        Some(Message::RemovePeerSender { peer_id }) => {
+                            slog::info!(self.logger, "Removing peer sender"; "peer_id" => peer_id);
+                            self.peers.remove(&peer_id);
+                        },
+                        Some(Message::QueryConfig { callback }) => {
+                            // Get current voter configuration from Raft
+                            let conf_state = self.raft_group.raft.prs().conf().to_conf_state();
+                            let voters: Vec<u64> = conf_state.voters.into_iter().collect();
+                            let _ = callback.send(voters);
+                        },
                         None => break,
                     }
                 },
