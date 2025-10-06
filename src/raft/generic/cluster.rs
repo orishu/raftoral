@@ -28,6 +28,8 @@ pub struct RaftCluster<E: CommandExecutor> {
     leader_id: Arc<AtomicU64>,
     // The ID of this node
     node_id: u64,
+    // Cached Raft configuration (shared with RaftNode for direct access)
+    cached_config: Arc<RwLock<Vec<u64>>>,
 }
 
 impl<E: CommandExecutor + 'static> RaftCluster<E> {
@@ -40,14 +42,13 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
     /// # Arguments
     /// * `node_id` - Unique identifier for this node
     /// * `receiver` - Channel to receive messages for this node
-    /// * `peer_senders` - Map of peer node IDs to their message senders (excluding self)
-    /// * `self_sender` - Sender for this node's own mailbox
+    /// * `node_senders` - Shared map of all node IDs to their message senders
     /// * `executor` - Command executor for applying committed commands
+    /// * `transport_updater` - Optional transport updater for dynamic peer management
     pub async fn new_with_transport(
         node_id: u64,
         receiver: mpsc::UnboundedReceiver<Message<E::Command>>,
         node_senders: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<Message<E::Command>>>>>,
-        _self_sender: mpsc::UnboundedSender<Message<E::Command>>,
         executor: E,
         transport_updater: Option<Arc<dyn crate::raft::generic::transport::TransportUpdater>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -69,16 +70,6 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
         // Build a flat node_senders HashMap for RaftCluster (keeps the old structure for now)
         let node_senders_flat = node_senders.read().unwrap().clone();
 
-        let cluster = RaftCluster {
-            node_senders: node_senders_flat,
-            node_count,
-            role_change_tx: role_change_tx.clone(),
-            next_command_id: Arc::new(AtomicU64::new(1)),
-            executor: executor_arc.clone(),
-            leader_id: leader_id_arc.clone(),
-            node_id,
-        };
-
         // Spawn a task to listen for role changes and update leader_id
         let leader_id_listener = leader_id_arc.clone();
         let role_change_tx_clone = role_change_tx.clone();
@@ -94,19 +85,27 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
         // Create and spawn the Raft node with shared node_senders Arc
         let role_tx_for_node = role_change_tx.clone();
         let node_senders_for_node = node_senders.clone();
-        tokio::spawn(async move {
-            let mut node = match RaftNode::<E>::new(node_id, receiver, node_senders_for_node, executor_arc.clone(), role_tx_for_node, transport_updater) {
-                Ok(n) => n,
-                Err(e) => {
-                    eprintln!("Failed to create RaftNode {}: {}", node_id, e);
-                    return;
-                }
-            };
+        let (node, cached_config_arc) = RaftNode::<E>::new(node_id, receiver, node_senders_for_node, executor_arc.clone(), role_tx_for_node, transport_updater)?;
 
-            if let Err(e) = node.run().await {
+        // Spawn the node
+        tokio::spawn(async move {
+            let mut n = node;
+            if let Err(e) = n.run().await {
                 eprintln!("Node {} exited with error: {}", node_id, e);
             }
         });
+
+        // Create cluster with the cached_config from the node
+        let cluster = RaftCluster {
+            node_senders: node_senders_flat,
+            node_count,
+            role_change_tx: role_change_tx.clone(),
+            next_command_id: Arc::new(AtomicU64::new(1)),
+            executor: executor_arc.clone(),
+            leader_id: leader_id_arc.clone(),
+            node_id,
+            cached_config: cached_config_arc,
+        };
 
         // Give the node time to initialize
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -135,6 +134,11 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
 
         let leader_id_arc = Arc::new(AtomicU64::new(node_id)); // Single node is always leader
 
+        // Create the RaftNode - it returns (node, cached_config)
+        let role_tx_clone = role_change_tx.clone();
+        let (node, cached_config_arc) = RaftNode::<E>::new(node_id, receiver, node_senders_shared, executor_arc.clone(), role_tx_clone, None)?;
+
+        // Build cluster with the cached_config from the node
         let cluster = RaftCluster {
             node_senders: node_senders_map,
             node_count: 1,
@@ -143,20 +147,13 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
             executor: executor_arc.clone(),
             leader_id: leader_id_arc.clone(),
             node_id,
+            cached_config: cached_config_arc,
         };
 
-        // Create and run the single node with shared node_senders
-        let role_tx_clone = role_change_tx.clone();
+        // Spawn task to run the node
         tokio::spawn(async move {
-            let mut node = match RaftNode::<E>::new(node_id, receiver, node_senders_shared, executor_arc.clone(), role_tx_clone, None) {
-                Ok(n) => n,
-                Err(e) => {
-                    eprintln!("Failed to create RaftNode {}: {}", node_id, e);
-                    return;
-                }
-            };
-
-            if let Err(e) = node.run().await {
+            let mut n = node;
+            if let Err(e) = n.run().await {
                 eprintln!("Node {} exited with error: {}", node_id, e);
             }
         });
@@ -371,25 +368,11 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
         self.node_count
     }
 
-    pub async fn get_node_ids(&self) -> Vec<u64> {
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-
-        // Send QueryConfig message to this node's RaftNode
-        if let Some(node_sender) = self.node_senders.get(&self.node_id) {
-            let _ = node_sender.send(Message::QueryConfig { callback: sender });
-
-            // Wait for response with timeout
-            match tokio::time::timeout(std::time::Duration::from_millis(100), receiver).await {
-                Ok(Ok(voters)) => voters,
-                _ => {
-                    // Fallback to transport view if query fails
-                    self.node_senders.keys().copied().collect()
-                }
-            }
-        } else {
-            // Fallback if we can't find our own sender
-            self.node_senders.keys().copied().collect()
-        }
+    /// Get the current cluster node IDs from the cached Raft configuration.
+    /// This uses a shared reference to the RaftNode's configuration, eliminating
+    /// the need for message-based queries.
+    pub fn get_node_ids(&self) -> Vec<u64> {
+        self.cached_config.read().unwrap().clone()
     }
 
     /// Get the ID of this node

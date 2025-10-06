@@ -51,6 +51,9 @@ pub struct RaftNode<E: CommandExecutor> {
     /// Shared reference to peer senders - same HashMap instance used by transport
     /// This eliminates the need for AddPeerSender/RemovePeerSender synchronization
     peers: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<Message<E::Command>>>>>,
+    /// Cached Raft configuration (voter IDs) - shared with RaftCluster for direct access
+    /// Updated whenever configuration changes, eliminating need for QueryConfig messages
+    cached_config: Arc<RwLock<Vec<u64>>>,
 
     // Sync command tracking (command_id -> completion callback)
     sync_commands: HashMap<u64, SyncCallback>,
@@ -83,7 +86,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
         executor: Arc<E>,
         role_change_tx: broadcast::Sender<RoleChange>,
         transport_updater: Option<Arc<dyn crate::raft::generic::transport::TransportUpdater>>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<(Self, Arc<RwLock<Vec<u64>>>), Box<dyn std::error::Error>> {
         let is_single_node = peers.read().unwrap().is_empty();
 
         let config = Config {
@@ -102,16 +105,20 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
 
         // Set up the initial cluster configuration
         let mut initial_state = ConfState::default();
-        // Add ourselves as a voter
-        initial_state.voters.push(node_id);
-        // Add all peers as voters (if multi-node)
-        {
+        // Add all nodes from peers HashMap (which includes self and all peers)
+        let initial_voters = {
             let peers_guard = peers.read().unwrap();
-            for &peer_id in peers_guard.keys() {
+            let mut voters: Vec<u64> = peers_guard.keys().copied().collect();
+            voters.sort(); // Keep deterministic order
+            for &peer_id in &voters {
                 initial_state.voters.push(peer_id);
             }
-        }
+            voters
+        };
         storage.wl().set_conf_state(initial_state);
+
+        // Create cached configuration (shared with RaftCluster)
+        let cached_config = Arc::new(RwLock::new(initial_voters));
 
         // Create logger for this node
         let decorator = slog_term::TermDecorator::new().build();
@@ -121,13 +128,14 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
 
         let raft_group = RawNode::new(&config, storage, &logger)?;
 
-        Ok(RaftNode {
+        let node = RaftNode {
             raft_group,
             storage: Arc::new(RwLock::new(HashMap::new())),
             node_id,
             logger,
             mailbox,
             peers,
+            cached_config: cached_config.clone(),
             sync_commands: HashMap::new(),
             next_command_id: AtomicU64::new(1),
             executor,
@@ -136,7 +144,9 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             committed_index: 0,
             snapshot_config: SnapshotConfig::default(),
             transport_updater,
-        })
+        };
+
+        Ok((node, cached_config))
     }
 
     pub fn propose_command(&mut self, command: E::Command, sync_id: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
@@ -433,6 +443,10 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
 
             let cs = self.raft_group.apply_conf_change(&legacy_change)?;
             slog::info!(self.logger, "ConfChangeV2 applied via legacy method"; "new_conf" => ?cs);
+
+            // Update cached configuration
+            let voters: Vec<u64> = cs.voters.into_iter().collect();
+            *self.cached_config.write().unwrap() = voters;
         }
 
         Ok(())
@@ -610,18 +624,6 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                                     }
                                 }
                             }
-                        },
-                        Some(Message::AddPeerSender { .. }) => {
-                            // No longer needed - peers HashMap is shared with transport
-                        },
-                        Some(Message::RemovePeerSender { .. }) => {
-                            // No longer needed - peers HashMap is shared with transport
-                        },
-                        Some(Message::QueryConfig { callback }) => {
-                            // Get current voter configuration from Raft
-                            let conf_state = self.raft_group.raft.prs().conf().to_conf_state();
-                            let voters: Vec<u64> = conf_state.voters.into_iter().collect();
-                            let _ = callback.send(voters);
                         },
                         None => break,
                     }

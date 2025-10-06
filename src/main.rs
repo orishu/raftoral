@@ -164,7 +164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("✓ Registered ping_pong workflow (v1)");
 
     println!("\n🎉 Node {} is running!", node_id);
-    println!("   Cluster size: {} nodes", cluster.get_node_ids().await.len());
+    println!("   Cluster size: {} nodes", cluster.get_node_ids().len());
     println!("   Press Ctrl+C to shutdown gracefully\n");
 
     // Give the cluster a moment to stabilize (especially important for joining nodes)
@@ -207,7 +207,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n🛑 Shutdown signal received, stopping gracefully...");
 
     // Remove this node from the cluster before shutting down
-    if !args.bootstrap || cluster.get_node_ids().await.len() > 1 {
+    if !args.bootstrap || cluster.get_node_ids().len() > 1 {
         println!("   Removing node {} from cluster...", node_id);
         match cluster.remove_node(node_id).await {
             Ok(_) => println!("✓ Node removed from cluster"),

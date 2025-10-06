@@ -151,21 +151,12 @@ impl<E: CommandExecutor + Default + 'static> ClusterTransport<E> for InMemoryClu
                 .ok_or_else(|| format!("Node {} receiver already claimed or doesn't exist", node_id))?
         };
 
-        // Get the sender for this node (for cluster's propose methods to use)
-        let self_sender = {
-            let senders = self.node_senders.read().unwrap();
-            senders.get(&node_id)
-                .ok_or_else(|| format!("Node {} sender not found", node_id))?
-                .clone()
-        };
-
         // Create the cluster with shared node_senders
         // In-memory transport has fixed nodes, so no transport update channel needed
         let cluster = RaftCluster::new_with_transport(
             node_id,
             receiver,
             self.node_senders.clone(), // Share the same HashMap instance
-            self_sender,
             executor,
             None, // No transport updates for in-memory (fixed nodes)
         ).await?;

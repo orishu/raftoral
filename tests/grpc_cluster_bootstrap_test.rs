@@ -134,9 +134,9 @@ async fn test_three_node_grpc_cluster_bootstrap() {
 
     // Step 4: Verify cluster membership
     println!("Step 4: Verifying cluster membership");
-    let node_ids_1 = cluster1.get_node_ids().await;
-    let node_ids_2 = cluster2.get_node_ids().await;
-    let node_ids_3 = cluster3.get_node_ids().await;
+    let node_ids_1 = cluster1.get_node_ids();
+    let node_ids_2 = cluster2.get_node_ids();
+    let node_ids_3 = cluster3.get_node_ids();
 
     println!("  Node 1 sees: {:?}", node_ids_1);
     println!("  Node 2 sees: {:?}", node_ids_2);

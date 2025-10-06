@@ -207,14 +207,6 @@ impl<E: CommandExecutor + Default + 'static> ClusterTransport<E> for GrpcCluster
                 .subscribe()
         };
 
-        // Get the sender for this node
-        let self_sender = {
-            let senders = self.node_senders.read().unwrap();
-            senders.get(&node_id)
-                .ok_or_else(|| format!("Node {} sender not found", node_id))?
-                .clone()
-        };
-
         // Create forwarders for outgoing messages to remote peers
         // Each forwarder monitors the shared node_senders channel for a specific peer
         // and forwards Raft messages via gRPC to that peer
@@ -256,7 +248,6 @@ impl<E: CommandExecutor + Default + 'static> ClusterTransport<E> for GrpcCluster
             node_id,
             receiver,
             self.node_senders.clone(), // Share the same HashMap instance
-            self_sender,
             executor,
             Some(Arc::clone(self) as Arc<dyn crate::raft::generic::transport::TransportUpdater>),
         ).await?;
