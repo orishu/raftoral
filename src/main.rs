@@ -1,18 +1,7 @@
 use clap::Parser;
 use raftoral::runtime::{RaftoralConfig, RaftoralGrpcRuntime};
 use raftoral::workflow::{WorkflowContext, WorkflowError};
-use serde::{Deserialize, Serialize};
 use tokio::signal;
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct PingInput {
-    message: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct PongOutput {
-    message: String,
-}
 
 #[derive(Parser, Debug)]
 #[command(name = "raftoral")]
@@ -68,17 +57,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = RaftoralGrpcRuntime::start(config).await?;
 
     // Register ping/pong workflow
-    // Input: { "message": "ping" } -> Output: { "message": "pong" }
+    // Input: "ping" -> Output: "pong"
     // Any other input returns an error
-    let ping_pong_fn = |input: PingInput, _context: WorkflowContext| async move {
-        if input.message == "ping" {
-            Ok::<PongOutput, WorkflowError>(PongOutput {
-                message: "pong".to_string(),
-            })
+    let ping_pong_fn = |input: String, _context: WorkflowContext| async move {
+        if input == "ping" {
+            Ok::<String, WorkflowError>("pong".to_string())
         } else {
             Err(WorkflowError::ClusterError(format!(
                 "Expected 'ping', got '{}'",
-                input.message
+                input
             )))
         }
     };
@@ -95,13 +82,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Note: This works from any node - start_workflow automatically routes to the leader
     println!("📌 Testing ping/pong workflow...");
 
-    let test_input = PingInput {
-        message: "ping".to_string(),
-    };
-
     match runtime
         .workflow_runtime()
-        .start_workflow::<PingInput, PongOutput>("ping_pong", 1, test_input)
+        .start_workflow::<String, String>("ping_pong", 1, "ping".to_string())
         .await
     {
         Ok(workflow_run) => {
@@ -109,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match workflow_run.wait_for_completion().await {
                 Ok(output) => {
-                    println!("   ✓ Workflow completed: got '{}'", output.message);
+                    println!("   ✓ Workflow completed: got '{}'", output);
                 }
                 Err(e) => {
                     eprintln!("   ✗ Workflow failed: {}", e);
