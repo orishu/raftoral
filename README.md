@@ -28,52 +28,103 @@ Raftoral provides a distributed workflow orchestration engine where workflows ex
 
 ## Quick Start
 
-### Multi-Node Cluster Setup
+### Bootstrap Node (gRPC Production Setup)
+
+```rust
+use raftoral::runtime::{RaftoralConfig, RaftoralGrpcRuntime};
+use raftoral::workflow::WorkflowContext;
+use tokio::signal;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
+
+    // 1. Configure and start the runtime (bootstrap mode)
+    let config = RaftoralConfig::bootstrap("127.0.0.1:7001".to_string(), Some(1));
+    let runtime = RaftoralGrpcRuntime::start(config).await?;
+
+    // 2. Register workflow
+    runtime.workflow_runtime().register_workflow_closure(
+        "process_order", 1,
+        |input: OrderInput, ctx: WorkflowContext| async move {
+            let status = ctx.create_replicated_var("status", "processing").await?;
+            // ... business logic ...
+            Ok(OrderOutput { id: input.id })
+        }
+    )?;
+
+    // 3. Wait for shutdown
+    signal::ctrl_c().await?;
+    runtime.shutdown().await?;
+    Ok(())
+}
+```
+
+### Join Existing Cluster
+
+```rust
+// Node joining an existing cluster
+let config = RaftoralConfig::join(
+    "127.0.0.1:7002".to_string(),
+    vec!["127.0.0.1:7001".to_string()]
+);
+
+let runtime = RaftoralGrpcRuntime::start(config).await?;
+
+// Register same workflows as other nodes
+runtime.workflow_runtime().register_workflow_closure(
+    "process_order", 1,
+    |input: OrderInput, ctx: WorkflowContext| async move {
+        // Same workflow implementation
+        Ok(OrderOutput { id: input.id })
+    }
+)?;
+
+signal::ctrl_c().await?;
+runtime.shutdown().await?;
+```
+
+### Advanced Configuration (TLS, Timeouts, etc.)
+
+```rust
+use raftoral::grpc::client::ChannelBuilder;
+use tonic::transport::Channel;
+
+// Custom channel builder for TLS/authentication
+let channel_builder = Arc::new(|address: String| {
+    Box::pin(async move {
+        Channel::from_shared(format!("https://{}", address))?
+            .tls_config(tls_config)?
+            .connect_timeout(Duration::from_secs(10))
+            .connect()
+            .await
+    })
+}) as ChannelBuilder;
+
+let config = RaftoralConfig::bootstrap("127.0.0.1:7001".to_string(), Some(1))
+    .with_channel_builder(channel_builder)
+    .with_advertise_address("192.168.1.10:7001".to_string());
+
+let runtime = RaftoralGrpcRuntime::start(config).await?;
+```
+
+### In-Memory Transport (for testing)
 
 ```rust
 use raftoral::raft::generic::transport::{ClusterTransport, InMemoryClusterTransport};
-use raftoral::workflow::{WorkflowCommandExecutor, WorkflowRuntime, WorkflowContext};
+use raftoral::workflow::{WorkflowCommandExecutor, WorkflowRuntime};
 
-// 1. Create transport for 3-node cluster
+// Create transport for 3-node cluster
 let transport = InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3]);
 transport.start().await?;
 
-// 2. Create runtimes (executors and self-registration automatic)
+// Create runtimes (executors and self-registration automatic)
 let runtime1 = WorkflowRuntime::new(transport.create_cluster(1).await?);
 let runtime2 = WorkflowRuntime::new(transport.create_cluster(2).await?);
 let runtime3 = WorkflowRuntime::new(transport.create_cluster(3).await?);
 
-// 3. Register workflow on all nodes
-let workflow = |input: OrderInput, ctx: WorkflowContext| async move {
-    let status = ctx.create_replicated_var("status", "processing").await?;
-    // ... business logic ...
-    Ok(OrderOutput { id: input.id })
-};
-
-runtime1.register_workflow_closure("process_order", 1, workflow.clone())?;
-runtime2.register_workflow_closure("process_order", 1, workflow.clone())?;
-runtime3.register_workflow_closure("process_order", 1, workflow)?;
-
-// 4. Start from any node - Raft handles routing
-let run = runtime1.start_workflow_typed("process_order", 1, input).await?;
-let result = run.wait_for_completion().await?;
-```
-
-### Single-Node Setup (for testing)
-
-```rust
-use raftoral::{WorkflowRuntime, WorkflowContext};
-
-let runtime = WorkflowRuntime::new_single_node(1).await?;
-tokio::time::sleep(Duration::from_millis(500)).await; // Wait for leadership
-
-runtime.register_workflow_closure("my_workflow", 1,
-    |input: MyInput, ctx: WorkflowContext| async move {
-        Ok(MyOutput { /* ... */ })
-    }
-)?;
-
-let run = runtime.start_workflow_typed("my_workflow", 1, input).await?;
+// Register and execute workflows
+let run = runtime1.start_workflow_typed("my_workflow", 1, input).await?;
 let result = run.wait_for_completion().await?;
 ```
 
@@ -212,70 +263,75 @@ pub enum WorkflowEvent {
 ## Running Examples
 
 ```bash
-# Multi-node fibonacci example
-cargo test test_three_node_cluster_workflow_execution -- --nocapture
+# Simple runtime example (production-style gRPC usage)
+cargo run --example simple_runtime
 
 # Typed workflow with checkpoints
 cargo run --example typed_workflow_example
 
+# Run the main binary (bootstrap node)
+RUST_LOG=info cargo run -- --listen 127.0.0.1:7001 --bootstrap
+
+# Run second node joining cluster
+RUST_LOG=info cargo run -- --listen 127.0.0.1:7002 --peers 127.0.0.1:7001
+
 # Run all tests
 cargo test
 
-# With logging
-RUST_LOG=info cargo test
+# Multi-node integration tests with logging
+RUST_LOG=info cargo test test_three_node_cluster_workflow_execution -- --nocapture
 ```
 
 ## Working Example
 
-See `examples/typed_workflow_example.rs`:
+See `examples/simple_runtime.rs` for production-style gRPC usage:
 
 ```rust
+use raftoral::runtime::{RaftoralConfig, RaftoralGrpcRuntime};
+use raftoral::workflow::WorkflowContext;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct ComputationInput {
-    base_value: i32,
-    multiplier: i32,
-    iterations: u32,
-}
+struct ComputeInput { value: i32 }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ComputeOutput { result: i32 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let runtime = WorkflowRuntime::new_single_node(1).await?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    env_logger::init();
 
-    runtime.register_workflow_closure(
-        "computation", 1,
-        |input: ComputationInput, context: WorkflowContext| async move {
-            let mut current_value = input.base_value;
-            let mut results = Vec::new();
+    // Create configuration for a new cluster
+    let config = RaftoralConfig::bootstrap("127.0.0.1:7001".to_string(), Some(1));
 
-            for i in 0..input.iterations {
-                current_value *= input.multiplier;
-                results.push(current_value);
+    // Start the runtime - handles all initialization
+    let runtime = RaftoralGrpcRuntime::start(config).await?;
 
-                // Checkpoint each step
-                context.create_replicated_var(
-                    &format!("step_{}", i),
-                    current_value
-                ).await?;
-            }
-
-            Ok(ComputationOutput {
-                final_result: current_value,
-                intermediate_values: results,
-            })
-        }
-    )?;
-
-    let input = ComputationInput {
-        base_value: 2,
-        multiplier: 3,
-        iterations: 4
+    // Register a simple computation workflow
+    let compute_fn = |input: ComputeInput, _ctx: WorkflowContext| async move {
+        // Simple computation: multiply by 2
+        let result = input.value * 2;
+        Ok::<ComputeOutput, WorkflowError>(ComputeOutput { result })
     };
 
-    let run = runtime.start_workflow_typed("computation", 1, input).await?;
-    let result = run.wait_for_completion().await?;
+    runtime.workflow_runtime()
+        .register_workflow_closure("compute", 1, compute_fn)?;
 
-    println!("Result: {}", result.final_result); // 162
+    println!("✓ Registered 'compute' workflow");
+
+    // Execute the workflow
+    let input = ComputeInput { value: 21 };
+    let workflow_run = runtime.workflow_runtime()
+        .start_workflow::<ComputeInput, ComputeOutput>("compute", 1, input)
+        .await?;
+
+    let output = workflow_run.wait_for_completion().await?;
+    println!("✓ Workflow completed: {} * 2 = {}", 21, output.result);
+
+    // Wait for shutdown signal
+    signal::ctrl_c().await?;
+
+    // Gracefully shutdown
+    runtime.shutdown().await?;
     Ok(())
 }
 ```
@@ -321,18 +377,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - Custom ChannelBuilder support for TLS/authentication
 - All 23 library tests + examples passing
 
+**Milestone 14: Production-Ready Runtime API** ✅
+- RaftoralGrpcRuntime high-level API for easy cluster setup
+- RaftoralConfig builder pattern (bootstrap, join, with_channel_builder, etc.)
+- Automatic peer discovery and node ID assignment
+- Graceful shutdown with cluster membership updates
+- Standard logging via log crate facade
+- Production configurability (TLS, timeouts, compression, server limits)
+- Clean 3-step pattern: start → register → shutdown
+
 ### Next Steps 🚀
 
-**Enhanced Snapshot Testing**
-- Multi-node snapshot integration tests
-- New node joining via snapshot restoration
-- Snapshot during active workflow execution
+**Production gRPC Cluster Testing**
+- Multi-node gRPC cluster integration tests
+- TLS/authentication validation
+- Network partition and recovery testing
+- Snapshot-based new node joining
 
 **Future Enhancements**
-- Multi-node gRPC cluster testing (infrastructure is ready)
-- Advanced workflow patterns (child workflows, compensation)
-- Observability and metrics
-- Performance benchmarking
+- Advanced workflow patterns (child workflows, parallel execution, compensation)
+- Persistent storage backend integration
+- Observability and metrics (Prometheus, OpenTelemetry)
+- Performance benchmarking and optimization
 
 ## Technical Details
 

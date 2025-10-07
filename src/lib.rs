@@ -1,6 +1,7 @@
 pub mod raft;
 pub mod workflow;
 pub mod grpc;
+pub mod runtime;
 
 // Type alias for our workflow-specific cluster
 pub type WorkflowCluster = raft::RaftCluster<workflow::WorkflowCommandExecutor>;
@@ -12,3 +13,4 @@ pub use workflow::{
     ReplicatedVar, ReplicatedVarError, WorkflowRuntime, WorkflowRun, WorkflowContext
 };
 pub use grpc::{start_grpc_server, start_grpc_server_with_config, GrpcServerHandle, RaftClient, discover_peers, DiscoveredPeer, bootstrap};
+pub use runtime::{RaftoralGrpcRuntime, RaftoralConfig};
