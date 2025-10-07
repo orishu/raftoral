@@ -2,10 +2,14 @@ use tonic::{transport::Server, Request, Response, Status};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use crate::raft::generic::grpc_transport::GrpcClusterTransport;
+use tonic_reflection::server::Builder as ReflectionBuilder;
 
 // Include the generated protobuf code
 pub mod raft_proto {
     tonic::include_proto!("raftoral");
+
+    // File descriptor for gRPC reflection
+    pub const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!("../../target/descriptor.bin");
 }
 
 use raft_proto::{
@@ -184,6 +188,11 @@ pub async fn start_grpc_server_with_config<E: CommandExecutor + 'static>(
     let raft_service = RaftServiceImpl::new(transport, cluster, node_id, address);
     let workflow_service = WorkflowManagementImpl::new(runtime);
 
+    // Create reflection service
+    let reflection_service = ReflectionBuilder::configure()
+        .register_encoded_file_descriptor_set(raft_proto::FILE_DESCRIPTOR_SET)
+        .build_v1()?;
+
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     tokio::spawn(async move {
@@ -197,6 +206,7 @@ pub async fn start_grpc_server_with_config<E: CommandExecutor + 'static>(
         server
             .add_service(RaftServiceServer::new(raft_service))
             .add_service(WorkflowManagementServer::new(workflow_service))
+            .add_service(reflection_service)
             .serve_with_shutdown(addr, async {
                 shutdown_rx.await.ok();
             })

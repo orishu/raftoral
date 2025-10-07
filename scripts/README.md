@@ -14,6 +14,11 @@ Utility scripts for testing and interacting with Raftoral clusters.
 
 Execute the `ping_pong` workflow via gRPC using grpcurl.
 
+**Features:**
+- Uses gRPC reflection - no proto files needed!
+- Works with any Raftoral node in the cluster
+- Automatic service discovery
+
 **Usage:**
 ```bash
 ./scripts/run_ping_pong.sh [node_address]
@@ -49,24 +54,39 @@ Execute the `ping_pong` workflow via gRPC using grpcurl.
 
 ## Using grpcurl Directly
 
-You can also use grpcurl directly for more flexibility:
+Raftoral servers support gRPC reflection, so you can use grpcurl without proto files:
 
 ```bash
-# List available services
-grpcurl -plaintext -import-path proto -proto raftoral.proto 127.0.0.1:5001 list
+# List available services (using reflection)
+grpcurl -plaintext 127.0.0.1:5001 list
 
-# Describe a service
-grpcurl -plaintext -import-path proto -proto raftoral.proto 127.0.0.1:5001 describe raftoral.WorkflowManagement
+# Describe a service (using reflection)
+grpcurl -plaintext 127.0.0.1:5001 describe raftoral.WorkflowManagement
 
-# Call RunWorkflowSync with custom input
+# Call RunWorkflowSync with custom input (using reflection)
 grpcurl -plaintext \
-    -import-path proto \
-    -proto raftoral.proto \
     -d '{
         "workflow_type": "my_workflow",
         "version": 1,
         "input_json": "{\"key\": \"value\"}"
     }' \
+    127.0.0.1:5001 \
+    raftoral.WorkflowManagement/RunWorkflowSync
+```
+
+### Using Proto Files (Optional)
+
+If you prefer to use proto files explicitly:
+
+```bash
+# List services with proto file
+grpcurl -plaintext -import-path proto -proto raftoral.proto 127.0.0.1:5001 list
+
+# Call with proto file
+grpcurl -plaintext \
+    -import-path proto \
+    -proto raftoral.proto \
+    -d '{"workflow_type": "ping_pong", "version": 1, "input_json": "\"ping\""}' \
     127.0.0.1:5001 \
     raftoral.WorkflowManagement/RunWorkflowSync
 ```
