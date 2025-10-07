@@ -86,7 +86,8 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
         executor: Arc<E>,
         role_change_tx: broadcast::Sender<RoleChange>,
         transport_updater: Option<Arc<dyn crate::raft::generic::transport::TransportUpdater>>,
-    ) -> Result<(Self, Arc<RwLock<Vec<u64>>>), Box<dyn std::error::Error>> {
+        cached_config: Arc<RwLock<Vec<u64>>>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let is_single_node = peers.read().unwrap().is_empty();
 
         let config = Config {
@@ -106,19 +107,17 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
         // Set up the initial cluster configuration
         let mut initial_state = ConfState::default();
         // Add all nodes from peers HashMap (which includes self and all peers)
-        let initial_voters = {
+        {
             let peers_guard = peers.read().unwrap();
             let mut voters: Vec<u64> = peers_guard.keys().copied().collect();
             voters.sort(); // Keep deterministic order
             for &peer_id in &voters {
                 initial_state.voters.push(peer_id);
             }
-            voters
+            // Populate the cached configuration (shared with RaftCluster)
+            *cached_config.write().unwrap() = voters;
         };
         storage.wl().set_conf_state(initial_state);
-
-        // Create cached configuration (shared with RaftCluster)
-        let cached_config = Arc::new(RwLock::new(initial_voters));
 
         // Create logger for this node
         let decorator = slog_term::TermDecorator::new().build();
@@ -135,7 +134,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             logger,
             mailbox,
             peers,
-            cached_config: cached_config.clone(),
+            cached_config,
             sync_commands: HashMap::new(),
             next_command_id: AtomicU64::new(1),
             executor,
@@ -146,7 +145,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             transport_updater,
         };
 
-        Ok((node, cached_config))
+        Ok(node)
     }
 
     pub fn propose_command(&mut self, command: E::Command, sync_id: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {

@@ -82,10 +82,21 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
             }
         });
 
+        // Create cached_config - will be populated by RaftNode::new
+        let cached_config_arc = Arc::new(RwLock::new(Vec::new()));
+
         // Create and spawn the Raft node with shared node_senders Arc
         let role_tx_for_node = role_change_tx.clone();
         let node_senders_for_node = node_senders.clone();
-        let (node, cached_config_arc) = RaftNode::<E>::new(node_id, receiver, node_senders_for_node, executor_arc.clone(), role_tx_for_node, transport_updater)?;
+        let node = RaftNode::<E>::new(
+            node_id,
+            receiver,
+            node_senders_for_node,
+            executor_arc.clone(),
+            role_tx_for_node,
+            transport_updater,
+            cached_config_arc.clone(),
+        )?;
 
         // Spawn the node
         tokio::spawn(async move {
@@ -95,7 +106,7 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
             }
         });
 
-        // Create cluster with the cached_config from the node
+        // Create cluster with the cached_config shared with the node
         let cluster = RaftCluster {
             node_senders: node_senders_flat,
             node_count,
@@ -134,11 +145,22 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
 
         let leader_id_arc = Arc::new(AtomicU64::new(node_id)); // Single node is always leader
 
-        // Create the RaftNode - it returns (node, cached_config)
-        let role_tx_clone = role_change_tx.clone();
-        let (node, cached_config_arc) = RaftNode::<E>::new(node_id, receiver, node_senders_shared, executor_arc.clone(), role_tx_clone, None)?;
+        // Create cached_config - will be populated by RaftNode::new
+        let cached_config_arc = Arc::new(RwLock::new(Vec::new()));
 
-        // Build cluster with the cached_config from the node
+        // Create the RaftNode with cached_config
+        let role_tx_clone = role_change_tx.clone();
+        let node = RaftNode::<E>::new(
+            node_id,
+            receiver,
+            node_senders_shared,
+            executor_arc.clone(),
+            role_tx_clone,
+            None,
+            cached_config_arc.clone(),
+        )?;
+
+        // Build cluster with the cached_config shared with the node
         let cluster = RaftCluster {
             node_senders: node_senders_map,
             node_count: 1,
