@@ -38,3 +38,21 @@ message DiscoveryResponse {
     uint64 highest_known_node_id = 3;
     string address = 4;
 }
+
+// Workflow Management Service
+service WorkflowManagement {
+    // Synchronously run a workflow and wait for result
+    rpc RunWorkflowSync(RunWorkflowRequest) returns (RunWorkflowResponse);
+}
+
+message RunWorkflowRequest {
+    string workflow_type = 1;
+    uint32 version = 2;
+    string input_json = 3;  // JSON-serialized input
+}
+
+message RunWorkflowResponse {
+    bool success = 1;
+    string result_json = 2;  // JSON-serialized result if success=true
+    string error = 3;        // Error message if success=false
+}

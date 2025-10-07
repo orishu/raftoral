@@ -10,8 +10,10 @@ pub mod raft_proto {
 
 use raft_proto::{
     raft_service_server::{RaftService, RaftServiceServer},
+    workflow_management_server::{WorkflowManagement, WorkflowManagementServer},
     GenericMessage, MessageResponse,
     DiscoveryRequest, DiscoveryResponse, RaftRole as ProtoRaftRole,
+    RunWorkflowRequest, RunWorkflowResponse,
 };
 
 use crate::raft::generic::message::{Message, SerializableMessage, CommandExecutor};
@@ -83,6 +85,66 @@ impl<E: CommandExecutor> RaftService for RaftServiceImpl<E> {
     }
 }
 
+/// gRPC service implementation for Workflow Management
+pub struct WorkflowManagementImpl {
+    runtime: Arc<crate::workflow::WorkflowRuntime>,
+}
+
+impl WorkflowManagementImpl {
+    pub fn new(runtime: Arc<crate::workflow::WorkflowRuntime>) -> Self {
+        Self { runtime }
+    }
+}
+
+#[tonic::async_trait]
+impl WorkflowManagement for WorkflowManagementImpl {
+    async fn run_workflow_sync(
+        &self,
+        request: Request<RunWorkflowRequest>,
+    ) -> Result<Response<RunWorkflowResponse>, Status> {
+        let req = request.into_inner();
+
+        // Parse input JSON to serde_json::Value
+        let input_value: serde_json::Value = serde_json::from_str(&req.input_json)
+            .map_err(|e| Status::invalid_argument(format!("Invalid input JSON: {}", e)))?;
+
+        // Start the workflow with generic JSON input
+        let workflow_run = self.runtime
+            .start_workflow::<serde_json::Value, serde_json::Value>(
+                &req.workflow_type,
+                req.version,
+                input_value,
+            )
+            .await
+            .map_err(|e| Status::internal(format!("Failed to start workflow: {}", e)))?;
+
+        // Wait for completion
+        let result = workflow_run.wait_for_completion().await;
+
+        match result {
+            Ok(output_value) => {
+                // Serialize result to JSON
+                let result_json = serde_json::to_string(&output_value)
+                    .map_err(|e| Status::internal(format!("Failed to serialize result: {}", e)))?;
+
+                Ok(Response::new(RunWorkflowResponse {
+                    success: true,
+                    result_json,
+                    error: String::new(),
+                }))
+            }
+            Err(e) => {
+                // Workflow failed - return error in payload, not gRPC status
+                Ok(Response::new(RunWorkflowResponse {
+                    success: false,
+                    result_json: String::new(),
+                    error: e.to_string(),
+                }))
+            }
+        }
+    }
+}
+
 /// Type alias for server configuration function
 pub type ServerConfigurator = Box<dyn Fn(Server) -> Server + Send + Sync>;
 
@@ -104,8 +166,9 @@ pub async fn start_grpc_server<E: CommandExecutor + 'static>(
     transport: Arc<GrpcClusterTransport<E>>,
     cluster: Arc<RaftCluster<E>>,
     node_id: u64,
+    runtime: Arc<crate::workflow::WorkflowRuntime>,
 ) -> Result<GrpcServerHandle, Box<dyn std::error::Error>> {
-    start_grpc_server_with_config(address, transport, cluster, node_id, None).await
+    start_grpc_server_with_config(address, transport, cluster, node_id, runtime, None).await
 }
 
 /// Start a gRPC server with custom server configuration
@@ -114,10 +177,12 @@ pub async fn start_grpc_server_with_config<E: CommandExecutor + 'static>(
     transport: Arc<GrpcClusterTransport<E>>,
     cluster: Arc<RaftCluster<E>>,
     node_id: u64,
+    runtime: Arc<crate::workflow::WorkflowRuntime>,
     server_config: Option<ServerConfigurator>,
 ) -> Result<GrpcServerHandle, Box<dyn std::error::Error>> {
     let addr = address.parse()?;
-    let service = RaftServiceImpl::new(transport, cluster, node_id, address);
+    let raft_service = RaftServiceImpl::new(transport, cluster, node_id, address);
+    let workflow_service = WorkflowManagementImpl::new(runtime);
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -130,7 +195,8 @@ pub async fn start_grpc_server_with_config<E: CommandExecutor + 'static>(
         }
 
         server
-            .add_service(RaftServiceServer::new(service))
+            .add_service(RaftServiceServer::new(raft_service))
+            .add_service(WorkflowManagementServer::new(workflow_service))
             .serve_with_shutdown(addr, async {
                 shutdown_rx.await.ok();
             })

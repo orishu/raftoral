@@ -234,6 +234,10 @@ impl RaftoralGrpcRuntime {
         let cluster = transport.create_cluster(node_id).await?;
         info!("Raft cluster initialized");
 
+        // Create workflow runtime (needed for gRPC server)
+        let workflow_runtime = WorkflowRuntime::new(cluster.clone());
+        info!("Workflow runtime ready");
+
         // Start gRPC server with optional custom configuration
         // Server must be started BEFORE add_node so it can receive Raft messages
         let server_handle = if let Some(server_config) = config.server_configurator {
@@ -242,6 +246,7 @@ impl RaftoralGrpcRuntime {
                 transport.clone(),
                 cluster.clone(),
                 node_id,
+                workflow_runtime.clone(),
                 Some(server_config),
             )
             .await?
@@ -251,6 +256,7 @@ impl RaftoralGrpcRuntime {
                 transport.clone(),
                 cluster.clone(),
                 node_id,
+                workflow_runtime.clone(),
             )
             .await?
         };
@@ -269,10 +275,6 @@ impl RaftoralGrpcRuntime {
                 }
             }
         }
-
-        // Create workflow runtime
-        let workflow_runtime = WorkflowRuntime::new(cluster.clone());
-        info!("Workflow runtime ready");
 
         info!("Node {} is running", node_id);
         info!("Cluster size: {} nodes", cluster.get_node_ids().len());
