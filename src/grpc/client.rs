@@ -29,23 +29,28 @@ impl RaftClient {
     ///
     /// # Example
     /// ```no_run
-    /// use raftoral::grpc::client::RaftClient;
+    /// use raftoral::grpc::client::{RaftClient, ChannelBuilder};
     /// use tonic::transport::Channel;
+    /// use std::sync::Arc;
     ///
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let channel_builder = Arc::new(|address: String| {
     ///     Box::pin(async move {
-    ///         Channel::from_shared(format!("https://{}", address))?
-    ///             .tls_config(tonic::transport::ClientTlsConfig::new())?
+    ///         Channel::from_shared(format!("http://{}", address))
+    ///             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
     ///             .connect()
     ///             .await
-    ///     }) as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
+    ///             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    ///     }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<Channel, Box<dyn std::error::Error + Send + Sync>>> + Send>>
     /// }) as ChannelBuilder;
     ///
     /// let client = RaftClient::connect_with_channel_builder(
     ///     "127.0.0.1:5001".to_string(),
     ///     channel_builder
     /// ).await?;
-    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn connect_with_channel_builder(
         address: String,

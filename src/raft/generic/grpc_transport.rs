@@ -56,20 +56,24 @@ impl<E: CommandExecutor> GrpcClusterTransport<E> {
     /// ```no_run
     /// use raftoral::raft::generic::grpc_transport::{GrpcClusterTransport, NodeConfig};
     /// use raftoral::workflow::WorkflowCommandExecutor;
+    /// use raftoral::grpc::client::ChannelBuilder;
     /// use tonic::transport::Channel;
+    /// use std::sync::Arc;
     ///
     /// let nodes = vec![
     ///     NodeConfig { node_id: 1, address: "127.0.0.1:5001".to_string() },
     ///     NodeConfig { node_id: 2, address: "127.0.0.1:5002".to_string() },
     /// ];
     ///
-    /// let channel_builder = std::sync::Arc::new(|address: String| {
+    /// let channel_builder = Arc::new(|address: String| {
     ///     Box::pin(async move {
-    ///         Channel::from_shared(format!("https://{}", address))?
+    ///         Channel::from_shared(format!("http://{}", address))
+    ///             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
     ///             .connect()
     ///             .await
-    ///     }) as std::pin::Pin<Box<dyn std::future::Future<Output = _> + Send>>
-    /// }) as crate::grpc::client::ChannelBuilder;
+    ///             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    ///     }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<Channel, Box<dyn std::error::Error + Send + Sync>>> + Send>>
+    /// }) as ChannelBuilder;
     ///
     /// let transport = GrpcClusterTransport::<WorkflowCommandExecutor>::new_with_channel_builder(
     ///     nodes,
