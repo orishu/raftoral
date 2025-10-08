@@ -1,3 +1,6 @@
+#![feature(stmt_expr_attributes)]
+#![feature(proc_macro_hygiene)]
+
 //! Demonstration of the `#[replicated]` macro for clean replicated variable syntax.
 //!
 //! This example shows how the proc macro makes replicated variables look almost
@@ -36,8 +39,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Starting workflow with input: {:?}", input);
 
             // Clean syntax! Looks almost like regular variables
-            replicated!(ctx, let mut counter = input.start);
-            replicated!(ctx, let mut history = Vec::<i32>::new());
+            #[replicated(ctx)]
+            let mut counter = input.start;
+
+            #[replicated(ctx)]
+            let mut history = Vec::<i32>::new();
 
             println!("Initial counter: {}", *counter);
 
