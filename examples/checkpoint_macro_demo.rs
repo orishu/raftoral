@@ -1,12 +1,9 @@
-#![feature(stmt_expr_attributes)]
-#![feature(proc_macro_hygiene)]
-
-//! Demonstration of the `#[replicated]` macro for clean replicated variable syntax.
+//! Demonstration of the `checkpoint!` and `checkpoint_compute!` macros.
 //!
-//! This example shows how the proc macro makes replicated variables look almost
-//! like regular Rust variables, while automatically handling checkpointing.
+//! This example shows how the checkpoint macros create replicated variables with
+//! explicit keys that remain stable across workflow versions.
 
-use raftoral::{WorkflowRuntime, WorkflowContext, WorkflowError, replicated};
+use raftoral::{WorkflowRuntime, WorkflowContext, WorkflowError, checkpoint, checkpoint_compute};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -19,31 +16,29 @@ struct ComputeInput {
 struct ComputeOutput {
     result: i32,
     history: Vec<i32>,
+    computed_value: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
-    println!("=== Replicated Macro Demo ===\n");
+    println!("=== Checkpoint Macro Demo ===\n");
 
     // Create single-node runtime for testing
     let runtime = WorkflowRuntime::new_single_node(1).await?;
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await; // Wait for leadership
 
-    // Register workflow using the clean #[replicated] syntax
+    // Register workflow demonstrating both checkpoint! and checkpoint_compute!
     runtime.register_workflow_closure(
         "compute_with_macro",
         1,
         |input: ComputeInput, ctx: WorkflowContext| async move {
             println!("Starting workflow with input: {:?}", input);
 
-            // Clean syntax! Looks almost like regular variables
-            #[replicated(ctx)]
-            let mut counter = input.start;
-
-            #[replicated(ctx)]
-            let mut history = Vec::<i32>::new();
+            // checkpoint! - Clean syntax with explicit keys that stay stable across versions
+            let mut counter = checkpoint!(ctx, "counter", input.start);
+            let mut history = checkpoint!(ctx, "history", Vec::<i32>::new());
 
             println!("Initial counter: {}", *counter);
 
@@ -65,9 +60,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }).await?;
             }
 
+            // checkpoint_compute! - Side-effect computation (executed once, result replicated)
+            let computed = checkpoint_compute!(ctx, "computed_timestamp", || async {
+                // Simulate expensive computation or external API call
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                format!("Computed at timestamp: {}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis())
+            });
+
+            println!("Computed value: {}", *computed);
+
             Ok::<ComputeOutput, WorkflowError>(ComputeOutput {
                 result: *counter,
                 history: (*history).clone(),
+                computed_value: (*computed).clone(),
             })
         },
     )?;
@@ -90,6 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Results ===");
     println!("Final result: {}", output.result);
     println!("History: {:?}", output.history);
+    println!("Computed: {}", output.computed_value);
     println!("\n✓ Demo complete!");
 
     Ok(())

@@ -43,11 +43,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = RaftoralConfig::bootstrap("127.0.0.1:7001".to_string(), Some(1));
     let runtime = RaftoralGrpcRuntime::start(config).await?;
 
-    // 2. Register workflow
+    // 2. Register workflow (using checkpoint! macro for clean syntax)
     runtime.workflow_runtime().register_workflow_closure(
         "process_order", 1,
         |input: OrderInput, ctx: WorkflowContext| async move {
-            let status = ctx.create_replicated_var("status", "processing").await?;
+            let status = checkpoint!(ctx, "status", "processing");
             // ... business logic ...
             Ok(OrderOutput { id: input.id })
         }
@@ -158,23 +158,41 @@ runtime.register_workflow_closure(
 )?;
 ```
 
-### 3. Replicated Variables with Automatic Checkpointing
+### 3. Replicated Variables with Clean Macro Syntax
 
 ```rust
-// Create checkpointed variable
-let counter = context.create_replicated_var("counter", 0).await?;
+use raftoral::{checkpoint, checkpoint_compute};
 
-// Atomic updates
-counter.update(|val| val + 1).await?;
+// Create checkpointed variables with explicit keys
+let mut counter = checkpoint!(ctx, "counter", 0);
+let mut history = checkpoint!(ctx, "history", Vec::<i32>::new());
 
-// Computed values (for external API calls)
-let api_result = context.create_replicated_var_with_computation(
-    "api_result",
-    || async { call_external_api().await }
-).await?;
+// Read with deref
+let value = *counter;
+
+// Direct updates
+counter.set(value + 1).await?;
+
+// Functional updates
+history.update(|mut h| { h.push(*counter); h }).await?;
+
+// Computed values (for side effects like API calls)
+let api_result = checkpoint_compute!(ctx, "api_result", || async {
+    call_external_api().await
+});
 ```
 
-### 4. Late Follower Catch-Up (Checkpoint Queues)
+**Key benefits of explicit keys:**
+- ✅ Stable across code changes (adding/removing lines)
+- ✅ Version-safe (same keys work in v1 and v2)
+- ✅ Self-documenting in logs
+- ✅ Editor type inference (`counter` is `ReplicatedVar<i32>`)
+
+### 4. Checkpoint Macro Demo
+
+See `examples/checkpoint_macro_demo.rs` for a complete demonstration of both macros.
+
+### 5. Late Follower Catch-Up (Checkpoint Queues)
 
 **Problem**: Follower receives checkpoint before execution reaches that point → deadlock
 
@@ -184,7 +202,7 @@ let api_result = context.create_replicated_var_with_computation(
 - Leader cleanup prevents self-consumption
 - Cluster progresses even with slow followers
 
-### 5. Raft Snapshots for State Recovery
+### 6. Raft Snapshots for State Recovery
 
 **Problem**: New nodes need complete checkpoint history, but queues are consumed during execution
 
@@ -194,7 +212,7 @@ let api_result = context.create_replicated_var_with_computation(
 - Queue reconstruction from history on snapshot restore
 - Enables new node catch-up without full log replay
 
-### 6. Automatic Leader Discovery & Node Management
+### 7. Automatic Leader Discovery & Node Management
 
 **No manual leader tracking required** - nodes automatically find the leader:
 
@@ -265,6 +283,9 @@ pub enum WorkflowEvent {
 ```bash
 # Simple runtime example (production-style gRPC usage)
 cargo run --example simple_runtime
+
+# Checkpoint macros demonstration
+cargo run --example checkpoint_macro_demo
 
 # Typed workflow with checkpoints
 cargo run --example typed_workflow_example
@@ -455,6 +476,7 @@ tests/
 └── node_failure_test.rs     # Failover and reassignment tests
 
 examples/
+├── checkpoint_macro_demo.rs    # Demonstrates checkpoint! and checkpoint_compute!
 ├── typed_workflow_example.rs
 ├── simple_workflow.rs
 └── scoped_workflow.rs

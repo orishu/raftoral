@@ -33,15 +33,15 @@ async fn test_three_node_grpc_cluster_bootstrap() {
     transport1.start().await.expect("Transport 1 should start");
 
     let cluster1 = transport1.create_cluster(1).await.expect("Should create cluster 1");
+    let runtime1 = WorkflowRuntime::new(cluster1.clone());
 
     let server1 = start_grpc_server(
         addr1.clone(),
         transport1.clone(),
         cluster1.clone(),
-        1
+        1,
+        runtime1.clone()
     ).await.expect("Should start server 1");
-
-    let runtime1 = WorkflowRuntime::new(cluster1.clone());
     println!("✓ Node 1 bootstrapped and running\n");
 
     // Give node 1 time to become leader
@@ -69,15 +69,15 @@ async fn test_three_node_grpc_cluster_bootstrap() {
     transport2.start().await.expect("Transport 2 should start");
 
     let cluster2 = transport2.create_cluster(2).await.expect("Should create cluster 2");
+    let runtime2 = WorkflowRuntime::new(cluster2.clone());
 
     let server2 = start_grpc_server(
         addr2.clone(),
         transport2.clone(),
         cluster2.clone(),
-        2
+        2,
+        runtime2.clone()
     ).await.expect("Should start server 2");
-
-    let runtime2 = WorkflowRuntime::new(cluster2.clone());
 
     // Add node 2 to the cluster via node 1 (the leader)
     println!("  Adding node 2 to cluster via ConfChange...");
@@ -111,15 +111,15 @@ async fn test_three_node_grpc_cluster_bootstrap() {
     transport3.start().await.expect("Transport 3 should start");
 
     let cluster3 = transport3.create_cluster(3).await.expect("Should create cluster 3");
+    let runtime3 = WorkflowRuntime::new(cluster3.clone());
 
     let server3 = start_grpc_server(
         addr3.clone(),
         transport3.clone(),
         cluster3.clone(),
-        3
+        3,
+        runtime3.clone()
     ).await.expect("Should start server 3");
-
-    let runtime3 = WorkflowRuntime::new(cluster3.clone());
 
     // Add node 3 to the cluster
     // Note: add_node automatically routes to the leader, so we can call it from any node

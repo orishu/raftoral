@@ -1171,7 +1171,6 @@ dependencies = [
  "prost",
  "protobuf",
  "raft",
- "raftoral-macros",
  "serde",
  "serde_json",
  "slog",
@@ -1182,15 +1181,6 @@ dependencies = [
  "tonic-build",
  "tonic-reflection",
  "uuid",
-]
-
-[[package]]
-name = "raftoral-macros"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]

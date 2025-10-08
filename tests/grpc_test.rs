@@ -1,6 +1,6 @@
 use raftoral::raft::generic::grpc_transport::{GrpcClusterTransport, NodeConfig};
 use raftoral::raft::generic::transport::ClusterTransport;
-use raftoral::workflow::WorkflowCommandExecutor;
+use raftoral::workflow::{WorkflowCommandExecutor, WorkflowRuntime};
 use raftoral::grpc::start_grpc_server;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
@@ -100,12 +100,16 @@ async fn test_discovery_rpc() {
     transport.start().await.expect("Should start transport");
     let cluster = transport.create_cluster(1).await.expect("Should create cluster");
 
+    // Create workflow runtime
+    let runtime = WorkflowRuntime::new(cluster.clone());
+
     // Start gRPC server
     let _server = start_grpc_server(
         address.clone(),
         transport.clone(),
         cluster,
-        1
+        1,
+        runtime
     ).await.expect("Should start server");
 
     // Give server time to start
