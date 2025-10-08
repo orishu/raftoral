@@ -48,9 +48,8 @@ pub struct RaftNode<E: CommandExecutor> {
 
     // For multi-node communication
     mailbox: mpsc::UnboundedReceiver<Message<E::Command>>,
-    /// Shared reference to peer senders - same HashMap instance used by transport
-    /// This eliminates the need for AddPeerSender/RemovePeerSender synchronization
-    peers: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<Message<E::Command>>>>>,
+    /// Transport interface for sending messages to peers
+    transport: Arc<dyn crate::raft::generic::transport::TransportInteraction<E::Command>>,
     /// Cached Raft configuration (voter IDs) - shared with RaftCluster for direct access
     /// Updated whenever configuration changes, eliminating need for QueryConfig messages
     cached_config: Arc<RwLock<Vec<u64>>>,
@@ -73,22 +72,19 @@ pub struct RaftNode<E: CommandExecutor> {
 
     // Snapshot configuration
     snapshot_config: SnapshotConfig,
-
-    // Transport updater for dynamic peer management
-    transport_updater: Option<Arc<dyn crate::raft::generic::transport::TransportUpdater>>,
 }
 
 impl<E: CommandExecutor + 'static> RaftNode<E> {
     pub fn new(
         node_id: u64,
         mailbox: mpsc::UnboundedReceiver<Message<E::Command>>,
-        peers: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<Message<E::Command>>>>>,
+        transport: Arc<dyn crate::raft::generic::transport::TransportInteraction<E::Command>>,
         executor: Arc<E>,
         role_change_tx: broadcast::Sender<RoleChange>,
-        transport_updater: Option<Arc<dyn crate::raft::generic::transport::TransportUpdater>>,
         cached_config: Arc<RwLock<Vec<u64>>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let is_single_node = peers.read().unwrap().is_empty();
+        let node_count = transport.list_nodes().len();
+        let is_single_node = node_count == 1;
 
         let config = Config {
             id: node_id,
@@ -106,10 +102,9 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
 
         // Set up the initial cluster configuration
         let mut initial_state = ConfState::default();
-        // Add all nodes from peers HashMap (which includes self and all peers)
+        // Add all nodes from transport
         {
-            let peers_guard = peers.read().unwrap();
-            let mut voters: Vec<u64> = peers_guard.keys().copied().collect();
+            let mut voters = transport.list_nodes();
             voters.sort(); // Keep deterministic order
             for &peer_id in &voters {
                 initial_state.voters.push(peer_id);
@@ -133,7 +128,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             node_id,
             logger,
             mailbox,
-            peers,
+            transport,
             cached_config,
             sync_commands: HashMap::new(),
             next_command_id: AtomicU64::new(1),
@@ -142,7 +137,6 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             current_role: StateRole::Follower, // Start as follower
             committed_index: 0,
             snapshot_config: SnapshotConfig::default(),
-            transport_updater,
         };
 
         Ok(node)
@@ -272,16 +266,11 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
     }
 
     fn send_messages(&self, messages: Vec<raft::prelude::Message>) -> Result<(), Box<dyn std::error::Error>> {
-        let peers = self.peers.read().unwrap();
         for msg in messages {
-            if let Some(sender) = peers.get(&msg.to) {
-                let msg_to = msg.to;
-                let raft_msg = Message::Raft(msg);
-                if let Err(e) = sender.send(raft_msg) {
-                    slog::warn!(self.logger, "Failed to send message"; "to" => msg_to, "error" => %e);
-                }
-            } else {
-                slog::warn!(self.logger, "No sender for peer"; "peer_id" => msg.to);
+            let msg_to = msg.to;
+            let raft_msg = Message::Raft(msg);
+            if let Err(e) = self.transport.send_message_to_node(msg_to, raft_msg) {
+                slog::warn!(self.logger, "Failed to send message"; "to" => msg_to, "error" => %e);
             }
         }
         Ok(())
@@ -373,18 +362,18 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                     slog::info!(self.logger, "Adding node to cluster (v2)"; "node_id" => node_id);
 
                     // Update transport if metadata is available
+                    // Note: On leader this may be redundant (already added before propose)
+                    // but on followers this is the first time they learn about the new peer
                     if let Some(ref meta) = metadata {
                         if meta.node_id == node_id {
-                            if let Some(ref updater) = self.transport_updater {
-                                match updater.update_add_peer(meta.node_id, meta.address.clone()) {
-                                    Ok(()) => {
-                                        slog::info!(self.logger, "Updated transport with new peer";
-                                                   "node_id" => node_id, "address" => &meta.address);
-                                    }
-                                    Err(e) => {
-                                        slog::error!(self.logger, "Failed to add peer to transport";
-                                                    "node_id" => node_id, "address" => &meta.address, "error" => %e);
-                                    }
+                            match self.transport.add_peer(meta.node_id, meta.address.clone()) {
+                                Ok(()) => {
+                                    slog::info!(self.logger, "Updated transport with new peer";
+                                               "node_id" => node_id, "address" => &meta.address);
+                                }
+                                Err(e) => {
+                                    slog::error!(self.logger, "Failed to add peer to transport";
+                                                "node_id" => node_id, "address" => &meta.address, "error" => %e);
                                 }
                             }
                         }
@@ -396,15 +385,13 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                     self.executor.on_node_removed(node_id, &self.logger);
 
                     // Update transport to remove peer
-                    if let Some(ref updater) = self.transport_updater {
-                        match updater.update_remove_peer(node_id) {
-                            Ok(()) => {
-                                slog::info!(self.logger, "Removed peer from transport"; "node_id" => node_id);
-                            }
-                            Err(e) => {
-                                slog::error!(self.logger, "Failed to remove peer from transport";
-                                            "node_id" => node_id, "error" => %e);
-                            }
+                    match self.transport.remove_peer(node_id) {
+                        Ok(()) => {
+                            slog::info!(self.logger, "Removed peer from transport"; "node_id" => node_id);
+                        }
+                        Err(e) => {
+                            slog::error!(self.logger, "Failed to remove peer from transport";
+                                        "node_id" => node_id, "error" => %e);
                         }
                     }
                 },
@@ -414,16 +401,14 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                     // Same as AddNode for transport purposes
                     if let Some(ref meta) = metadata {
                         if meta.node_id == node_id {
-                            if let Some(ref updater) = self.transport_updater {
-                                match updater.update_add_peer(meta.node_id, meta.address.clone()) {
-                                    Ok(()) => {
-                                        slog::info!(self.logger, "Updated transport with new learner peer";
-                                                   "node_id" => node_id, "address" => &meta.address);
-                                    }
-                                    Err(e) => {
-                                        slog::error!(self.logger, "Failed to add learner peer to transport";
-                                                    "node_id" => node_id, "address" => &meta.address, "error" => %e);
-                                    }
+                            match self.transport.add_peer(meta.node_id, meta.address.clone()) {
+                                Ok(()) => {
+                                    slog::info!(self.logger, "Updated transport with new learner peer";
+                                               "node_id" => node_id, "address" => &meta.address);
+                                }
+                                Err(e) => {
+                                    slog::error!(self.logger, "Failed to add learner peer to transport";
+                                                "node_id" => node_id, "address" => &meta.address, "error" => %e);
                                 }
                             }
                         }
@@ -554,6 +539,23 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                             }
                         },
                         Some(Message::AddNode { node_id, address, callback }) => {
+                            // CRITICAL: Add peer to transport BEFORE proposing ConfChange
+                            // This ensures followers can receive messages immediately when they join
+                            match self.transport.add_peer(node_id, address.clone()) {
+                                Ok(()) => {
+                                    slog::info!(self.logger, "Added peer to transport"; "node_id" => node_id, "address" => &address);
+                                },
+                                Err(e) => {
+                                    slog::error!(self.logger, "Failed to add peer to transport"; "error" => %e, "node_id" => node_id);
+                                    if let Some(cb) = callback {
+                                        let err: Box<dyn std::error::Error + Send + Sync> =
+                                            format!("Failed to add peer to transport: {}", e).into();
+                                        let _ = cb.send(Err(err));
+                                    }
+                                    continue;
+                                }
+                            }
+
                             // Create ConfChangeV2 for adding node
                             let mut conf_change = ConfChangeV2::default();
                             let mut change = ConfChangeSingle::default();

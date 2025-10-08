@@ -60,13 +60,19 @@ async fn test_three_node_grpc_cluster_bootstrap() {
     let addr2 = format!("127.0.0.1:{}", port2);
     println!("  Node 2 address: {}", addr2);
 
-    // Create transport with node 2 AND node 1 (discovered peer)
-    // This ensures node 2's Raft instance knows about node 1 from the start
+    // IMPORTANT: Create transport with ONLY node 2 initially
     let transport2 = Arc::new(GrpcClusterTransport::<WorkflowCommandExecutor>::new(vec![
-        NodeConfig { node_id: 1, address: addr1.clone() },
         NodeConfig { node_id: 2, address: addr2.clone() },
     ]));
     transport2.start().await.expect("Transport 2 should start");
+
+    // CRITICAL: Add node 1 to transport BEFORE creating cluster
+    // This prevents node 2 from being detected as single-node and campaigning
+    transport2.add_node(NodeConfig { node_id: 1, address: addr1.clone() }).await
+        .expect("Should add node 1 to transport 2");
+
+    // Give time for gRPC client to be created
+    sleep(Duration::from_millis(100)).await;
 
     let cluster2 = transport2.create_cluster(2).await.expect("Should create cluster 2");
     let runtime2 = WorkflowRuntime::new(cluster2.clone());
@@ -79,7 +85,11 @@ async fn test_three_node_grpc_cluster_bootstrap() {
         runtime2.clone()
     ).await.expect("Should start server 2");
 
+    // Give server time to be fully ready
+    sleep(Duration::from_millis(200)).await;
+
     // Add node 2 to the cluster via node 1 (the leader)
+    // Node 1 will propose the ConfChange and send it to node 2
     println!("  Adding node 2 to cluster via ConfChange...");
     cluster1.add_node(2, addr2.clone()).await
         .expect("Should add node 2 to cluster");
@@ -87,7 +97,12 @@ async fn test_three_node_grpc_cluster_bootstrap() {
     println!("✓ Node 2 added to cluster\n");
 
     // Give time for the ConfChange to propagate and nodes to sync
-    sleep(Duration::from_millis(2000)).await;
+    // IMPORTANT: Need significant time for 2-node cluster to establish stable quorum
+    // Node 2 needs to receive the full log from node 1 before it can commit
+    // This includes the initial empty entry and the ConfChange entry
+    // Raft log backtracking and replication can take multiple election timeouts
+    // Wait for cluster to stabilize with both nodes in sync
+    sleep(Duration::from_millis(10000)).await;
 
     // Step 3: Add third node
     println!("Step 3: Adding third node (node 3)");
@@ -101,14 +116,21 @@ async fn test_three_node_grpc_cluster_bootstrap() {
     let addr3 = format!("127.0.0.1:{}", port3);
     println!("  Node 3 address: {}", addr3);
 
-    // Create transport with node 3 AND the discovered peers
-    // This ensures node 3's Raft instance knows about all nodes from the start
+    // IMPORTANT: Create transport with ONLY node 3 initially
     let transport3 = Arc::new(GrpcClusterTransport::<WorkflowCommandExecutor>::new(vec![
-        NodeConfig { node_id: 1, address: addr1.clone() },
-        NodeConfig { node_id: 2, address: addr2.clone() },
         NodeConfig { node_id: 3, address: addr3.clone() },
     ]));
     transport3.start().await.expect("Transport 3 should start");
+
+    // CRITICAL: Add existing cluster members to transport BEFORE creating cluster
+    // This prevents node 3 from being detected as single-node and campaigning
+    transport3.add_node(NodeConfig { node_id: 1, address: addr1.clone() }).await
+        .expect("Should add node 1 to transport 3");
+    transport3.add_node(NodeConfig { node_id: 2, address: addr2.clone() }).await
+        .expect("Should add node 2 to transport 3");
+
+    // Give time for gRPC clients to be created
+    sleep(Duration::from_millis(100)).await;
 
     let cluster3 = transport3.create_cluster(3).await.expect("Should create cluster 3");
     let runtime3 = WorkflowRuntime::new(cluster3.clone());
@@ -121,8 +143,11 @@ async fn test_three_node_grpc_cluster_bootstrap() {
         runtime3.clone()
     ).await.expect("Should start server 3");
 
-    // Add node 3 to the cluster
-    // Note: add_node automatically routes to the leader, so we can call it from any node
+    // Give node 3's server a moment to be fully ready before adding to cluster
+    sleep(Duration::from_millis(500)).await;
+
+    // Add node 3 to the cluster via the existing cluster (node 1)
+    // Note: add_node automatically routes to the leader
     println!("  Adding node 3 to cluster via ConfChange...");
     cluster1.add_node(3, addr3.clone()).await
         .expect("Should add node 3 to cluster");

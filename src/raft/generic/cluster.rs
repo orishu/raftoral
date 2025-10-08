@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::{mpsc, broadcast};
@@ -15,7 +14,7 @@ pub enum RoleChange {
 
 #[derive(Clone)]
 pub struct RaftCluster<E: CommandExecutor> {
-    node_senders: HashMap<u64, mpsc::UnboundedSender<Message<E::Command>>>,
+    transport: Arc<dyn crate::raft::generic::transport::TransportInteraction<E::Command>>,
     node_count: usize,
     // Role change notifications
     role_change_tx: broadcast::Sender<RoleChange>,
@@ -42,15 +41,13 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
     /// # Arguments
     /// * `node_id` - Unique identifier for this node
     /// * `receiver` - Channel to receive messages for this node
-    /// * `node_senders` - Shared map of all node IDs to their message senders
+    /// * `transport` - Transport implementation for sending messages to peers
     /// * `executor` - Command executor for applying committed commands
-    /// * `transport_updater` - Optional transport updater for dynamic peer management
     pub async fn new_with_transport(
         node_id: u64,
         receiver: mpsc::UnboundedReceiver<Message<E::Command>>,
-        node_senders: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<Message<E::Command>>>>>,
+        transport: Arc<dyn crate::raft::generic::transport::TransportInteraction<E::Command>>,
         executor: E,
-        transport_updater: Option<Arc<dyn crate::raft::generic::transport::TransportUpdater>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Create role change broadcast channel
         let (role_change_tx, _role_change_rx) = broadcast::channel(100);
@@ -60,15 +57,12 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
         // Set node ID on executor (for ownership checks)
         executor_arc.set_node_id(node_id);
 
-        let node_count = node_senders.read().unwrap().len();
+        let node_count = transport.list_nodes().len();
 
         // Determine if this is a single-node or multi-node setup
         let is_single_node = node_count == 1;
 
         let leader_id_arc = Arc::new(AtomicU64::new(0)); // 0 = unknown
-
-        // Build a flat node_senders HashMap for RaftCluster (keeps the old structure for now)
-        let node_senders_flat = node_senders.read().unwrap().clone();
 
         // Spawn a task to listen for role changes and update leader_id
         let leader_id_listener = leader_id_arc.clone();
@@ -85,16 +79,15 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
         // Create cached_config - will be populated by RaftNode::new
         let cached_config_arc = Arc::new(RwLock::new(Vec::new()));
 
-        // Create and spawn the Raft node with shared node_senders Arc
+        // Create and spawn the Raft node with transport reference
         let role_tx_for_node = role_change_tx.clone();
-        let node_senders_for_node = node_senders.clone();
+        let transport_for_node = transport.clone();
         let node = RaftNode::<E>::new(
             node_id,
             receiver,
-            node_senders_for_node,
+            transport_for_node,
             executor_arc.clone(),
             role_tx_for_node,
-            transport_updater,
             cached_config_arc.clone(),
         )?;
 
@@ -108,7 +101,7 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
 
         // Create cluster with the cached_config shared with the node
         let cluster = RaftCluster {
-            node_senders: node_senders_flat,
+            transport,
             node_count,
             role_change_tx: role_change_tx.clone(),
             next_command_id: Arc::new(AtomicU64::new(1)),
@@ -129,84 +122,20 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
         Ok(cluster)
     }
 
-    pub async fn new_single_node(node_id: u64, executor: E) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut node_senders_map = HashMap::new();
-        let (sender, receiver) = mpsc::unbounded_channel();
-
-        node_senders_map.insert(node_id, sender.clone());
-
-        // Wrap in Arc<RwLock> for sharing with RaftNode
-        let node_senders_shared = Arc::new(RwLock::new(node_senders_map.clone()));
-
-        // Create role change broadcast channel
-        let (role_change_tx, _role_change_rx) = broadcast::channel(100);
-
-        let executor_arc = Arc::new(executor);
-
-        let leader_id_arc = Arc::new(AtomicU64::new(node_id)); // Single node is always leader
-
-        // Create cached_config - will be populated by RaftNode::new
-        let cached_config_arc = Arc::new(RwLock::new(Vec::new()));
-
-        // Create the RaftNode with cached_config
-        let role_tx_clone = role_change_tx.clone();
-        let node = RaftNode::<E>::new(
-            node_id,
-            receiver,
-            node_senders_shared,
-            executor_arc.clone(),
-            role_tx_clone,
-            None,
-            cached_config_arc.clone(),
-        )?;
-
-        // Build cluster with the cached_config shared with the node
-        let cluster = RaftCluster {
-            node_senders: node_senders_map,
-            node_count: 1,
-            role_change_tx: role_change_tx.clone(),
-            next_command_id: Arc::new(AtomicU64::new(1)),
-            executor: executor_arc.clone(),
-            leader_id: leader_id_arc.clone(),
-            node_id,
-            cached_config: cached_config_arc,
-        };
-
-        // Spawn task to run the node
-        tokio::spawn(async move {
-            let mut n = node;
-            if let Err(e) = n.run().await {
-                eprintln!("Node {} exited with error: {}", node_id, e);
-            }
-        });
-
-        // Give the node time to initialize
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // For single node, manually trigger campaign to become leader
-        cluster.campaign().await?;
-
-        Ok(cluster)
-    }
-
     /// Generic method to propose any command using the CommandExecutor pattern
     pub async fn propose_command(&self, command: E::Command) -> Result<bool, Box<dyn std::error::Error>> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
 
         // Send to this node's local Raft instance, which will forward to leader if needed
-        if let Some(node_sender) = self.node_senders.get(&self.node_id) {
-            node_sender.send(Message::Propose {
-                id: 0,
-                callback: Some(sender),
-                sync_callback: None,
-                command,
-            })?;
+        self.transport.send_message_to_node(self.node_id, Message::Propose {
+            id: 0,
+            callback: Some(sender),
+            sync_callback: None,
+            command,
+        }).map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
 
-            let result = receiver.await?;
-            Ok(result)
-        } else {
-            Err("Local node sender not found".into())
-        }
+        let result = receiver.await?;
+        Ok(result)
     }
 
     /// Send a message to the leader node with retry logic
@@ -224,16 +153,14 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
         for retry in 0..max_retries {
             // If this node is the leader, try sending to self first
             if self.leader_id.load(Ordering::SeqCst) == self.node_id {
-                if let Some(self_sender) = self.node_senders.get(&self.node_id) {
-                    let (sender, receiver) = tokio::sync::oneshot::channel();
-                    let message = create_message(sender);
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                let message = create_message(sender);
 
-                    if self_sender.send(message).is_ok() {
-                        match tokio::time::timeout(std::time::Duration::from_millis(500), receiver).await {
-                            Ok(Ok(result)) => return Ok(result),
-                            _ => {
-                                // Failed as leader
-                            }
+                if self.transport.send_message_to_node(self.node_id, message).is_ok() {
+                    match tokio::time::timeout(std::time::Duration::from_millis(500), receiver).await {
+                        Ok(Ok(result)) => return Ok(result),
+                        _ => {
+                            // Failed as leader
                         }
                     }
                 }
@@ -244,16 +171,14 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
 
             // Try sending to known leader
             if known_leader_id != 0 && known_leader_id != self.node_id {
-                if let Some(leader_sender) = self.node_senders.get(&known_leader_id) {
-                    let (sender, receiver) = tokio::sync::oneshot::channel();
-                    let message = create_message(sender);
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                let message = create_message(sender);
 
-                    if leader_sender.send(message).is_ok() {
-                        match tokio::time::timeout(std::time::Duration::from_millis(500), receiver).await {
-                            Ok(Ok(result)) => return Ok(result),
-                            _ => {
-                                // Known leader failed, will try discovery
-                            }
+                if self.transport.send_message_to_node(known_leader_id, message).is_ok() {
+                    match tokio::time::timeout(std::time::Duration::from_millis(500), receiver).await {
+                        Ok(Ok(result)) => return Ok(result),
+                        _ => {
+                            // Known leader failed, will try discovery
                         }
                     }
                 }
@@ -261,15 +186,16 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
 
             // Leader unknown or failed - try scanning all nodes to find the leader
             // This is a fallback for when the role change subscription misses the initial election
-            for (node_id, sender) in &self.node_senders {
+            let node_ids = self.transport.list_nodes();
+            for node_id in node_ids {
                 let (test_sender, test_receiver) = tokio::sync::oneshot::channel();
                 let test_message = create_message(test_sender);
 
-                if sender.send(test_message).is_ok() {
+                if self.transport.send_message_to_node(node_id, test_message).is_ok() {
                     match tokio::time::timeout(std::time::Duration::from_millis(500), test_receiver).await {
                         Ok(Ok(result)) => {
                             // Found the leader! Update our cached leader_id
-                            self.leader_id.store(*node_id, Ordering::SeqCst);
+                            self.leader_id.store(node_id, Ordering::SeqCst);
                             return Ok(result);
                         },
                         _ => {
@@ -298,16 +224,14 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
 
             if let Ok(Some(leader_id)) = wait_result {
                 // We learned who the leader is, try sending to them
-                if let Some(leader_sender) = self.node_senders.get(&leader_id) {
-                    let (sender, receiver) = tokio::sync::oneshot::channel();
-                    let message = create_message(sender);
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                let message = create_message(sender);
 
-                    if leader_sender.send(message).is_ok() {
-                        match tokio::time::timeout(std::time::Duration::from_millis(500), receiver).await {
-                            Ok(Ok(result)) => return Ok(result),
-                            _ => {
-                                // Failed, will retry
-                            }
+                if self.transport.send_message_to_node(leader_id, message).is_ok() {
+                    match tokio::time::timeout(std::time::Duration::from_millis(500), receiver).await {
+                        Ok(Ok(result)) => return Ok(result),
+                        _ => {
+                            // Failed, will retry
                         }
                     }
                 }
@@ -405,16 +329,12 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
     pub async fn campaign(&self) -> Result<bool, Box<dyn std::error::Error>> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
 
-        if let Some(node_sender) = self.node_senders.get(&self.node_id) {
-            node_sender.send(Message::Campaign {
-                callback: Some(sender),
-            })?;
+        self.transport.send_message_to_node(self.node_id, Message::Campaign {
+            callback: Some(sender),
+        }).map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
 
-            let result = receiver.await?;
-            Ok(result)
-        } else {
-            Err("Local node sender not found".into())
-        }
+        let result = receiver.await?;
+        Ok(result)
     }
 
 }
@@ -446,6 +366,7 @@ mod tests {
         Noop,
     }
 
+    #[derive(Default)]
     struct TestCommandExecutor;
 
     impl CommandExecutor for TestCommandExecutor {
@@ -472,8 +393,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_single_node_cluster_creation() {
-        let executor = TestCommandExecutor;
-        let cluster = RaftCluster::new_single_node(1, executor).await;
+        use crate::raft::generic::transport::{InMemoryClusterTransport, ClusterTransport};
+
+        let transport = Arc::new(InMemoryClusterTransport::<TestCommandExecutor>::new(vec![1]));
+        transport.start().await.expect("Transport start should succeed");
+
+        let cluster = transport.create_cluster(1).await;
         assert!(cluster.is_ok());
 
         let cluster = cluster.unwrap();
@@ -483,13 +408,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_single_node_propose_and_apply() {
+        use crate::raft::generic::transport::{InMemoryClusterTransport, ClusterTransport};
         const TEST_PREFIX: &str = "test1_";
 
         // Clear any previous test state for this prefix
         clear_test_state_for_prefix(TEST_PREFIX);
 
-        let executor = TestCommandExecutor;
-        let cluster = RaftCluster::new_single_node(1, executor).await
+        let transport = Arc::new(InMemoryClusterTransport::<TestCommandExecutor>::new(vec![1]));
+        transport.start().await.expect("Transport start should succeed");
+
+        let cluster = transport.create_cluster(1).await
             .expect("Failed to create single node cluster");
 
         // Wait for leadership establishment
@@ -583,13 +511,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_commands_sequential() {
+        use crate::raft::generic::transport::{InMemoryClusterTransport, ClusterTransport};
         const TEST_PREFIX: &str = "test2_";
 
         // Clear any previous test state for this prefix
         clear_test_state_for_prefix(TEST_PREFIX);
 
-        let executor = TestCommandExecutor;
-        let cluster = RaftCluster::new_single_node(1, executor).await
+        let transport = Arc::new(InMemoryClusterTransport::<TestCommandExecutor>::new(vec![1]));
+        transport.start().await.expect("Transport start should succeed");
+
+        let cluster = transport.create_cluster(1).await
             .expect("Failed to create single node cluster");
 
         // Wait for leadership establishment

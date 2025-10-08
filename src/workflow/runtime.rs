@@ -116,10 +116,16 @@ impl WorkflowRuntime {
         runtime
     }
 
-    /// Create a new workflow runtime and cluster
+    /// Create a new workflow runtime and cluster with in-memory transport
     pub async fn new_single_node(node_id: u64) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
-        let executor = WorkflowCommandExecutor::new();
-        let cluster = Arc::new(RaftCluster::new_single_node(node_id, executor).await?);
+        use crate::raft::generic::transport::{InMemoryClusterTransport, ClusterTransport};
+
+        // Create in-memory transport for single node
+        let transport = Arc::new(InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![node_id]));
+        transport.start().await?;
+
+        // Create cluster via transport
+        let cluster = transport.create_cluster(node_id).await?;
 
         let runtime = Arc::new(WorkflowRuntime {
             cluster: cluster.clone(),
@@ -127,9 +133,6 @@ impl WorkflowRuntime {
 
         // Set the runtime reference in the executor so it can spawn workflows
         cluster.executor.set_runtime(runtime.clone());
-
-        // Set the node ID in the executor for ownership checks
-        cluster.executor.set_node_id(node_id);
 
         Ok(runtime)
     }

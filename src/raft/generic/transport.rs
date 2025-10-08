@@ -5,14 +5,41 @@ use serde::{Serialize, Deserialize};
 use crate::raft::generic::message::{Message, CommandExecutor};
 use crate::raft::generic::cluster::RaftCluster;
 
-/// Trait for handling transport updates from RaftNode
-/// Implemented by ClusterTransport to handle dynamic peer management
-pub trait TransportUpdater: Send + Sync {
-    /// Add a peer to the transport
-    fn update_add_peer(&self, node_id: u64, address: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+/// Unified interface for Raft nodes to interact with the transport layer
+///
+/// This trait provides all necessary operations for RaftCluster and RaftNode to
+/// communicate with peers without directly accessing transport internals.
+/// Generic over command type C to avoid associated type complexities.
+pub trait TransportInteraction<C>: Send + Sync
+where
+    C: Clone + std::fmt::Debug + serde::Serialize + for<'de> serde::Deserialize<'de> + Send + Sync + 'static,
+{
+    /// Send a message to a specific node
+    /// Returns error if node doesn't exist or send fails
+    fn send_message_to_node(
+        &self,
+        target_node_id: u64,
+        message: Message<C>
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
-    /// Remove a peer from the transport
-    fn update_remove_peer(&self, node_id: u64) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+    /// Get list of all known node IDs
+    /// Used by send_to_leader to scan for the leader
+    fn list_nodes(&self) -> Vec<u64>;
+
+    /// Add a peer to the transport (for dynamic membership)
+    /// Called by RaftNode when applying AddNode ConfChange
+    fn add_peer(
+        &self,
+        node_id: u64,
+        address: String
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Remove a peer from the transport (for dynamic membership)
+    /// Called by RaftNode when applying RemoveNode ConfChange
+    fn remove_peer(
+        &self,
+        node_id: u64
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
 /// Metadata about a node's transport address
@@ -151,14 +178,15 @@ impl<E: CommandExecutor + Default + 'static> ClusterTransport<E> for InMemoryClu
                 .ok_or_else(|| format!("Node {} receiver already claimed or doesn't exist", node_id))?
         };
 
-        // Create the cluster with shared node_senders
-        // In-memory transport has fixed nodes, so no transport update channel needed
+        // Create transport interface as Arc<dyn TransportInteraction>
+        let transport: Arc<dyn TransportInteraction<E::Command>> = self.clone();
+
+        // Create the cluster with transport interface
         let cluster = RaftCluster::new_with_transport(
             node_id,
             receiver,
-            self.node_senders.clone(), // Share the same HashMap instance
+            transport,
             executor,
-            None, // No transport updates for in-memory (fixed nodes)
         ).await?;
 
         Ok(Arc::new(cluster))
@@ -189,6 +217,39 @@ impl<E: CommandExecutor + Default + 'static> ClusterTransport<E> for InMemoryClu
     }
 
     fn remove_peer(&self, _node_id: u64) -> Result<(), Box<dyn std::error::Error>> {
+        // In-memory transport - no-op
+        Ok(())
+    }
+}
+
+// Implement TransportInteraction for InMemoryClusterTransport
+impl<E: CommandExecutor + 'static> TransportInteraction<E::Command> for InMemoryClusterTransport<E> {
+    fn send_message_to_node(
+        &self,
+        target_node_id: u64,
+        message: Message<E::Command>
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let senders = self.node_senders.read().unwrap();
+        let sender = senders.get(&target_node_id)
+            .ok_or_else(|| format!("Node {} not found", target_node_id))?;
+
+        sender.send(message)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        Ok(())
+    }
+
+    fn list_nodes(&self) -> Vec<u64> {
+        self.node_senders.read().unwrap().keys().copied().collect()
+    }
+
+    fn add_peer(&self, _node_id: u64, _address: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // In-memory transport has fixed nodes at construction time
+        // This is a no-op for testing - nodes are pre-configured
+        Ok(())
+    }
+
+    fn remove_peer(&self, _node_id: u64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // In-memory transport - no-op
         Ok(())
     }

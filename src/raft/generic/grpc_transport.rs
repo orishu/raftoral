@@ -13,6 +13,22 @@ pub struct NodeConfig {
     pub address: String,  // host:port
 }
 
+/// All components needed to send messages to a peer node
+/// Consolidates sender, gRPC client, and forwarder handle for atomic management
+struct Destination<C>
+where
+    C: Clone + std::fmt::Debug + serde::Serialize + for<'de> serde::Deserialize<'de> + Send + Sync + 'static,
+{
+    /// Channel to send messages to this node
+    sender: mpsc::UnboundedSender<Message<C>>,
+
+    /// gRPC client for remote communication (None for local node or not yet connected)
+    grpc_client: Option<Arc<tokio::sync::Mutex<RaftClient>>>,
+
+    /// Forwarder task handle (None for local node)
+    forwarder_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
 /// Generic gRPC-based transport for distributed Raft clusters
 ///
 /// This transport enables Raft nodes to communicate over network via gRPC.
@@ -22,18 +38,18 @@ pub struct NodeConfig {
 /// The transport is generic over the CommandExecutor type, but the actual
 /// gRPC protocol is defined for specific command types (e.g., WorkflowCommand).
 pub struct GrpcClusterTransport<E: CommandExecutor> {
+    /// Unified peer management: node_id -> all communication components
+    destinations: Arc<RwLock<HashMap<u64, Destination<E::Command>>>>,
+
     /// Node configurations (node_id -> address)
     nodes: Arc<RwLock<HashMap<u64, NodeConfig>>>,
+
     /// Receivers for each node (held until create_cluster is called)
     node_receivers: Arc<Mutex<HashMap<u64, mpsc::UnboundedReceiver<Message<E::Command>>>>>,
-    /// Senders for each node (node_id -> sender to that node's receiver)
-    node_senders: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<Message<E::Command>>>>>,
-    /// gRPC clients for sending to remote nodes (node_id -> client)
-    grpc_clients: Arc<RwLock<HashMap<u64, Arc<tokio::sync::Mutex<RaftClient>>>>>,
-    /// Background task handles for message forwarding
-    forwarder_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+
     /// Shutdown signal
     shutdown_tx: Arc<Mutex<Option<tokio::sync::broadcast::Sender<()>>>>,
+
     /// Custom channel builder for gRPC connections
     channel_builder: ChannelBuilder,
 }
@@ -82,23 +98,28 @@ impl<E: CommandExecutor> GrpcClusterTransport<E> {
     /// ```
     pub fn new_with_channel_builder(nodes: Vec<NodeConfig>, channel_builder: ChannelBuilder) -> Self {
         let mut node_map = HashMap::new();
-        let mut node_senders = HashMap::new();
+        let mut destinations_map = HashMap::new();
         let mut node_receivers_map = HashMap::new();
 
         // Create channels for each node
         for node in nodes {
             let (sender, receiver) = mpsc::unbounded_channel();
-            node_senders.insert(node.node_id, sender);
+
+            // Create destination with sender only (no client/forwarder yet)
+            destinations_map.insert(node.node_id, Destination {
+                sender,
+                grpc_client: None,
+                forwarder_handle: None,
+            });
+
             node_receivers_map.insert(node.node_id, receiver);
             node_map.insert(node.node_id, node);
         }
 
         GrpcClusterTransport {
+            destinations: Arc::new(RwLock::new(destinations_map)),
             nodes: Arc::new(RwLock::new(node_map)),
             node_receivers: Arc::new(Mutex::new(node_receivers_map)),
-            node_senders: Arc::new(RwLock::new(node_senders)),
-            grpc_clients: Arc::new(RwLock::new(HashMap::new())),
-            forwarder_handles: Arc::new(Mutex::new(Vec::new())),
             shutdown_tx: Arc::new(Mutex::new(None)),
             channel_builder,
         }
@@ -106,29 +127,52 @@ impl<E: CommandExecutor> GrpcClusterTransport<E> {
 
     /// Add a new node to the transport configuration
     pub async fn add_node(&self, node: NodeConfig) -> Result<(), Box<dyn std::error::Error>> {
-        let mut nodes = self.nodes.write().unwrap();
-        let mut senders = self.node_senders.write().unwrap();
-        let mut receivers = self.node_receivers.lock().unwrap();
-
         // Create channel for the new node
         let (sender, receiver) = mpsc::unbounded_channel();
 
-        senders.insert(node.node_id, sender);
-        receivers.insert(node.node_id, receiver);
-        nodes.insert(node.node_id, node);
+        // Create destination with sender only (no client/forwarder yet)
+        let destination = Destination {
+            sender,
+            grpc_client: None,
+            forwarder_handle: None,
+        };
+
+        // Insert atomically
+        {
+            let mut destinations = self.destinations.write().unwrap();
+            destinations.insert(node.node_id, destination);
+        }
+
+        {
+            let mut receivers = self.node_receivers.lock().unwrap();
+            receivers.insert(node.node_id, receiver);
+        }
+
+        {
+            let mut nodes = self.nodes.write().unwrap();
+            nodes.insert(node.node_id, node);
+        }
 
         Ok(())
     }
 
     /// Remove a node from the transport configuration
     pub async fn remove_node(&self, node_id: u64) -> Result<(), Box<dyn std::error::Error>> {
-        let mut nodes = self.nodes.write().unwrap();
-        let mut senders = self.node_senders.write().unwrap();
-        let mut receivers = self.node_receivers.lock().unwrap();
+        // Remove destination (forwarder will exit when sender is dropped)
+        {
+            let mut destinations = self.destinations.write().unwrap();
+            destinations.remove(&node_id);
+        }
 
-        nodes.remove(&node_id);
-        senders.remove(&node_id);
-        receivers.remove(&node_id);
+        {
+            let mut receivers = self.node_receivers.lock().unwrap();
+            receivers.remove(&node_id);
+        }
+
+        {
+            let mut nodes = self.nodes.write().unwrap();
+            nodes.remove(&node_id);
+        }
 
         Ok(())
     }
@@ -147,8 +191,8 @@ impl<E: CommandExecutor> GrpcClusterTransport<E> {
 
     /// Internal method to get a sender for a specific node
     pub async fn get_node_sender(&self, node_id: u64) -> Option<mpsc::UnboundedSender<Message<E::Command>>> {
-        let senders = self.node_senders.read().unwrap();
-        senders.get(&node_id).cloned()
+        let destinations = self.destinations.read().unwrap();
+        destinations.get(&node_id).map(|dest| dest.sender.clone())
     }
 
     /// Spawn a background task that forwards messages to a remote peer via gRPC
@@ -158,16 +202,16 @@ impl<E: CommandExecutor> GrpcClusterTransport<E> {
         mut forwarder_rx: mpsc::UnboundedReceiver<Message<E::Command>>,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     ) -> tokio::task::JoinHandle<()> {
-        let grpc_clients = self.grpc_clients.clone();
+        let destinations = self.destinations.clone();
 
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     Some(message) = forwarder_rx.recv() => {
-                        // Get the gRPC client for this node
+                        // Get the gRPC client for this node from destination
                         let client_arc = {
-                            let clients = grpc_clients.read().unwrap();
-                            clients.get(&target_node_id).cloned()
+                            let dests = destinations.read().unwrap();
+                            dests.get(&target_node_id).and_then(|dest| dest.grpc_client.clone())
                         };
 
                         if let Some(client) = client_arc {
@@ -212,48 +256,42 @@ impl<E: CommandExecutor + Default + 'static> ClusterTransport<E> for GrpcCluster
         };
 
         // Create forwarders for outgoing messages to remote peers
-        // Each forwarder monitors the shared node_senders channel for a specific peer
-        // and forwards Raft messages via gRPC to that peer
+        // Each forwarder reads from its channel and sends via gRPC
         let peer_ids: Vec<u64> = {
-            let senders = self.node_senders.read().unwrap();
-            senders.keys()
+            let dests = self.destinations.read().unwrap();
+            dests.keys()
                 .filter(|&&id| id != node_id)
                 .copied()
                 .collect()
         };
 
-        let mut forwarder_handles_vec = Vec::new();
         for peer_id in peer_ids {
-            // Create a channel that will replace the direct sender in node_senders
-            // The forwarder reads from this channel and sends via gRPC
+            // Create a channel that will replace the direct sender in destinations
             let (forwarder_tx, forwarder_rx) = mpsc::unbounded_channel();
-
-            // Replace the direct sender with the forwarder sender in the shared HashMap
-            // This way when RaftNode sends to this peer, it goes through the forwarder
-            {
-                let mut senders_mut = self.node_senders.write().unwrap();
-                senders_mut.insert(peer_id, forwarder_tx);
-            }
 
             // Spawn forwarder task for this peer
             let handle = self.spawn_peer_forwarder(peer_id, forwarder_rx, shutdown_rx.resubscribe());
-            forwarder_handles_vec.push(handle);
+
+            // Update destination to use forwarder sender and store handle
+            {
+                let mut dests = self.destinations.write().unwrap();
+                if let Some(dest) = dests.get_mut(&peer_id) {
+                    dest.sender = forwarder_tx;
+                    dest.forwarder_handle = Some(handle);
+                }
+            }
         }
 
-        // Store all forwarder handles
-        {
-            let mut handles = self.forwarder_handles.lock().unwrap();
-            handles.extend(forwarder_handles_vec);
-        }
+        // Create the cluster with transport reference
+        // Cast self to Arc<dyn TransportInteraction>
+        let transport: Arc<dyn crate::raft::generic::transport::TransportInteraction<E::Command>> =
+            self.clone() as Arc<dyn crate::raft::generic::transport::TransportInteraction<E::Command>>;
 
-        // Create the cluster with shared node_senders Arc
-        // Pass self as the transport updater (implements TransportUpdater trait)
         let cluster = RaftCluster::new_with_transport(
             node_id,
             receiver,
-            self.node_senders.clone(), // Share the same HashMap instance
+            transport,
             executor,
-            Some(Arc::clone(self) as Arc<dyn crate::raft::generic::transport::TransportUpdater>),
         ).await?;
 
         Ok(Arc::new(cluster))
@@ -284,8 +322,10 @@ impl<E: CommandExecutor + Default + 'static> ClusterTransport<E> for GrpcCluster
                 self.channel_builder.clone()
             ).await {
                 Ok(client) => {
-                    let mut clients = self.grpc_clients.write().unwrap();
-                    clients.insert(node.node_id, Arc::new(tokio::sync::Mutex::new(client)));
+                    let mut dests = self.destinations.write().unwrap();
+                    if let Some(dest) = dests.get_mut(&node.node_id) {
+                        dest.grpc_client = Some(Arc::new(tokio::sync::Mutex::new(client)));
+                    }
                 }
                 Err(e) => {
                     eprintln!("Warning: Failed to connect to node {}: {}", node.node_id, e);
@@ -323,40 +363,39 @@ impl<E: CommandExecutor + Default + 'static> ClusterTransport<E> for GrpcCluster
             nodes.insert(node_id, node_config.clone());
         }
 
-        // Create sender/receiver pair for this node
-        let (tx, rx) = mpsc::unbounded_channel();
-
-        {
-            let mut senders = self.node_senders.write().unwrap();
-            senders.insert(node_id, tx.clone());
-        }
+        // Create receiver for this node (will be claimed when cluster is created)
+        let (_tx, rx) = mpsc::unbounded_channel();
 
         {
             let mut receivers = self.node_receivers.lock().unwrap();
             receivers.insert(node_id, rx);
         }
 
-        // Get shutdown receiver for forwarders
-        let _shutdown_rx = {
+        // Get shutdown receiver for forwarder
+        let shutdown_rx = {
             let shutdown_tx = self.shutdown_tx.lock().unwrap();
             shutdown_tx.as_ref()
                 .ok_or("Transport not started")?
                 .subscribe()
         };
 
-        // Note: No need to notify existing nodes with AddPeerSender messages.
-        // When nodes apply the ConfChange, they all call add_peer() on their local transport,
-        // which shares the node_senders HashMap. Since node_senders is shared via Arc<RwLock>,
-        // the new peer is immediately visible to all RaftNodes without explicit notification.
+        // CRITICAL: Create forwarder channel and spawn forwarder task
+        let (forwarder_tx, forwarder_rx) = mpsc::unbounded_channel();
+
+        // Spawn the forwarder task for this peer
+        let handle = self.spawn_peer_forwarder(node_id, forwarder_rx, shutdown_rx);
 
         // Spawn async task to create gRPC client
-        let grpc_clients = self.grpc_clients.clone();
+        let destinations = self.destinations.clone();
         let channel_builder = self.channel_builder.clone();
         tokio::spawn(async move {
             match RaftClient::connect_with_channel_builder(address.clone(), channel_builder).await {
                 Ok(client) => {
-                    let mut clients = grpc_clients.write().unwrap();
-                    clients.insert(node_id, Arc::new(tokio::sync::Mutex::new(client)));
+                    // Update destination with gRPC client
+                    let mut dests = destinations.write().unwrap();
+                    if let Some(dest) = dests.get_mut(&node_id) {
+                        dest.grpc_client = Some(Arc::new(tokio::sync::Mutex::new(client)));
+                    }
                 }
                 Err(e) => {
                     eprintln!("Warning: Failed to connect to node {}: {}", node_id, e);
@@ -364,14 +403,26 @@ impl<E: CommandExecutor + Default + 'static> ClusterTransport<E> for GrpcCluster
             }
         });
 
+        // Insert complete destination atomically
+        {
+            let mut dests = self.destinations.write().unwrap();
+            dests.insert(node_id, Destination {
+                sender: forwarder_tx,
+                grpc_client: None, // Will be set async above
+                forwarder_handle: Some(handle),
+            });
+        }
+
         Ok(())
     }
 
     fn remove_peer(&self, node_id: u64) -> Result<(), Box<dyn std::error::Error>> {
-        // Remove from shared maps - all RaftNodes see the change immediately
+        // Remove destination (forwarder will exit when sender is dropped)
+        self.destinations.write().unwrap().remove(&node_id);
+
+        // Remove from nodes map
         self.nodes.write().unwrap().remove(&node_id);
-        self.node_senders.write().unwrap().remove(&node_id);
-        self.grpc_clients.write().unwrap().remove(&node_id);
+
         // Note: receiver is consumed when cluster is created, can't remove
         // Forwarder will stop when shutdown_rx fires or sender is dropped
 
@@ -379,17 +430,48 @@ impl<E: CommandExecutor + Default + 'static> ClusterTransport<E> for GrpcCluster
     }
 }
 
-impl<E: CommandExecutor + Default + 'static> crate::raft::generic::transport::TransportUpdater for GrpcClusterTransport<E> {
-    fn update_add_peer(&self, node_id: u64, address: String) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.add_peer(node_id, address).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("{}", e).into()
-        })
+// Implement TransportInteraction trait for unified transport interaction
+impl<E: CommandExecutor + Default + 'static> crate::raft::generic::transport::TransportInteraction<E::Command> for GrpcClusterTransport<E> {
+    fn send_message_to_node(
+        &self,
+        target_node_id: u64,
+        message: Message<E::Command>
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let destinations = self.destinations.read().unwrap();
+        let dest = destinations.get(&target_node_id)
+            .ok_or_else(|| format!("Node {} not found", target_node_id))?;
+
+        dest.sender.send(message)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        Ok(())
     }
 
-    fn update_remove_peer(&self, node_id: u64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.remove_peer(node_id).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("{}", e).into()
-        })
+    fn list_nodes(&self) -> Vec<u64> {
+        self.destinations.read().unwrap().keys().copied().collect()
+    }
+
+    fn add_peer(
+        &self,
+        node_id: u64,
+        address: String
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Call the ClusterTransport trait method explicitly
+        <Self as ClusterTransport<E>>::add_peer(self, node_id, address)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("{}", e).into()
+            })
+    }
+
+    fn remove_peer(
+        &self,
+        node_id: u64
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Call the ClusterTransport trait method explicitly
+        <Self as ClusterTransport<E>>::remove_peer(self, node_id)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("{}", e).into()
+            })
     }
 }
 
