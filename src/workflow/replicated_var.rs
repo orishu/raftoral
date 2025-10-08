@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::ops::Deref;
 use serde::{Serialize, Deserialize};
 use std::sync::Arc;
 use crate::workflow::error::WorkflowError;
@@ -196,6 +197,50 @@ where
     /// Get the workflow ID this variable belongs to
     pub fn workflow_id(&self) -> &str {
         &self.workflow_run.context.workflow_id
+    }
+
+    /// Set the value directly
+    ///
+    /// This method stores a new value in Raft and updates the local cache.
+    ///
+    /// # Arguments
+    /// * `value` - The new value to store
+    ///
+    /// # Returns
+    /// * `Ok(T)` with the new value if successful
+    /// * `Err(WorkflowError)` if the operation failed
+    pub async fn set(&mut self, value: T) -> Result<T, WorkflowError> {
+        // Store the new value in Raft using the workflow run's runtime
+        let stored_value = self.workflow_run.runtime.set_replicated_var(
+            &self.workflow_run.context.workflow_id,
+            &self.key,
+            value,
+            &self.workflow_run.runtime.cluster
+        ).await?;
+
+        // Update the local cache
+        self.value = stored_value.clone();
+
+        Ok(stored_value)
+    }
+}
+
+/// Implement Deref to allow using `*var` to get the value
+///
+/// This enables ergonomic read access:
+/// ```rust
+/// let counter = ReplicatedVar::with_value("counter", &workflow_run, 42).await?;
+/// let value = *counter;  // Returns 42
+/// let sum = *counter + 10;  // Works in expressions
+/// ```
+impl<T> Deref for ReplicatedVar<T>
+where
+    T: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + 'static,
+{
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
     }
 }
 
