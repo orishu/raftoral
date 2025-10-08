@@ -3,7 +3,7 @@ use std::ops::Deref;
 use serde::{Serialize, Deserialize};
 use std::sync::Arc;
 use crate::workflow::error::WorkflowError;
-use crate::workflow::context::WorkflowRun;
+use crate::workflow::context::{WorkflowRun, WorkflowContext};
 
 /// A type-safe replicated variable that stores its value as a checkpoint in the Raft cluster.
 ///
@@ -59,8 +59,8 @@ use crate::workflow::context::WorkflowRun;
 pub struct ReplicatedVar<T> {
     /// Unique key for this replicated variable within the workflow
     key: String,
-    /// Reference to the workflow run this variable belongs to
-    workflow_run: Arc<WorkflowRun>,
+    /// Workflow context containing workflow_id and runtime
+    context: WorkflowContext,
     /// The current value (cached after initialization/updates)
     value: T,
 }
@@ -98,7 +98,7 @@ where
 
         Ok(ReplicatedVar {
             key: key.to_string(),
-            workflow_run: workflow_run.clone(),
+            context: workflow_run.context.clone(),
             value: stored_value,
         })
     }
@@ -141,7 +141,7 @@ where
 
         Ok(ReplicatedVar {
             key: key.to_string(),
-            workflow_run: workflow_run.clone(),
+            context: workflow_run.context.clone(),
             value: stored_value,
         })
     }
@@ -173,13 +173,13 @@ where
         // Apply the update function
         let new_value = updater(self.value.clone());
 
-        // Store the new value in Raft using the workflow run's runtime
+        // Store the new value in Raft using the context's runtime
         // Always checks queue for late follower catch-up (FIFO guarantees correct order)
-        let stored_value = self.workflow_run.runtime.set_replicated_var(
-            &self.workflow_run.context.workflow_id,
+        let stored_value = self.context.runtime.set_replicated_var(
+            &self.context.workflow_id,
             &self.key,
             new_value,
-            &self.workflow_run.runtime.cluster
+            &self.context.runtime.cluster
         ).await?;
 
         // Update the local cache
@@ -196,7 +196,7 @@ where
 
     /// Get the workflow ID this variable belongs to
     pub fn workflow_id(&self) -> &str {
-        &self.workflow_run.context.workflow_id
+        &self.context.workflow_id
     }
 
     /// Set the value directly
@@ -210,12 +210,12 @@ where
     /// * `Ok(T)` with the new value if successful
     /// * `Err(WorkflowError)` if the operation failed
     pub async fn set(&mut self, value: T) -> Result<T, WorkflowError> {
-        // Store the new value in Raft using the workflow run's runtime
-        let stored_value = self.workflow_run.runtime.set_replicated_var(
-            &self.workflow_run.context.workflow_id,
+        // Store the new value in Raft using the context's runtime
+        let stored_value = self.context.runtime.set_replicated_var(
+            &self.context.workflow_id,
             &self.key,
             value,
-            &self.workflow_run.runtime.cluster
+            &self.context.runtime.cluster
         ).await?;
 
         // Update the local cache
@@ -251,7 +251,7 @@ where
     fn clone(&self) -> Self {
         ReplicatedVar {
             key: self.key.clone(),
-            workflow_run: self.workflow_run.clone(),
+            context: self.context.clone(),
             value: self.value.clone(),
         }
     }
