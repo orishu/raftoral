@@ -55,6 +55,9 @@ async fn test_three_node_grpc_cluster_bootstrap() {
     println!("  Discovered {} peer(s)", discovered.len());
     assert_eq!(discovered.len(), 1, "Should discover node 1");
     assert_eq!(discovered[0].node_id, 1, "Discovered node should be node 1");
+    println!("  Discovered voters: {:?}", discovered[0].voters);
+    println!("  Discovered first entry: index={}, term={}",
+             discovered[0].first_entry_index, discovered[0].first_entry_term);
 
     let port2 = port_check::free_local_port().expect("Should find free port for node 2");
     let addr2 = format!("127.0.0.1:{}", port2);
@@ -65,6 +68,12 @@ async fn test_three_node_grpc_cluster_bootstrap() {
         NodeConfig { node_id: 2, address: addr2.clone() },
     ]));
     transport2.start().await.expect("Transport 2 should start");
+
+    // CRITICAL: Set discovered voter configuration AND first entry BEFORE creating cluster
+    // This initializes the joining node with proper Raft configuration and log entry
+    transport2.set_discovered_voters(discovered[0].voters.clone());
+    transport2.set_discovered_first_entry(discovered[0].first_entry_index, discovered[0].first_entry_term);
+    println!("  Set discovered voters and first entry on transport 2");
 
     // CRITICAL: Add node 1 to transport BEFORE creating cluster
     // This prevents node 2 from being detected as single-node and campaigning
@@ -90,19 +99,14 @@ async fn test_three_node_grpc_cluster_bootstrap() {
 
     // Add node 2 to the cluster via node 1 (the leader)
     // Node 1 will propose the ConfChange and send it to node 2
-    println!("  Adding node 2 to cluster via ConfChange...");
+    println!("  Adding node 2 to cluster as voter via ConfChange...");
     cluster1.add_node(2, addr2.clone()).await
-        .expect("Should add node 2 to cluster");
+        .expect("Should add node 2 as voter");
 
-    println!("✓ Node 2 added to cluster\n");
+    println!("✓ Node 2 added as voter\n");
 
-    // Give time for the ConfChange to propagate and nodes to sync
-    // IMPORTANT: Need significant time for 2-node cluster to establish stable quorum
-    // Node 2 needs to receive the full log from node 1 before it can commit
-    // This includes the initial empty entry and the ConfChange entry
-    // Raft log backtracking and replication can take multiple election timeouts
-    // Wait for cluster to stabilize with both nodes in sync
-    sleep(Duration::from_millis(10000)).await;
+    // Wait for node 2 to catch up
+    sleep(Duration::from_millis(2000)).await;
 
     // Step 3: Add third node
     println!("Step 3: Adding third node (node 3)");
@@ -111,6 +115,9 @@ async fn test_three_node_grpc_cluster_bootstrap() {
     let discovered = discover_peers(vec![addr1.clone(), addr2.clone()]).await;
     println!("  Discovered {} peer(s)", discovered.len());
     assert!(discovered.len() >= 1, "Should discover at least one node");
+    println!("  Discovered voters from first peer: {:?}", discovered[0].voters);
+    println!("  Discovered first entry: index={}, term={}",
+             discovered[0].first_entry_index, discovered[0].first_entry_term);
 
     let port3 = port_check::free_local_port().expect("Should find free port for node 3");
     let addr3 = format!("127.0.0.1:{}", port3);
@@ -121,6 +128,11 @@ async fn test_three_node_grpc_cluster_bootstrap() {
         NodeConfig { node_id: 3, address: addr3.clone() },
     ]));
     transport3.start().await.expect("Transport 3 should start");
+
+    // CRITICAL: Set discovered voter configuration AND first entry BEFORE creating cluster
+    transport3.set_discovered_voters(discovered[0].voters.clone());
+    transport3.set_discovered_first_entry(discovered[0].first_entry_index, discovered[0].first_entry_term);
+    println!("  Set discovered voters and first entry on transport 3");
 
     // CRITICAL: Add existing cluster members to transport BEFORE creating cluster
     // This prevents node 3 from being detected as single-node and campaigning
@@ -148,14 +160,14 @@ async fn test_three_node_grpc_cluster_bootstrap() {
 
     // Add node 3 to the cluster via the existing cluster (node 1)
     // Note: add_node automatically routes to the leader
-    println!("  Adding node 3 to cluster via ConfChange...");
+    println!("  Adding node 3 to cluster as voter via ConfChange...");
     cluster1.add_node(3, addr3.clone()).await
-        .expect("Should add node 3 to cluster");
+        .expect("Should add node 3 as voter");
 
-    println!("✓ Node 3 added to cluster\n");
+    println!("✓ Node 3 added as voter\n");
 
-    // Give time for the ConfChange to propagate and nodes to sync
-    sleep(Duration::from_millis(2000)).await;
+    // Wait for node 3 to catch up
+    sleep(Duration::from_millis(5000)).await;
 
     // Step 4: Verify cluster membership
     println!("Step 4: Verifying cluster membership");

@@ -80,11 +80,24 @@ impl<E: CommandExecutor> RaftService for RaftServiceImpl<E> {
         let node_ids = self.cluster.get_node_ids();
         let highest_known_node_id = node_ids.iter().copied().max().unwrap_or(self.node_id);
 
+        // Get full configuration state (voters and learners)
+        let conf_state = self.cluster.get_conf_state();
+        let voters: Vec<u64> = conf_state.voters.into_iter().collect();
+        let learners: Vec<u64> = conf_state.learners.into_iter().collect();
+
+        // Get first log entry info for bootstrapping
+        let (first_entry_index, first_entry_term) = self.cluster.get_first_entry_info()
+            .unwrap_or((0, 0)); // Default to (0, 0) if log is empty
+
         Ok(Response::new(DiscoveryResponse {
             node_id: self.node_id,
             role: ProtoRaftRole::Follower as i32, // Role discovery requires cluster reference - simplified for now
             highest_known_node_id,
             address: self.address.clone(),
+            voters,
+            learners,
+            first_entry_index,
+            first_entry_term,
         }))
     }
 }

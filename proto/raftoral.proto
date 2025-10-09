@@ -37,6 +37,10 @@ message DiscoveryResponse {
     RaftRole role = 2;
     uint64 highest_known_node_id = 3;
     string address = 4;
+    repeated uint64 voters = 5;      // Current voting members
+    repeated uint64 learners = 6;    // Current learner members
+    uint64 first_entry_index = 7;    // Index of first log entry (usually 1)
+    uint64 first_entry_term = 8;     // Term of first log entry for bootstrapping
 }
 
 // Workflow Management Service

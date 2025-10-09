@@ -29,6 +29,10 @@ pub struct RaftCluster<E: CommandExecutor> {
     node_id: u64,
     // Cached Raft configuration (shared with RaftNode for direct access)
     cached_config: Arc<RwLock<Vec<u64>>>,
+    // Cached full configuration state (voters and learners separately)
+    cached_conf_state: Arc<RwLock<raft::prelude::ConfState>>,
+    // Cached first log entry info for discovery (index, term) - set once at creation
+    cached_first_entry: Arc<RwLock<Option<(u64, u64)>>>,
 }
 
 impl<E: CommandExecutor + 'static> RaftCluster<E> {
@@ -78,6 +82,8 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
 
         // Create cached_config - will be populated by RaftNode::new
         let cached_config_arc = Arc::new(RwLock::new(Vec::new()));
+        let cached_conf_state_arc = Arc::new(RwLock::new(raft::prelude::ConfState::default()));
+        let cached_first_entry_arc = Arc::new(RwLock::new(None));
 
         // Create and spawn the Raft node with transport reference
         let role_tx_for_node = role_change_tx.clone();
@@ -89,6 +95,8 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
             executor_arc.clone(),
             role_tx_for_node,
             cached_config_arc.clone(),
+            cached_conf_state_arc.clone(),
+            cached_first_entry_arc.clone(),
         )?;
 
         // Spawn the node
@@ -109,6 +117,8 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
             leader_id: leader_id_arc.clone(),
             node_id,
             cached_config: cached_config_arc,
+            cached_conf_state: cached_conf_state_arc,
+            cached_first_entry: cached_first_entry_arc,
         };
 
         // Give the node time to initialize
@@ -319,6 +329,16 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
     /// the need for message-based queries.
     pub fn get_node_ids(&self) -> Vec<u64> {
         self.cached_config.read().unwrap().clone()
+    }
+
+    /// Get the full Raft configuration state (voters and learners separately)
+    pub fn get_conf_state(&self) -> raft::prelude::ConfState {
+        self.cached_conf_state.read().unwrap().clone()
+    }
+
+    /// Get first log entry info for discovery (cached at node creation)
+    pub fn get_first_entry_info(&self) -> Option<(u64, u64)> {
+        *self.cached_first_entry.read().unwrap()
     }
 
     /// Get the ID of this node

@@ -53,6 +53,10 @@ pub struct RaftNode<E: CommandExecutor> {
     /// Cached Raft configuration (voter IDs) - shared with RaftCluster for direct access
     /// Updated whenever configuration changes, eliminating need for QueryConfig messages
     cached_config: Arc<RwLock<Vec<u64>>>,
+    /// Cached full configuration state (voters and learners separately)
+    cached_conf_state: Arc<RwLock<raft::prelude::ConfState>>,
+    /// Cached first log entry info for discovery - shared with RaftCluster
+    cached_first_entry: Arc<RwLock<Option<(u64, u64)>>>,
 
     // Sync command tracking (command_id -> completion callback)
     sync_commands: HashMap<u64, SyncCallback>,
@@ -82,6 +86,8 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
         executor: Arc<E>,
         role_change_tx: broadcast::Sender<RoleChange>,
         cached_config: Arc<RwLock<Vec<u64>>>,
+        cached_conf_state: Arc<RwLock<raft::prelude::ConfState>>,
+        cached_first_entry: Arc<RwLock<Option<(u64, u64)>>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let node_count = transport.list_nodes().len();
         let is_single_node = node_count == 1;
@@ -101,18 +107,61 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
         let storage = MemStorageWithSnapshot::new();
 
         // Set up the initial cluster configuration
-        let mut initial_state = ConfState::default();
-        // Add all nodes from transport
-        {
-            let mut voters = transport.list_nodes();
-            voters.sort(); // Keep deterministic order
-            for &peer_id in &voters {
-                initial_state.voters.push(peer_id);
+        if is_single_node {
+            // Bootstrap node: Initialize with self in configuration
+            let mut initial_state = ConfState::default();
+            initial_state.voters.push(node_id);
+            storage.wl().set_conf_state(initial_state.clone());
+            *cached_config.write().unwrap() = vec![node_id];
+            *cached_conf_state.write().unwrap() = initial_state;
+
+            // Cache first entry info (will be set after first leader election creates index 1)
+            // For now, leave as None - will be populated after the node becomes leader
+        } else {
+            // Joining node: Initialize with discovered voter configuration from transport
+            // This solves the "empty configuration" problem that causes ConfChange apply failures
+            let discovered_voters = transport.get_discovered_voters();
+
+            if !discovered_voters.is_empty() {
+                // We have discovered configuration - use it!
+                let mut initial_state = ConfState::default();
+                initial_state.voters = discovered_voters.clone();
+                storage.wl().set_conf_state(initial_state.clone());
+                *cached_config.write().unwrap() = discovered_voters.clone();
+                *cached_conf_state.write().unwrap() = initial_state;
+                slog::info!(slog::Logger::root(slog::Discard, slog::o!()),
+                    "Initialized joining node with discovered voters";
+                    "voters" => ?discovered_voters);
+
+                // CRITICAL: Also initialize log with first entry from discovery
+                // This prevents AppendEntries rejections when leader checks prev_log
+                if let Some((first_index, first_term)) = transport.get_discovered_first_entry() {
+                    // Create a dummy entry with the discovered term and index
+                    use raft::prelude::Entry;
+                    let mut dummy_entry = Entry::default();
+                    dummy_entry.set_index(first_index);
+                    dummy_entry.set_term(first_term);
+
+                    // Append the dummy entry to storage
+                    storage.wl().append(&[dummy_entry]).expect("Failed to append dummy entry");
+
+                    // Cache the first entry info
+                    *cached_first_entry.write().unwrap() = Some((first_index, first_term));
+
+                    slog::info!(slog::Logger::root(slog::Discard, slog::o!()),
+                        "Initialized joining node with dummy first entry";
+                        "index" => first_index, "term" => first_term);
+                }
+            } else{
+                // Fallback: Use transport peer list for cached_config only
+                // This maintains backward compatibility for tests that don't use discovery
+                let peer_ids: Vec<u64> = transport.list_nodes().into_iter()
+                    .filter(|&id| id != node_id)  // Don't include self
+                    .collect();
+                *cached_config.write().unwrap() = peer_ids;
+                // cached_conf_state stays empty - old behavior for backward compatibility
             }
-            // Populate the cached configuration (shared with RaftCluster)
-            *cached_config.write().unwrap() = voters;
-        };
-        storage.wl().set_conf_state(initial_state);
+        }
 
         // Create logger for this node
         let decorator = slog_term::TermDecorator::new().build();
@@ -122,6 +171,9 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
 
         let raft_group = RawNode::new(&config, storage, &logger)?;
 
+        // Note: For bootstrap nodes, the first entry will be cached later in handle_committed_entries
+        // after the node becomes leader and creates its first committed entry
+
         let node = RaftNode {
             raft_group,
             storage: Arc::new(RwLock::new(HashMap::new())),
@@ -130,6 +182,8 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             mailbox,
             transport,
             cached_config,
+            cached_conf_state,
+            cached_first_entry,
             sync_commands: HashMap::new(),
             next_command_id: AtomicU64::new(1),
             executor,
@@ -161,7 +215,11 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
     }
 
     pub fn step(&mut self, msg: raft::prelude::Message) -> Result<(), Box<dyn std::error::Error>> {
-        self.raft_group.step(msg)?;
+        if let Err(e) = self.raft_group.step(msg.clone()) {
+            slog::warn!(self.logger, "Failed to step message"; "from" => msg.from, "to" => msg.to,
+                       "msg_type" => ?msg.get_msg_type(), "error" => %e);
+            return Err(Box::new(e));
+        }
         Ok(())
     }
 
@@ -320,7 +378,16 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                 },
                 EntryType::EntryConfChangeV2 => {
                     slog::info!(self.logger, "Processing conf change v2 entry"; "index" => entry.index);
+
                     if let Ok(conf_change_v2) = ConfChangeV2::parse_from_bytes(&entry.data) {
+                        // Parse metadata to add peer to transport (all nodes need to know about peers)
+                        if !conf_change_v2.context.is_empty() {
+                            if let Ok(meta) = crate::raft::generic::transport::NodeMetadata::from_bytes(&conf_change_v2.context) {
+                                let _ = self.transport.add_peer(meta.node_id, meta.address.clone());
+                            }
+                        }
+
+                        // Apply the configuration change
                         self.apply_conf_change_v2(&conf_change_v2)?;
                     } else {
                         slog::error!(self.logger, "Failed to parse conf change v2 from entry data");
@@ -329,6 +396,21 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                 },
             }
         }
+
+        // Cache first entry info for discovery if not already set
+        // This is important for bootstrap nodes to report their first entry
+        if self.cached_first_entry.read().unwrap().is_none() {
+            let first_index = self.raft_group.raft.raft_log.first_index();
+            let last_index = self.raft_group.raft.raft_log.last_index();
+            if first_index <= last_index {
+                if let Ok(term) = self.raft_group.raft.raft_log.term(first_index) {
+                    *self.cached_first_entry.write().unwrap() = Some((first_index, term));
+                    slog::info!(self.logger, "Cached first entry info for discovery";
+                        "index" => first_index, "term" => term);
+                }
+            }
+        }
+
         Ok(last_applied_index)
     }
 
@@ -361,18 +443,19 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                 ConfChangeType::AddNode => {
                     slog::info!(self.logger, "Adding node to cluster (v2)"; "node_id" => node_id);
 
-                    // Update transport if metadata is available
-                    // Note: On leader this may be redundant (already added before propose)
-                    // but on followers this is the first time they learn about the new peer
+                    // Add peer to transport when ConfChange is applied (if not already added)
+                    // On the leader, this was already added before proposing (to enable bidirectional communication)
+                    // On followers, this is where the peer is first added
                     if let Some(ref meta) = metadata {
                         if meta.node_id == node_id {
                             match self.transport.add_peer(meta.node_id, meta.address.clone()) {
                                 Ok(()) => {
-                                    slog::info!(self.logger, "Updated transport with new peer";
+                                    slog::info!(self.logger, "Added peer to transport during ConfChange apply";
                                                "node_id" => node_id, "address" => &meta.address);
                                 }
                                 Err(e) => {
-                                    slog::error!(self.logger, "Failed to add peer to transport";
+                                    // May already exist (if we're the leader who added it before proposing)
+                                    slog::debug!(self.logger, "Peer may already be in transport";
                                                 "node_id" => node_id, "address" => &meta.address, "error" => %e);
                                 }
                             }
@@ -396,23 +479,9 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                     }
                 },
                 ConfChangeType::AddLearnerNode => {
-                    slog::info!(self.logger, "Adding learner node to cluster (v2)"; "node_id" => node_id);
-
-                    // Same as AddNode for transport purposes
-                    if let Some(ref meta) = metadata {
-                        if meta.node_id == node_id {
-                            match self.transport.add_peer(meta.node_id, meta.address.clone()) {
-                                Ok(()) => {
-                                    slog::info!(self.logger, "Updated transport with new learner peer";
-                                               "node_id" => node_id, "address" => &meta.address);
-                                }
-                                Err(e) => {
-                                    slog::error!(self.logger, "Failed to add learner peer to transport";
-                                                "node_id" => node_id, "address" => &meta.address, "error" => %e);
-                                }
-                            }
-                        }
-                    }
+                    // Learner support removed - use AddNode directly instead
+                    slog::error!(self.logger, "AddLearnerNode not supported - use AddNode instead"; "node_id" => node_id);
+                    return Err("AddLearnerNode not supported, use AddNode instead".into());
                 },
             }
         }
@@ -428,9 +497,31 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             let cs = self.raft_group.apply_conf_change(&legacy_change)?;
             slog::info!(self.logger, "ConfChangeV2 applied via legacy method"; "new_conf" => ?cs);
 
-            // Update cached configuration
-            let voters: Vec<u64> = cs.voters.into_iter().collect();
-            *self.cached_config.write().unwrap() = voters;
+            // Update cached full configuration state first (before moving parts of cs)
+            *self.cached_conf_state.write().unwrap() = cs.clone();
+
+            // Update cached configuration with all voter nodes
+            // Note: Learner support removed - learners list should always be empty
+            let mut all_nodes: Vec<u64> = cs.voters.into_iter().collect();
+            if !cs.learners.is_empty() {
+                slog::warn!(self.logger, "Unexpected learners in configuration"; "learners" => ?cs.learners);
+                all_nodes.extend(cs.learners.into_iter());
+            }
+            all_nodes.sort();
+            all_nodes.dedup();
+            *self.cached_config.write().unwrap() = all_nodes.clone();
+
+            slog::info!(self.logger, "Updated cached config"; "all_nodes" => ?all_nodes);
+
+            // After adding a node, trigger send_append to initiate replication
+            // With dummy entry bootstrap, nodes start with matching first entry, so replication succeeds
+            // This helps raft-rs transition Progress to Replicate state faster
+            if legacy_change.change_type == ConfChangeType::AddNode && self.is_leader() {
+                let added_node_id = legacy_change.node_id;
+                self.raft_group.raft.send_append(added_node_id);
+                slog::info!(self.logger, "Triggered send_append for newly added node";
+                           "node_id" => added_node_id);
+            }
         }
 
         Ok(())
@@ -438,6 +529,27 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
 
     pub fn is_leader(&self) -> bool {
         self.raft_group.raft.state == raft::StateRole::Leader
+    }
+
+    /// Get the current Raft configuration state (voters and learners)
+    pub fn get_conf_state(&self) -> raft::prelude::ConfState {
+        self.raft_group.raft.prs().conf().to_conf_state()
+    }
+
+    /// Get first log entry info for bootstrapping joining nodes
+    /// Returns (index, term) or None if log is empty
+    pub fn get_first_entry_info(&self) -> Option<(u64, u64)> {
+        let first_index = self.raft_group.raft.raft_log.first_index();
+        let last_index = self.raft_group.raft.raft_log.last_index();
+
+        // Check if we have at least one entry
+        if first_index <= last_index {
+            // Get the term of the first entry
+            if let Ok(term) = self.raft_group.raft.raft_log.term(first_index) {
+                return Some((first_index, term));
+            }
+        }
+        None
     }
 
     pub fn campaign(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -539,24 +651,27 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                             }
                         },
                         Some(Message::AddNode { node_id, address, callback }) => {
+                            slog::info!(self.logger, "Preparing to add node as voter"; "node_id" => node_id, "address" => &address);
+
                             // CRITICAL: Add peer to transport BEFORE proposing ConfChange
-                            // This ensures followers can receive messages immediately when they join
+                            // This enables bidirectional communication for log replication
                             match self.transport.add_peer(node_id, address.clone()) {
                                 Ok(()) => {
-                                    slog::info!(self.logger, "Added peer to transport"; "node_id" => node_id, "address" => &address);
-                                },
+                                    slog::info!(self.logger, "Added peer to transport before ConfChange";
+                                               "node_id" => node_id, "address" => &address);
+                                }
                                 Err(e) => {
-                                    slog::error!(self.logger, "Failed to add peer to transport"; "error" => %e, "node_id" => node_id);
+                                    slog::error!(self.logger, "Failed to add peer to transport before ConfChange";
+                                                "node_id" => node_id, "address" => &address, "error" => %e);
                                     if let Some(cb) = callback {
-                                        let err: Box<dyn std::error::Error + Send + Sync> =
-                                            format!("Failed to add peer to transport: {}", e).into();
-                                        let _ = cb.send(Err(err));
+                                        let _ = cb.send(Err(e));
                                     }
                                     continue;
                                 }
                             }
 
-                            // Create ConfChangeV2 for adding node
+                            // Add node directly as voter (simpler approach with proper initialization)
+                            // With discovered configuration, new nodes can apply ConfChanges correctly
                             let mut conf_change = ConfChangeV2::default();
                             let mut change = ConfChangeSingle::default();
                             change.change_type = ConfChangeType::AddNode.into();
