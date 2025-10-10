@@ -55,8 +55,6 @@ pub struct RaftNode<E: CommandExecutor> {
     cached_config: Arc<RwLock<Vec<u64>>>,
     /// Cached full configuration state (voters and learners separately)
     cached_conf_state: Arc<RwLock<raft::prelude::ConfState>>,
-    /// Cached first log entry info for discovery - shared with RaftCluster
-    cached_first_entry: Arc<RwLock<Option<(u64, u64)>>>,
 
     // Sync command tracking (command_id -> completion callback)
     sync_commands: HashMap<u64, SyncCallback>,
@@ -87,7 +85,6 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
         role_change_tx: broadcast::Sender<RoleChange>,
         cached_config: Arc<RwLock<Vec<u64>>>,
         cached_conf_state: Arc<RwLock<raft::prelude::ConfState>>,
-        cached_first_entry: Arc<RwLock<Option<(u64, u64)>>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let node_count = transport.list_nodes().len();
         let is_single_node = node_count == 1;
@@ -132,26 +129,6 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                 slog::info!(slog::Logger::root(slog::Discard, slog::o!()),
                     "Initialized joining node with discovered voters";
                     "voters" => ?discovered_voters);
-
-                // CRITICAL: Also initialize log with first entry from discovery
-                // This prevents AppendEntries rejections when leader checks prev_log
-                if let Some((first_index, first_term)) = transport.get_discovered_first_entry() {
-                    // Create a dummy entry with the discovered term and index
-                    use raft::prelude::Entry;
-                    let mut dummy_entry = Entry::default();
-                    dummy_entry.set_index(first_index);
-                    dummy_entry.set_term(first_term);
-
-                    // Append the dummy entry to storage
-                    storage.wl().append(&[dummy_entry]).expect("Failed to append dummy entry");
-
-                    // Cache the first entry info
-                    *cached_first_entry.write().unwrap() = Some((first_index, first_term));
-
-                    slog::info!(slog::Logger::root(slog::Discard, slog::o!()),
-                        "Initialized joining node with dummy first entry";
-                        "index" => first_index, "term" => first_term);
-                }
             } else{
                 // Fallback: Use transport peer list for cached_config only
                 // This maintains backward compatibility for tests that don't use discovery
@@ -171,9 +148,6 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
 
         let raft_group = RawNode::new(&config, storage, &logger)?;
 
-        // Note: For bootstrap nodes, the first entry will be cached later in handle_committed_entries
-        // after the node becomes leader and creates its first committed entry
-
         let node = RaftNode {
             raft_group,
             storage: Arc::new(RwLock::new(HashMap::new())),
@@ -183,7 +157,6 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             transport,
             cached_config,
             cached_conf_state,
-            cached_first_entry,
             sync_commands: HashMap::new(),
             next_command_id: AtomicU64::new(1),
             executor,
@@ -397,20 +370,6 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             }
         }
 
-        // Cache first entry info for discovery if not already set
-        // This is important for bootstrap nodes to report their first entry
-        if self.cached_first_entry.read().unwrap().is_none() {
-            let first_index = self.raft_group.raft.raft_log.first_index();
-            let last_index = self.raft_group.raft.raft_log.last_index();
-            if first_index <= last_index {
-                if let Ok(term) = self.raft_group.raft.raft_log.term(first_index) {
-                    *self.cached_first_entry.write().unwrap() = Some((first_index, term));
-                    slog::info!(self.logger, "Cached first entry info for discovery";
-                        "index" => first_index, "term" => term);
-                }
-            }
-        }
-
         Ok(last_applied_index)
     }
 
@@ -514,8 +473,8 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             slog::info!(self.logger, "Updated cached config"; "all_nodes" => ?all_nodes);
 
             // After adding a node, trigger send_append to initiate replication
-            // With dummy entry bootstrap, nodes start with matching first entry, so replication succeeds
             // This helps raft-rs transition Progress to Replicate state faster
+            // The first AppendEntries may be rejected (empty log), but raft-rs retries with earlier entries
             if legacy_change.change_type == ConfChangeType::AddNode && self.is_leader() {
                 let added_node_id = legacy_change.node_id;
                 self.raft_group.raft.send_append(added_node_id);

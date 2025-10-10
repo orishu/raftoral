@@ -56,10 +56,6 @@ pub struct GrpcClusterTransport<E: CommandExecutor> {
     /// Discovered cluster configuration (voters from discovery)
     /// Used to initialize joining nodes with proper Raft configuration
     discovered_voters: Arc<RwLock<Vec<u64>>>,
-
-    /// Discovered first log entry for bootstrapping (index, term)
-    /// Used to initialize joining nodes with a dummy first entry
-    discovered_first_entry: Arc<RwLock<Option<(u64, u64)>>>,
 }
 
 impl<E: CommandExecutor> GrpcClusterTransport<E> {
@@ -131,7 +127,6 @@ impl<E: CommandExecutor> GrpcClusterTransport<E> {
             shutdown_tx: Arc::new(Mutex::new(None)),
             channel_builder,
             discovered_voters: Arc::new(RwLock::new(Vec::new())),
-            discovered_first_entry: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -258,17 +253,6 @@ impl<E: CommandExecutor> GrpcClusterTransport<E> {
     /// Get discovered voter configuration
     pub fn get_discovered_voters(&self) -> Vec<u64> {
         self.discovered_voters.read().unwrap().clone()
-    }
-
-    /// Set discovered first log entry info from peer discovery
-    /// This should be called after discovering the cluster but before creating nodes
-    pub fn set_discovered_first_entry(&self, index: u64, term: u64) {
-        *self.discovered_first_entry.write().unwrap() = Some((index, term));
-    }
-
-    /// Get discovered first log entry info
-    pub fn get_discovered_first_entry(&self) -> Option<(u64, u64)> {
-        *self.discovered_first_entry.read().unwrap()
     }
 
     /// Internal method to get a sender for a specific node
@@ -559,10 +543,6 @@ impl<E: CommandExecutor + Default + 'static> crate::raft::generic::transport::Tr
     fn get_discovered_voters(&self) -> Vec<u64> {
         self.discovered_voters.read().unwrap().clone()
     }
-
-    fn get_discovered_first_entry(&self) -> Option<(u64, u64)> {
-        *self.discovered_first_entry.read().unwrap()
-    }
 }
 
 #[cfg(test)]
@@ -692,8 +672,6 @@ mod tests {
                     address: self.addr.clone(),
                     voters: vec![1],
                     learners: vec![],
-                    first_entry_index: 1,
-                    first_entry_term: 1,
                 }))
             }
         }

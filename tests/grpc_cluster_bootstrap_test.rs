@@ -56,8 +56,6 @@ async fn test_three_node_grpc_cluster_bootstrap() {
     assert_eq!(discovered.len(), 1, "Should discover node 1");
     assert_eq!(discovered[0].node_id, 1, "Discovered node should be node 1");
     println!("  Discovered voters: {:?}", discovered[0].voters);
-    println!("  Discovered first entry: index={}, term={}",
-             discovered[0].first_entry_index, discovered[0].first_entry_term);
 
     let port2 = port_check::free_local_port().expect("Should find free port for node 2");
     let addr2 = format!("127.0.0.1:{}", port2);
@@ -69,11 +67,10 @@ async fn test_three_node_grpc_cluster_bootstrap() {
     ]));
     transport2.start().await.expect("Transport 2 should start");
 
-    // CRITICAL: Set discovered voter configuration AND first entry BEFORE creating cluster
-    // This initializes the joining node with proper Raft configuration and log entry
+    // CRITICAL: Set discovered voter configuration BEFORE creating cluster
+    // This initializes the joining node with proper Raft configuration
     transport2.set_discovered_voters(discovered[0].voters.clone());
-    transport2.set_discovered_first_entry(discovered[0].first_entry_index, discovered[0].first_entry_term);
-    println!("  Set discovered voters and first entry on transport 2");
+    println!("  Set discovered voters on transport 2");
 
     // CRITICAL: Add node 1 to transport BEFORE creating cluster
     // This prevents node 2 from being detected as single-node and campaigning
@@ -116,8 +113,6 @@ async fn test_three_node_grpc_cluster_bootstrap() {
     println!("  Discovered {} peer(s)", discovered.len());
     assert!(discovered.len() >= 1, "Should discover at least one node");
     println!("  Discovered voters from first peer: {:?}", discovered[0].voters);
-    println!("  Discovered first entry: index={}, term={}",
-             discovered[0].first_entry_index, discovered[0].first_entry_term);
 
     let port3 = port_check::free_local_port().expect("Should find free port for node 3");
     let addr3 = format!("127.0.0.1:{}", port3);
@@ -129,10 +124,9 @@ async fn test_three_node_grpc_cluster_bootstrap() {
     ]));
     transport3.start().await.expect("Transport 3 should start");
 
-    // CRITICAL: Set discovered voter configuration AND first entry BEFORE creating cluster
+    // CRITICAL: Set discovered voter configuration BEFORE creating cluster
     transport3.set_discovered_voters(discovered[0].voters.clone());
-    transport3.set_discovered_first_entry(discovered[0].first_entry_index, discovered[0].first_entry_term);
-    println!("  Set discovered voters and first entry on transport 3");
+    println!("  Set discovered voters on transport 3");
 
     // CRITICAL: Add existing cluster members to transport BEFORE creating cluster
     // This prevents node 3 from being detected as single-node and campaigning

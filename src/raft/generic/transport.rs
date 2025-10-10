@@ -44,10 +44,6 @@ where
     /// Get discovered voter configuration from peer discovery
     /// Used to initialize joining nodes with proper Raft configuration
     fn get_discovered_voters(&self) -> Vec<u64>;
-
-    /// Get discovered first log entry info from peer discovery
-    /// Returns (index, term) for initializing joining nodes with a dummy entry
-    fn get_discovered_first_entry(&self) -> Option<(u64, u64)>;
 }
 
 /// Metadata about a node's transport address
@@ -266,11 +262,6 @@ impl<E: CommandExecutor + 'static> TransportInteraction<E::Command> for InMemory
         // In-memory transport doesn't use discovery - return empty
         // Tests using InMemoryClusterTransport don't need this feature
         Vec::new()
-    }
-
-    fn get_discovered_first_entry(&self) -> Option<(u64, u64)> {
-        // In-memory transport doesn't use discovery
-        None
     }
 }
 

@@ -11,8 +11,6 @@ pub struct DiscoveredPeer {
     pub highest_known_node_id: u64,
     pub voters: Vec<u64>,
     pub learners: Vec<u64>,
-    pub first_entry_index: u64,
-    pub first_entry_term: u64,
 }
 
 /// Raft role of a node
@@ -50,8 +48,6 @@ pub async fn discover_peer(address: &str) -> Result<DiscoveredPeer, Box<dyn std:
         highest_known_node_id: discovery.highest_known_node_id,
         voters: discovery.voters,
         learners: discovery.learners,
-        first_entry_index: discovery.first_entry_index,
-        first_entry_term: discovery.first_entry_term,
     })
 }
 
@@ -106,8 +102,6 @@ mod tests {
                 highest_known_node_id: 3,
                 voters: vec![1, 2, 3],
                 learners: vec![],
-                first_entry_index: 1,
-                first_entry_term: 1,
             }
         ];
         assert_eq!(next_node_id(&peers), 4);
@@ -123,8 +117,6 @@ mod tests {
                 highest_known_node_id: 3,
                 voters: vec![1, 2, 3],
                 learners: vec![],
-                first_entry_index: 1,
-                first_entry_term: 1,
             },
             DiscoveredPeer {
                 node_id: 2,
@@ -133,8 +125,6 @@ mod tests {
                 highest_known_node_id: 5,
                 voters: vec![1, 2, 3],
                 learners: vec![],
-                first_entry_index: 1,
-                first_entry_term: 1,
             },
             DiscoveredPeer {
                 node_id: 3,
@@ -143,8 +133,6 @@ mod tests {
                 highest_known_node_id: 5,
                 voters: vec![1, 2, 3],
                 learners: vec![],
-                first_entry_index: 1,
-                first_entry_term: 1,
             }
         ];
         // Should pick max highest_known_node_id (5) and add 1
