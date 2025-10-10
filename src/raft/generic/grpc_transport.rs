@@ -136,31 +136,81 @@ impl<E: CommandExecutor> GrpcClusterTransport<E> {
     }
 
     /// Add a new node to the transport configuration
+    /// IMPORTANT: This creates gRPC client and forwarder for the new node
     pub async fn add_node(&self, node: NodeConfig) -> Result<(), Box<dyn std::error::Error>> {
-        // Create channel for the new node
-        let (sender, receiver) = mpsc::unbounded_channel();
-
-        // Create destination with sender only (no client/forwarder yet)
-        let destination = Destination {
-            sender,
-            grpc_client: None,
-            forwarder_handle: None,
-        };
-
-        // Insert atomically
+        // Check if already exists
         {
-            let mut destinations = self.destinations.write().unwrap();
-            destinations.insert(node.node_id, destination);
+            let nodes = self.nodes.read().unwrap();
+            if nodes.contains_key(&node.node_id) {
+                return Ok(()); // Already added
+            }
         }
+
+        // Add to nodes map
+        {
+            let mut nodes = self.nodes.write().unwrap();
+            nodes.insert(node.node_id, node.clone());
+        }
+
+        // Create receiver for this node (will be claimed when cluster is created)
+        let (_tx, rx) = mpsc::unbounded_channel();
 
         {
             let mut receivers = self.node_receivers.lock().unwrap();
-            receivers.insert(node.node_id, receiver);
+            receivers.insert(node.node_id, rx);
         }
 
+        // Check if transport has been started (needed for forwarders)
+        let shutdown_rx_opt = {
+            let shutdown_tx = self.shutdown_tx.lock().unwrap();
+            shutdown_tx.as_ref().map(|tx| tx.subscribe())
+        };
+
+        // Create sender channel and destination
+        let (sender, forwarder_handle) = if let Some(shutdown_rx) = shutdown_rx_opt {
+            // CRITICAL FIX: Transport is started, create forwarder and gRPC client
+            // This ensures messages can be sent to the new node immediately
+            let (forwarder_tx, forwarder_rx) = mpsc::unbounded_channel();
+
+            // Spawn the forwarder task for this peer
+            let handle = self.spawn_peer_forwarder(node.node_id, forwarder_rx, shutdown_rx);
+
+            // Spawn async task to create gRPC client
+            let destinations = self.destinations.clone();
+            let channel_builder = self.channel_builder.clone();
+            let node_id = node.node_id;
+            let address = node.address.clone();
+            tokio::spawn(async move {
+                match RaftClient::connect_with_channel_builder(address.clone(), channel_builder).await {
+                    Ok(client) => {
+                        // Update destination with gRPC client
+                        let mut dests = destinations.write().unwrap();
+                        if let Some(dest) = dests.get_mut(&node_id) {
+                            dest.grpc_client = Some(Arc::new(tokio::sync::Mutex::new(client)));
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Failed to connect to node {}: {}", node_id, e);
+                    }
+                }
+            });
+
+            (forwarder_tx, Some(handle))
+        } else {
+            // Transport not started yet - create basic channel without forwarder
+            // Forwarders will be created when create_cluster() is called
+            let (tx, _rx) = mpsc::unbounded_channel();
+            (tx, None)
+        };
+
+        // Insert destination with appropriate configuration
         {
-            let mut nodes = self.nodes.write().unwrap();
-            nodes.insert(node.node_id, node);
+            let mut dests = self.destinations.write().unwrap();
+            dests.insert(node.node_id, Destination {
+                sender,
+                grpc_client: None, // Will be set async if transport started
+                forwarder_handle,
+            });
         }
 
         Ok(())

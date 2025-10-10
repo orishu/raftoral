@@ -702,6 +702,25 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                             match self.propose_conf_change_v2(conf_change) {
                                 Ok(_) => {
                                     slog::info!(self.logger, "Proposed adding node"; "node_id" => node_id, "address" => address);
+
+                                    // CRITICAL: After proposing ConfChange, force replication to all peers
+                                    // Progress might be paused, preventing automatic replication
+                                    if self.is_leader() {
+                                        let conf_state = self.raft_group.raft.prs().conf().to_conf_state();
+                                        for peer_id in conf_state.voters {
+                                            if peer_id != self.node_id {
+                                                self.raft_group.raft.send_append(peer_id);
+                                                slog::debug!(self.logger, "Triggered send_append to replicate ConfChange";
+                                                           "peer_id" => peer_id);
+                                            }
+                                        }
+
+                                        // Process ready state immediately to send the messages
+                                        if let Err(e) = self.on_ready() {
+                                            slog::warn!(self.logger, "Failed to process ready after send_append"; "error" => %e);
+                                        }
+                                    }
+
                                     if let Some(cb) = callback {
                                         let _ = cb.send(Ok(()));
                                     }
