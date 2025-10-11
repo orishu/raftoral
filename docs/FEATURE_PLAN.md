@@ -121,85 +121,55 @@ pub struct RaftoralConfig {
 
 ---
 
-## 3. Scalability Enhancements
+## 3. Scalability: Management + Execution Clusters
 
-**Priority:** Medium
-**Complexity:** High
-**Estimated Effort:** 6-8 weeks
+**Priority:** High
+**Complexity:** Very High
+**Estimated Effort:** 14 weeks (3 months)
 
-### Goals
-Support large clusters by reducing consensus overhead and enabling selective workflow execution.
+### Overview
 
-### Features
+**Problem:** Current single-cluster architecture doesn't scale beyond ~20 nodes because every checkpoint is replicated to all nodes.
 
-#### 3.1 Voter/Learner Node Roles
-**Current State:** All nodes are voters
-**Target:** Configurable voter set with learner nodes
+**Solution:** Two-tier cluster architecture:
+- **Management Cluster:** Single global cluster (all nodes) managing execution cluster membership and workflow lifecycle tracking
+- **Execution Clusters:** Multiple small virtual clusters (3-5 nodes each) handling workflow execution and checkpoint replication
 
-```rust
-pub enum NodeRole {
-    Voter,      // Participates in consensus (quorum)
-    Learner,    // Receives log but doesn't vote
-}
+**Key Benefit:** Decouple cluster size from checkpoint throughput. 50-node deployment with 10 execution clusters = **10x reduction** in checkpoint replication traffic.
 
-impl RaftoralConfig {
-    pub fn with_role(mut self, role: NodeRole) -> Self;
-}
-```
+### Architecture Reference
 
-**Implementation Notes:**
-- Use Raft's native learner support (`ConfChangeType::AddLearnerNode`)
-- Typical topology: 3-5 voters + N learners
-- Learners still execute workflows but don't vote on consensus
-- Dynamic promotion: learner → voter via `ConfChange`
+**See detailed design:** [docs/SCALABILITY_ARCHITECTURE.md](./SCALABILITY_ARCHITECTURE.md)
 
-**Benefits:**
-- Reduced quorum size → faster consensus
-- Horizontal scaling without slowing down commits
-- Geographical distribution (distant learners don't affect latency)
+The architecture document covers:
+- Management cluster command set (`CreateExecutionCluster`, `AssociateNode`, etc.)
+- Execution cluster lifecycle and workflow assignment
+- Unified transport layer routing messages to correct cluster
+- Dynamic rebalancing as deployment scales
+- Performance analysis (10-20x throughput improvement)
+- Concerns and open issues (failover complexity, cross-cluster queries, etc.)
 
-#### 3.2 Workflow Owner/Shadower Model
-**Current State:** All nodes execute all workflows
-**Target:** Selective workflow execution
+### Implementation Phases
 
-```rust
-pub struct WorkflowExecutionPolicy {
-    pub owner_count: usize,           // Default: 1
-    pub shadower_count: usize,        // Default: 2
-    pub shadower_selection: ShadowerStrategy,
-}
+**Phase 1: Management Cluster Foundation (4 weeks)**
+- Implement `ManagementCommandExecutor`
+- Dual-cluster node (management + execution)
+- Voter/learner configuration for management cluster
 
-pub enum ShadowerStrategy {
-    Random,
-    RoundRobin,
-    LocalityAware(Vec<String>),  // Prefer specific node IDs/zones
-}
-```
+**Phase 2: Unified Transport (3 weeks)**
+- Update protobuf schema with cluster routing
+- Route messages based on cluster type and ID
+- Integration testing with both cluster types
 
-**Implementation Plan:**
-1. Extend `WorkflowStartData` to include `owner_node_id` and `shadower_node_ids`
-2. Leader selects owner + shadowers based on policy when starting workflow
-3. Only selected nodes spawn workflow execution task
-4. Checkpoints still replicated to all nodes via Raft (consensus)
-5. On owner failure: promote shadower to owner via `WorkflowCommand::PromoteOwner`
+**Phase 3: Workflow Lifecycle Integration (3 weeks)**
+- Execution cluster selection strategies
+- Lifecycle reporting to management cluster
+- End-to-end testing with 50-node deployment
 
-**Design Considerations:**
-- How to handle owner node failure?
-  - Automatic promotion of first shadower
-  - Leader proposes `PromoteOwner` command
-- Should non-shadowers maintain workflow state?
-  - Yes (via Raft log) but don't execute
-- Load balancing: distribute ownership evenly across nodes
-
-**Benefits:**
-- Run 1000+ workflows without overwhelming all nodes
-- Reduced CPU/memory per node
-- Better resource utilization
-
-**Testing:**
-- Workflow with 1 owner + 2 shadowers
-- Owner node crashes, shadower promotion
-- New workflows distributed evenly across cluster
+**Phase 4: Dynamic Rebalancing (4 weeks)**
+- Load monitoring and metrics
+- Automatic cluster creation/destruction
+- Scale testing and chaos engineering
 
 ---
 
@@ -571,8 +541,7 @@ public class RaftoralRuntime {
 |---------|----------|------------|--------------|----------------|
 | Workflow Management APIs | High | Low | None | v0.2.0 |
 | Persistent Storage | High | Medium | None | v0.3.0 |
-| Scalability (Voter/Learner) | Medium | High | Persistent Storage | v0.4.0 |
-| Scalability (Owner/Shadower) | Medium | High | Voter/Learner | v0.4.0 |
+| Management + Execution Clusters | High | Very High | Persistent Storage recommended | v0.4.0 |
 | Out-of-Band Snapshots | Medium | Medium | Persistent Storage | v0.5.0 |
 | Checkpoint History | Low | Medium | Persistent Storage | v0.5.0 |
 | Python Bindings | Low | Very High | All core features stable | v1.0.0 |
@@ -591,9 +560,12 @@ public class RaftoralRuntime {
    - Default storage path: `~/.raftoral/` or `./raftoral_data/`?
    - Automatic migration from in-memory to persistent?
 
-3. **Scalability:**
-   - Should owner/shadower selection be user-configurable per workflow?
-   - How to handle zone-aware shadower placement?
+3. **Scalability (Management + Execution Clusters):**
+   - Execution cluster size: default to 5 nodes or make configurable?
+   - Workflow failover strategy: migrate to new cluster vs. add nodes to restore quorum?
+   - Execution cluster lifecycle: immediate destruction when empty or delayed (TTL)?
+   - Management cluster voter selection: static assignment vs. dynamic election?
+   - See detailed concerns in [SCALABILITY_ARCHITECTURE.md](./SCALABILITY_ARCHITECTURE.md)
 
 4. **Snapshots:**
    - Snapshot compression (gzip, zstd)?
