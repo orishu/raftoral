@@ -2,8 +2,15 @@
 //!
 //! This example shows how the checkpoint macros create replicated variables with
 //! explicit keys that remain stable across workflow versions.
+//!
+//! Run with:
+//! ```
+//! cargo run --example checkpoint_macro_demo
+//! ```
 
-use raftoral::{WorkflowRuntime, WorkflowContext, WorkflowError, checkpoint, checkpoint_compute};
+use raftoral::runtime::{RaftoralConfig, RaftoralGrpcRuntime};
+use raftoral::workflow::{WorkflowContext, WorkflowError};
+use raftoral::{checkpoint, checkpoint_compute};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -25,12 +32,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("=== Checkpoint Macro Demo ===\n");
 
-    // Create single-node runtime for testing
-    let runtime = WorkflowRuntime::new_single_node(1).await?;
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await; // Wait for leadership
+    // Bootstrap a single-node cluster for testing
+    let config = RaftoralConfig::bootstrap("127.0.0.1:0".to_string(), Some(1));
+    let runtime = RaftoralGrpcRuntime::start(config).await?;
 
     // Register workflow demonstrating both checkpoint! and checkpoint_compute!
-    runtime.register_workflow_closure(
+    runtime
+        .workflow_runtime()
+        .register_workflow_closure(
         "compute_with_macro",
         1,
         |input: ComputeInput, ctx: WorkflowContext| async move {
@@ -91,6 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Executing workflow...");
     let workflow_run = runtime
+        .workflow_runtime()
         .start_workflow::<ComputeInput, ComputeOutput>("compute_with_macro", 1, input)
         .await?;
 
@@ -101,6 +111,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("History: {:?}", output.history);
     println!("Computed: {}", output.computed_value);
     println!("\n✓ Demo complete!");
+
+    // Shutdown the runtime
+    runtime.shutdown().await?;
 
     Ok(())
 }

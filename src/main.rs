@@ -1,4 +1,5 @@
 use clap::Parser;
+use log::{info, error};
 use raftoral::runtime::{RaftoralConfig, RaftoralGrpcRuntime};
 use raftoral::workflow::{WorkflowContext, WorkflowError};
 use tokio::signal;
@@ -74,13 +75,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .workflow_runtime()
         .register_workflow_closure("ping_pong", 1, ping_pong_fn)
         .expect("Failed to register ping_pong workflow");
-    println!("✓ Registered ping_pong workflow (v1)");
+    info!("Registered ping_pong workflow (v1)");
 
-    println!("   Press Ctrl+C to shutdown gracefully\n");
+    info!("Press Ctrl+C to shutdown gracefully");
 
     // Example: Execute ping/pong workflow to test the system
     // Note: This works from any node - start_workflow automatically routes to the leader
-    println!("📌 Testing ping/pong workflow...");
+    info!("Testing ping/pong workflow...");
 
     match runtime
         .workflow_runtime()
@@ -88,22 +89,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
     {
         Ok(workflow_run) => {
-            println!("   Started ping/pong workflow: {}", workflow_run.workflow_id());
+            info!("Started ping/pong workflow: {}", workflow_run.workflow_id());
 
             match workflow_run.wait_for_completion().await {
                 Ok(output) => {
-                    println!("   ✓ Workflow completed: got '{}'", output);
+                    info!("Workflow completed: got '{}'", output);
                 }
                 Err(e) => {
-                    eprintln!("   ✗ Workflow failed: {}", e);
+                    error!("Workflow failed: {}", e);
                 }
             }
         }
         Err(e) => {
-            eprintln!("   ✗ Failed to start workflow: {}", e);
+            error!("Failed to start workflow: {}", e);
         }
     }
-    println!();
 
     // Wait for shutdown signal
     signal::ctrl_c().await?;
