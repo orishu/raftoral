@@ -2,35 +2,45 @@
 
 A Rust library for building fault-tolerant, distributed workflows using the Raft consensus protocol.
 
-## The Problem: Serverless Without Servers
+## The Problem: Orchestration Infrastructure Overhead
 
-Modern serverless platforms (AWS Lambda, Google Cloud Functions, etc.) are great for stateless execution, but orchestrating complex, long-running workflows is challenging:
+Building long-running, fault-tolerant workflows typically requires deploying and managing separate orchestration infrastructure:
 
-### Traditional Serverless Limitations
+### Traditional Orchestration Challenges
 
 **External Orchestrators (Temporal, AWS Step Functions, etc.):**
-- ❌ **Infrastructure Overhead**: Requires running dedicated servers/databases for orchestration
-- ❌ **Vendor Lock-in**: Cloud-specific or hosted service dependencies
-- ❌ **Network Latency**: Every workflow step requires network round-trips to orchestrator
-- ❌ **Operational Complexity**: Another service to monitor, scale, and maintain
+- ❌ **Separate Infrastructure**: Dedicated orchestrator servers and databases to deploy and maintain
+- ❌ **Operational Overhead**: Another cluster to monitor, scale, backup, and upgrade
+- ❌ **Network Latency**: Every workflow step requires round-trips to external orchestrator
+- ❌ **Additional Failure Points**: Orchestrator availability becomes critical path
 
-**Why This Is a Problem:**
-The promise of serverless is "no servers to manage," but workflow orchestration brings them back. You end up running Temporal servers, managing databases, and dealing with all the operational overhead you wanted to avoid.
+**Example Setup (Temporal):**
+```
+Your Services (Workers)  →  Temporal Server Cluster  →  Database (Cassandra/Postgres)
+   3+ nodes                    3-5+ nodes                    3+ nodes
+```
 
-### The Raftoral Solution: Truly Serverless Workflows
+You end up managing 10+ nodes across multiple systems just to orchestrate workflows.
 
-Raftoral eliminates the need for external orchestration infrastructure by embedding the orchestrator directly into your application using Raft consensus:
+### The Raftoral Solution: Embedded Orchestration
 
-- ✅ **No External Services**: No separate orchestrator servers or databases to run
-- ✅ **Pure Rust Library**: Just add it to your dependencies and run
-- ✅ **Self-Coordinating**: Cluster nodes coordinate via Raft protocol
-- ✅ **Dynamic Scaling**: Start with any number of nodes, add/remove as needed
+Raftoral eliminates separate orchestration infrastructure by embedding the orchestrator directly into your long-running services using Raft consensus:
+
+- ✅ **No Separate Infrastructure**: Orchestration runs inside your application processes
+- ✅ **Pure Rust Library**: Just add it to your dependencies
+- ✅ **Self-Coordinating**: Application nodes coordinate via Raft protocol
+- ✅ **Unified Operations**: One cluster to monitor, one deployment pipeline
 - ✅ **Fault Tolerant**: Automatic failover when nodes fail
 - ✅ **Cloud Agnostic**: Works anywhere Rust runs
 
 **The Architecture Difference:**
-- **Traditional**: Your Code → Network → Orchestrator Servers → Database → Network → Your Code
-- **Raftoral**: Your Code (with embedded orchestration) ↔ Other Nodes (peer-to-peer)
+- **Traditional**: Your Services → Network → Orchestrator Cluster → Database Cluster → Network → Your Services
+- **Raftoral**: Your Services (with embedded orchestration) ↔ Peer-to-Peer Coordination
+
+**Requirements:**
+- Long-running services (not FaaS/Lambda - workflows need continuous execution)
+- 3+ nodes for production fault tolerance (Raft quorum requirement)
+- Rust 1.70+
 
 ---
 

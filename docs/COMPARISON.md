@@ -1,14 +1,21 @@
 # Comparison: Raftoral vs. Temporal vs. DBOS
 
-This document provides a detailed comparison between Raftoral, Temporal, and DBOS—three systems designed for building fault-tolerant, durable workflows and stateful applications. Raftoral is a Rust-based library embedding Raft consensus for decentralized orchestration. Temporal is a mature workflow orchestration platform using event sourcing. DBOS is a database-oriented system for durable execution with minimal code changes.
+This document provides a detailed comparison between Raftoral, Temporal, and DBOS—three systems designed for building fault-tolerant, durable workflows and stateful applications.
+
+**All three systems are designed for long-running services**, not serverless/FaaS deployments (like AWS Lambda). Workflows execute continuously and maintain state across hours, days, or even months, which requires persistent runtime processes.
+
+The key differentiator is **infrastructure requirements**:
+- **Raftoral**: Embedded orchestration (no separate infrastructure)
+- **Temporal**: Separate orchestrator cluster + database cluster
+- **DBOS**: Requires database cluster for state persistence
 
 The comparison covers key aspects such as overview, architecture, language support, fault tolerance, state management, scalability, complexity/ease of use, use cases, pros/cons, and when to choose each. Data is based on official documentation and project descriptions as of October 2025.
 
 ## Overview
 
-- **Raftoral**: A pure Rust library for fault-tolerant, distributed workflows using embedded Raft consensus. It eliminates external infrastructure by running workflows peer-to-peer across application nodes, focusing on simplicity and dynamic scaling. Inspired by Temporal but designed to be lighter, with no dedicated servers or databases.
-- **Temporal**: An open-source platform for orchestrating durable workflow executions that survive failures. It allows developers to write code as if failures don't exist, handling retries, state persistence, and long-running processes automatically.
-- **DBOS**: A database-oriented system for building reliable, stateful applications and workflows. It uses annotations to make existing code durable, backed by a database for execution state, emphasizing ease of addition to legacy code without rearchitecting.
+- **Raftoral**: A pure Rust library for fault-tolerant, distributed workflows using embedded Raft consensus. Orchestration runs inside your application processes via peer-to-peer coordination, eliminating separate infrastructure. Inspired by Temporal but designed with no dedicated orchestrator servers or databases.
+- **Temporal**: An open-source platform for orchestrating durable workflow executions that survive failures. Requires deploying a Temporal Server cluster and backend database (Cassandra, MySQL, or PostgreSQL). Workers run in your services and communicate with the central server for orchestration.
+- **DBOS**: A database-oriented system for building reliable, stateful applications and workflows. Uses annotations to make existing code durable, backed by PostgreSQL for execution state. Requires database infrastructure but no separate orchestrator servers.
 
 ## Architecture
 
@@ -65,15 +72,15 @@ The comparison covers key aspects such as overview, architecture, language suppo
 
 ## Use Cases
 
-- **Raftoral**: Decentralized apps, serverless workflows without vendors (e.g., payment processing, order orchestration). Ideal for embedded coordination in microservices.
-- **Temporal**: Long-running, failure-prone processes (e.g., billing, CI/CD, microservices orchestration). Suited for polyglot teams and complex workflows with activities/child workflows.
-- **DBOS**: Reliable data pipelines, AI agents, event processing, cron jobs, e-commerce checkouts. Great for adding durability to existing apps (e.g., Slack integrations, genomic processing).
+- **Raftoral**: Long-running services needing embedded workflow orchestration (e.g., payment processing services, order management systems, microservice coordination). Best for teams wanting to minimize infrastructure components while maintaining fault tolerance.
+- **Temporal**: Complex, long-running, failure-prone processes requiring mature tooling (e.g., billing systems, CI/CD pipelines, multi-step microservices orchestration). Suited for polyglot teams and workflows with complex patterns (activities, child workflows, signals).
+- **DBOS**: Reliable data pipelines, AI agents, event processing, cron jobs, e-commerce checkouts. Great for adding durability to existing services (e.g., Slack integrations, genomic processing) with minimal code changes.
 
 ## Pros and Cons
 
 ### Raftoral
-- **Pros**: No external infra/vendor lock-in; dynamic scaling; type-safe; low latency for checkpoints.
-- **Cons**: Rust-only; requires determinism; in-memory (persistence planned); no built-in compensation.
+- **Pros**: No separate infrastructure; unified operations; dynamic scaling; type-safe; low latency for checkpoints.
+- **Cons**: Rust-only; requires long-running services; requires determinism; in-memory (persistence planned); no built-in compensation.
 
 ### Temporal
 - **Pros**: Multi-language; mature ecosystem; handles arbitrary failures; scalable for massive workloads.
@@ -85,9 +92,9 @@ The comparison covers key aspects such as overview, architecture, language suppo
 
 ## When to Choose
 
-- **Choose Raftoral** if you want a lightweight, embedded solution in Rust for decentralized, infrastructure-free workflows. Best for teams avoiding external services and needing peer-to-peer resilience.
-- **Choose Temporal** if you need a battle-tested platform for complex, polyglot orchestrations with event sourcing. Ideal for large-scale, long-running processes in failure-prone environments.
-- **Choose DBOS** if you're adding durability to existing code quickly, with a focus on database-backed simplicity and observability. Suited for rapid prototyping and stateful serverless apps.
+- **Choose Raftoral** if you're building long-running services in Rust and want to minimize operational overhead by embedding orchestration. Best for teams wanting unified infrastructure (no separate orchestrator/database clusters) while maintaining fault tolerance and dynamic scaling.
+- **Choose Temporal** if you need a battle-tested platform for complex, polyglot orchestrations with event sourcing. Ideal for large-scale, long-running processes in failure-prone environments where mature tooling and multi-language support justify the infrastructure overhead.
+- **Choose DBOS** if you're adding durability to existing services quickly, with a focus on database-backed simplicity and observability. Suited for rapid prototyping and teams already comfortable with PostgreSQL infrastructure.
 
 ## Summary
 
