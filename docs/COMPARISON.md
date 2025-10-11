@@ -89,6 +89,14 @@ The comparison covers key aspects such as overview, architecture, language suppo
 - **Choose Temporal** if you need a battle-tested platform for complex, polyglot orchestrations with event sourcing. Ideal for large-scale, long-running processes in failure-prone environments.
 - **Choose DBOS** if you're adding durability to existing code quickly, with a focus on database-backed simplicity and observability. Suited for rapid prototyping and stateful serverless apps.
 
+## Summary
+
+Each system offers unique trade-offs:
+
+- **Raftoral** excels at embedded orchestration without external dependencies, perfect for Rust applications that need peer-to-peer resilience
+- **Temporal** provides the most mature, battle-tested platform for enterprise-scale workflow orchestration across multiple languages
+- **DBOS** offers the fastest path to adding durability to existing applications through simple annotations
+
 For more details, refer to the respective documentation:
 - Raftoral: [GitHub Repo](https://github.com/orishu/raftoral)
 - Temporal: [Docs](https://docs.temporal.io/)

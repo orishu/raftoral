@@ -32,6 +32,16 @@ Raftoral eliminates the need for external orchestration infrastructure by embedd
 - **Traditional**: Your Code → Network → Orchestrator Servers → Database → Network → Your Code
 - **Raftoral**: Your Code (with embedded orchestration) ↔ Other Nodes (peer-to-peer)
 
+---
+
+### 📊 **Comparing Workflow Systems?**
+
+**See our detailed comparison**: [Raftoral vs. Temporal vs. DBOS](docs/COMPARISON.md)
+
+This guide helps you choose the right workflow orchestration system by comparing architecture, scalability, complexity, use cases, and trade-offs across all three platforms.
+
+---
+
 ## Architecture Overview
 
 ### Consensus-Driven Execution
