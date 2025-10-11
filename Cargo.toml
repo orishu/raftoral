@@ -1,7 +1,15 @@
 [package]
 name = "raftoral"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
+authors = ["Ori Shalev"]
+license = "MIT"
+description = "Fault-tolerant workflow orchestration library using embedded Raft consensus for Rust applications"
+homepage = "https://github.com/orishu/raftoral"
+repository = "https://github.com/orishu/raftoral"
+readme = "README.md"
+keywords = ["workflow", "orchestration", "raft", "consensus", "distributed"]
+categories = ["asynchronous", "concurrency", "development-tools"]
 
 [dependencies]
 raft = "0.7.0"
