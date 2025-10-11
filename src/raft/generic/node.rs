@@ -445,43 +445,18 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             }
         }
 
-        // Note: raft-rs 0.7.0 may not have apply_conf_change_v2, using legacy method
-        // Convert ConfChangeV2 to legacy ConfChange for compatibility
-        if let Some(change) = conf_change.changes.first() {
-            let mut legacy_change = ConfChange::default();
-            legacy_change.change_type = change.change_type;
-            legacy_change.node_id = change.node_id;
-            legacy_change.context = bytes::Bytes::new(); // Empty context for compatibility
+        // Apply the configuration change and get the new configuration state
+        let cs = self.raft_group.apply_conf_change(conf_change)?;
+        slog::info!(self.logger, "ConfChange applied"; "new_conf" => ?cs);
 
-            let cs = self.raft_group.apply_conf_change(&legacy_change)?;
-            slog::info!(self.logger, "ConfChangeV2 applied via legacy method"; "new_conf" => ?cs);
+        // Update cached configuration state
+        *self.cached_conf_state.write().unwrap() = cs.clone();
 
-            // Update cached full configuration state first (before moving parts of cs)
-            *self.cached_conf_state.write().unwrap() = cs.clone();
+        // Update cached configuration with voter node IDs
+        let all_nodes: Vec<u64> = cs.voters.into_iter().collect();
+        *self.cached_config.write().unwrap() = all_nodes.clone();
 
-            // Update cached configuration with all voter nodes
-            // Note: Learner support removed - learners list should always be empty
-            let mut all_nodes: Vec<u64> = cs.voters.into_iter().collect();
-            if !cs.learners.is_empty() {
-                slog::warn!(self.logger, "Unexpected learners in configuration"; "learners" => ?cs.learners);
-                all_nodes.extend(cs.learners.into_iter());
-            }
-            all_nodes.sort();
-            all_nodes.dedup();
-            *self.cached_config.write().unwrap() = all_nodes.clone();
-
-            slog::info!(self.logger, "Updated cached config"; "all_nodes" => ?all_nodes);
-
-            // After adding a node, trigger send_append to initiate replication
-            // This helps raft-rs transition Progress to Replicate state faster
-            // The first AppendEntries may be rejected (empty log), but raft-rs retries with earlier entries
-            if legacy_change.change_type == ConfChangeType::AddNode && self.is_leader() {
-                let added_node_id = legacy_change.node_id;
-                self.raft_group.raft.send_append(added_node_id);
-                slog::info!(self.logger, "Triggered send_append for newly added node";
-                           "node_id" => added_node_id);
-            }
-        }
+        slog::info!(self.logger, "Updated cached config"; "all_nodes" => ?all_nodes);
 
         Ok(())
     }
@@ -611,23 +586,6 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                         },
                         Some(Message::AddNode { node_id, address, callback }) => {
                             slog::info!(self.logger, "Preparing to add node as voter"; "node_id" => node_id, "address" => &address);
-
-                            // CRITICAL: Add peer to transport BEFORE proposing ConfChange
-                            // This enables bidirectional communication for log replication
-                            match self.transport.add_peer(node_id, address.clone()) {
-                                Ok(()) => {
-                                    slog::info!(self.logger, "Added peer to transport before ConfChange";
-                                               "node_id" => node_id, "address" => &address);
-                                }
-                                Err(e) => {
-                                    slog::error!(self.logger, "Failed to add peer to transport before ConfChange";
-                                                "node_id" => node_id, "address" => &address, "error" => %e);
-                                    if let Some(cb) = callback {
-                                        let _ = cb.send(Err(e));
-                                    }
-                                    continue;
-                                }
-                            }
 
                             // Add node directly as voter (simpler approach with proper initialization)
                             // With discovered configuration, new nodes can apply ConfChanges correctly
