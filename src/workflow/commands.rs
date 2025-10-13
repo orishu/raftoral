@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 /// Data for starting a workflow execution
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkflowStartData {
+    pub command_id: u64,  // Unique ID for tracking command completion
     pub workflow_id: String,
     pub workflow_type: String,
     pub version: u32,
@@ -13,6 +14,7 @@ pub struct WorkflowStartData {
 /// Data for ending a workflow execution
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkflowEndData {
+    pub command_id: u64,  // Unique ID for tracking command completion
     pub workflow_id: String,
     pub result: Vec<u8>,
 }
@@ -20,6 +22,7 @@ pub struct WorkflowEndData {
 /// Data for setting a checkpoint value
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CheckpointData {
+    pub command_id: u64,  // Unique ID for tracking command completion
     pub workflow_id: String,
     pub key: String,
     pub value: Vec<u8>,
@@ -38,6 +41,7 @@ pub enum OwnerChangeReason {
 /// Data for changing workflow ownership
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OwnerChangeData {
+    pub command_id: u64,  // Unique ID for tracking command completion
     pub workflow_id: String,
     pub old_owner_node_id: u64,
     pub new_owner_node_id: u64,
@@ -55,4 +59,16 @@ pub enum WorkflowCommand {
     SetCheckpoint(CheckpointData),
     /// Change ownership of a workflow to a different node
     OwnerChange(OwnerChangeData),
+}
+
+impl WorkflowCommand {
+    /// Get the command ID for tracking completion
+    pub fn command_id(&self) -> u64 {
+        match self {
+            WorkflowCommand::WorkflowStart(data) => data.command_id,
+            WorkflowCommand::WorkflowEnd(data) => data.command_id,
+            WorkflowCommand::SetCheckpoint(data) => data.command_id,
+            WorkflowCommand::OwnerChange(data) => data.command_id,
+        }
+    }
 }

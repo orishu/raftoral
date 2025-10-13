@@ -336,6 +336,11 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
         self.node_id
     }
 
+    /// Generate a unique command ID for tracking command completion
+    pub fn generate_command_id(&self) -> u64 {
+        self.next_command_id.fetch_add(1, Ordering::SeqCst)
+    }
+
     pub async fn campaign(&self) -> Result<bool, Box<dyn std::error::Error>> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
 

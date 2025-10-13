@@ -25,7 +25,9 @@ async fn test_snapshot_based_bootstrap() {
     use raftoral::workflow::{WorkflowCommand, CheckpointData};
 
     for i in 0..1500 {
+        let command_id = cluster1.generate_command_id();
         let dummy_checkpoint = WorkflowCommand::SetCheckpoint(CheckpointData {
+            command_id,
             workflow_id: format!("dummy_workflow_{}", i),
             key: format!("key_{}", i),
             value: vec![i as u8],
