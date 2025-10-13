@@ -2,6 +2,7 @@ pub mod raft;
 pub mod workflow;
 pub mod grpc;
 pub mod runtime;
+pub mod nodemanager;
 
 /// Create a replicated variable with an explicit key.
 ///

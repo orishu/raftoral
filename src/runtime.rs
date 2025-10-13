@@ -142,7 +142,7 @@ impl RaftoralConfig {
 pub struct RaftoralGrpcRuntime {
     node_id: u64,
     _transport: Arc<GrpcClusterTransport<WorkflowCommandExecutor>>,
-    workflow_runtime: Arc<WorkflowRuntime>,
+    node_manager: Arc<crate::nodemanager::NodeManager>,
     server_handle: GrpcServerHandle,
     advertise_address: String,
     is_bootstrap: bool,
@@ -219,6 +219,7 @@ impl RaftoralGrpcRuntime {
         debug!("Initial transport nodes: {}", nodes.len());
 
         // Create transport with optional custom channel builder
+        // This transport is shared by both management and workflow clusters
         let transport = if let Some(channel_builder) = config.channel_builder {
             Arc::new(GrpcClusterTransport::<WorkflowCommandExecutor>::new_with_channel_builder(
                 nodes,
@@ -230,13 +231,12 @@ impl RaftoralGrpcRuntime {
         transport.start().await?;
         info!("Transport started");
 
-        // Create cluster (this starts the Raft event loop)
-        let cluster = transport.create_cluster(node_id).await?;
-        info!("Raft cluster initialized");
-
-        // Create workflow runtime (needed for gRPC server)
-        let workflow_runtime = WorkflowRuntime::new(cluster.clone());
-        info!("Workflow runtime ready");
+        // Create NodeManager (creates both management and workflow clusters internally)
+        let node_manager = Arc::new(crate::nodemanager::NodeManager::new(
+            transport.clone(),
+            node_id,
+        ).await?);
+        info!("NodeManager ready with management and workflow clusters");
 
         // Start gRPC server with optional custom configuration
         // Server must be started BEFORE add_node so it can receive Raft messages
@@ -244,9 +244,8 @@ impl RaftoralGrpcRuntime {
             start_grpc_server_with_config(
                 config.listen_address.clone(),
                 transport.clone(),
-                cluster.clone(),
+                node_manager.clone(),
                 node_id,
-                workflow_runtime.clone(),
                 Some(server_config),
             )
             .await?
@@ -254,9 +253,8 @@ impl RaftoralGrpcRuntime {
             start_grpc_server(
                 config.listen_address.clone(),
                 transport.clone(),
-                cluster.clone(),
+                node_manager.clone(),
                 node_id,
-                workflow_runtime.clone(),
             )
             .await?
         };
@@ -267,7 +265,7 @@ impl RaftoralGrpcRuntime {
         if !config.bootstrap && !config.peers.is_empty() {
             info!("Adding node {} to existing cluster", node_id);
             // add_node automatically routes to the leader
-            match cluster.add_node(node_id, advertise_addr.clone()).await {
+            match node_manager.add_node(node_id, advertise_addr.clone()).await {
                 Ok(_) => info!("Node added to cluster"),
                 Err(e) => {
                     warn!("Failed to add node to cluster: {}", e);
@@ -277,7 +275,7 @@ impl RaftoralGrpcRuntime {
         }
 
         info!("Node {} is running", node_id);
-        info!("Cluster size: {} nodes", cluster.get_node_ids().len());
+        info!("Cluster size: {} nodes", node_manager.cluster_size());
         info!("Ready to accept workflow registrations");
 
         // Give the cluster a moment to stabilize (especially important for joining nodes)
@@ -288,7 +286,7 @@ impl RaftoralGrpcRuntime {
         Ok(Self {
             node_id,
             _transport: transport,
-            workflow_runtime,
+            node_manager,
             server_handle,
             advertise_address: advertise_addr,
             is_bootstrap: config.bootstrap,
@@ -296,8 +294,8 @@ impl RaftoralGrpcRuntime {
     }
 
     /// Get a reference to the workflow runtime for registering and executing workflows.
-    pub fn workflow_runtime(&self) -> &Arc<WorkflowRuntime> {
-        &self.workflow_runtime
+    pub fn workflow_runtime(&self) -> Arc<WorkflowRuntime> {
+        self.node_manager.workflow_runtime()
     }
 
     /// Get the node ID of this runtime.
@@ -312,7 +310,7 @@ impl RaftoralGrpcRuntime {
 
     /// Get the current cluster size.
     pub fn cluster_size(&self) -> usize {
-        self.workflow_runtime.cluster.get_node_ids().len()
+        self.node_manager.cluster_size()
     }
 
     /// Gracefully shutdown the node.
@@ -327,12 +325,7 @@ impl RaftoralGrpcRuntime {
         // Remove this node from the cluster before shutting down
         if !self.is_bootstrap || self.cluster_size() > 1 {
             info!("Removing node {} from cluster", self.node_id);
-            match self
-                .workflow_runtime
-                .cluster
-                .remove_node(self.node_id)
-                .await
-            {
+            match self.node_manager.remove_node(self.node_id).await {
                 Ok(_) => info!("Node removed from cluster"),
                 Err(e) => warn!("Failed to remove node from cluster: {}", e),
             }

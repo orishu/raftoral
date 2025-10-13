@@ -172,27 +172,27 @@ impl GrpcServerHandle {
 }
 
 /// Start a gRPC server for a Raft node with graceful shutdown
-pub async fn start_grpc_server<E: CommandExecutor + 'static>(
+pub async fn start_grpc_server(
     address: String,
-    transport: Arc<GrpcClusterTransport<E>>,
-    cluster: Arc<RaftCluster<E>>,
+    transport: Arc<GrpcClusterTransport<crate::workflow::WorkflowCommandExecutor>>,
+    node_manager: Arc<crate::nodemanager::NodeManager>,
     node_id: u64,
-    runtime: Arc<crate::workflow::WorkflowRuntime>,
 ) -> Result<GrpcServerHandle, Box<dyn std::error::Error>> {
-    start_grpc_server_with_config(address, transport, cluster, node_id, runtime, None).await
+    start_grpc_server_with_config(address, transport, node_manager, node_id, None).await
 }
 
 /// Start a gRPC server with custom server configuration
-pub async fn start_grpc_server_with_config<E: CommandExecutor + 'static>(
+pub async fn start_grpc_server_with_config(
     address: String,
-    transport: Arc<GrpcClusterTransport<E>>,
-    cluster: Arc<RaftCluster<E>>,
+    transport: Arc<GrpcClusterTransport<crate::workflow::WorkflowCommandExecutor>>,
+    node_manager: Arc<crate::nodemanager::NodeManager>,
     node_id: u64,
-    runtime: Arc<crate::workflow::WorkflowRuntime>,
     server_config: Option<ServerConfigurator>,
 ) -> Result<GrpcServerHandle, Box<dyn std::error::Error>> {
     let addr = address.parse()?;
+    let cluster = node_manager.workflow_cluster.clone();
     let raft_service = RaftServiceImpl::new(transport, cluster, node_id, address);
+    let runtime = node_manager.workflow_runtime();
     let workflow_service = WorkflowManagementImpl::new(runtime);
 
     // Create reflection service
