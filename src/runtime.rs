@@ -11,8 +11,7 @@ use crate::grpc::{
 use crate::grpc::client::ChannelBuilder;
 use crate::raft::generic::grpc_transport::{GrpcClusterTransport, NodeConfig};
 use crate::raft::generic::transport::ClusterTransport;
-use crate::raft::generic::message::Message;
-use crate::workflow::{WorkflowCommand, WorkflowCommandExecutor, WorkflowRuntime};
+use crate::workflow::{WorkflowCommandExecutor, WorkflowRuntime};
 use log::{debug, info, warn};
 use std::sync::Arc;
 
@@ -142,7 +141,7 @@ impl RaftoralConfig {
 /// ```
 pub struct RaftoralGrpcRuntime {
     node_id: u64,
-    _transport: Arc<GrpcClusterTransport<Message<WorkflowCommand>>>,
+    _transport: Arc<GrpcClusterTransport<WorkflowCommandExecutor>>,
     node_manager: Arc<crate::nodemanager::NodeManager>,
     server_handle: GrpcServerHandle,
     advertise_address: String,
@@ -222,12 +221,12 @@ impl RaftoralGrpcRuntime {
         // Create transport with optional custom channel builder
         // This transport is shared by both management and workflow clusters
         let transport = if let Some(channel_builder) = config.channel_builder {
-            Arc::new(GrpcClusterTransport::<Message<WorkflowCommand>>::new_with_channel_builder(
+            Arc::new(GrpcClusterTransport::<WorkflowCommandExecutor>::new_with_channel_builder(
                 nodes,
                 channel_builder,
             ))
         } else {
-            Arc::new(GrpcClusterTransport::<Message<WorkflowCommand>>::new(nodes))
+            Arc::new(GrpcClusterTransport::<WorkflowCommandExecutor>::new(nodes))
         };
         transport.start().await?;
         info!("Transport started");

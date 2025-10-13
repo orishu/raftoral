@@ -15,12 +15,12 @@ pub struct NodeConfig {
 
 /// All components needed to send messages to a peer node
 /// Consolidates sender, gRPC client, and forwarder handle for atomic management
-struct Destination<M>
+struct Destination<C>
 where
-    M: Clone + std::fmt::Debug + serde::Serialize + for<'de> serde::Deserialize<'de> + Send + Sync + 'static,
+    C: Clone + std::fmt::Debug + serde::Serialize + for<'de> serde::Deserialize<'de> + Send + Sync + 'static,
 {
     /// Channel to send messages to this node
-    sender: mpsc::UnboundedSender<M>,
+    sender: mpsc::UnboundedSender<Message<C>>,
 
     /// gRPC client for remote communication (None for local node or not yet connected)
     grpc_client: Option<Arc<tokio::sync::Mutex<RaftClient>>>,
@@ -35,20 +35,17 @@ where
 /// It maintains a mapping of node IDs to network addresses and provides
 /// the infrastructure for sending Raft messages between nodes.
 ///
-/// The transport is generic over the message type M.
-/// This allows the same transport to handle any message type.
-pub struct GrpcClusterTransport<M>
-where
-    M: Clone + std::fmt::Debug + serde::Serialize + for<'de> serde::Deserialize<'de> + Send + Sync + 'static,
-{
+/// The transport is generic over the CommandExecutor type, but the actual
+/// gRPC protocol is defined for specific command types (e.g., WorkflowCommand).
+pub struct GrpcClusterTransport<E: CommandExecutor> {
     /// Unified peer management: node_id -> all communication components
-    destinations: Arc<RwLock<HashMap<u64, Destination<M>>>>,
+    destinations: Arc<RwLock<HashMap<u64, Destination<E::Command>>>>,
 
     /// Node configurations (node_id -> address)
     nodes: Arc<RwLock<HashMap<u64, NodeConfig>>>,
 
     /// Receivers for each node (held until create_cluster is called)
-    node_receivers: Arc<Mutex<HashMap<u64, mpsc::UnboundedReceiver<M>>>>,
+    node_receivers: Arc<Mutex<HashMap<u64, mpsc::UnboundedReceiver<Message<E::Command>>>>>,
 
     /// Shutdown signal
     shutdown_tx: Arc<Mutex<Option<tokio::sync::broadcast::Sender<()>>>>,
@@ -61,10 +58,7 @@ where
     discovered_voters: Arc<RwLock<Vec<u64>>>,
 }
 
-impl<M> GrpcClusterTransport<M>
-where
-    M: Clone + std::fmt::Debug + serde::Serialize + for<'de> serde::Deserialize<'de> + Send + Sync + 'static,
-{
+impl<E: CommandExecutor> GrpcClusterTransport<E> {
     /// Create a new gRPC transport with the given node configurations
     pub fn new(nodes: Vec<NodeConfig>) -> Self {
         Self::new_with_channel_builder(nodes, default_channel_builder())
@@ -262,7 +256,7 @@ where
     }
 
     /// Internal method to get a sender for a specific node
-    pub async fn get_node_sender(&self, node_id: u64) -> Option<mpsc::UnboundedSender<M>> {
+    pub async fn get_node_sender(&self, node_id: u64) -> Option<mpsc::UnboundedSender<Message<E::Command>>> {
         let destinations = self.destinations.read().unwrap();
         destinations.get(&node_id).map(|dest| dest.sender.clone())
     }
@@ -271,7 +265,7 @@ where
     fn spawn_peer_forwarder(
         &self,
         target_node_id: u64,
-        mut forwarder_rx: mpsc::UnboundedReceiver<M>,
+        mut forwarder_rx: mpsc::UnboundedReceiver<Message<E::Command>>,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     ) -> tokio::task::JoinHandle<()> {
         let destinations = self.destinations.clone();
@@ -304,18 +298,13 @@ where
     }
 }
 
-impl<M> ClusterTransport<M> for GrpcClusterTransport<M>
-where
-    M: Clone + std::fmt::Debug + serde::Serialize + for<'de> serde::Deserialize<'de> + Send + Sync + 'static,
-{
-    async fn create_cluster<E>(
+impl<E: CommandExecutor + Default + 'static> ClusterTransport<E> for GrpcClusterTransport<E> {
+    async fn create_cluster(
         self: &Arc<Self>,
         node_id: u64,
-        executor: E,
-    ) -> Result<Arc<RaftCluster<E>>, Box<dyn std::error::Error>>
-    where
-        E: CommandExecutor + Default + 'static,
-    {
+    ) -> Result<Arc<RaftCluster<E>>, Box<dyn std::error::Error>> {
+        // Create a new executor instance
+        let executor = E::default();
 
         // Extract the receiver for this node
         let receiver = {
@@ -361,8 +350,8 @@ where
 
         // Create the cluster with transport reference
         // Cast self to Arc<dyn TransportInteraction>
-        let transport: Arc<dyn crate::raft::generic::transport::TransportInteraction<M>> =
-            self.clone() as Arc<dyn crate::raft::generic::transport::TransportInteraction<M>>;
+        let transport: Arc<dyn crate::raft::generic::transport::TransportInteraction<E::Command>> =
+            self.clone() as Arc<dyn crate::raft::generic::transport::TransportInteraction<E::Command>>;
 
         let cluster = RaftCluster::new_with_transport(
             node_id,
@@ -508,14 +497,11 @@ where
 }
 
 // Implement TransportInteraction trait for unified transport interaction
-impl<M> crate::raft::generic::transport::TransportInteraction<M> for GrpcClusterTransport<M>
-where
-    M: Clone + std::fmt::Debug + serde::Serialize + for<'de> serde::Deserialize<'de> + Send + Sync + 'static,
-{
+impl<E: CommandExecutor + Default + 'static> crate::raft::generic::transport::TransportInteraction<E::Command> for GrpcClusterTransport<E> {
     fn send_message_to_node(
         &self,
         target_node_id: u64,
-        message: M
+        message: Message<E::Command>
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let destinations = self.destinations.read().unwrap();
         let dest = destinations.get(&target_node_id)
@@ -537,7 +523,7 @@ where
         address: String
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Call the ClusterTransport trait method explicitly
-        <Self as ClusterTransport<M>>::add_peer(self, node_id, address)
+        <Self as ClusterTransport<E>>::add_peer(self, node_id, address)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("{}", e).into()
             })
@@ -548,7 +534,7 @@ where
         node_id: u64
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Call the ClusterTransport trait method explicitly
-        <Self as ClusterTransport<M>>::remove_peer(self, node_id)
+        <Self as ClusterTransport<E>>::remove_peer(self, node_id)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("{}", e).into()
             })
@@ -597,7 +583,7 @@ mod tests {
             NodeConfig { node_id: 2, address: "127.0.0.1:5002".to_string() },
         ];
 
-        let transport = GrpcClusterTransport::<TestCommand>::new(nodes);
+        let transport = GrpcClusterTransport::<TestExecutor>::new(nodes);
 
         // Verify we can get node addresses
         assert_eq!(
@@ -612,7 +598,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_remove_node() {
-        let transport = GrpcClusterTransport::<TestCommand>::new(vec![]);
+        let transport = GrpcClusterTransport::<TestExecutor>::new(vec![]);
 
         // Add a node
         let node = NodeConfig { node_id: 1, address: "127.0.0.1:5001".to_string() };

@@ -14,7 +14,7 @@ pub enum RoleChange {
 
 #[derive(Clone)]
 pub struct RaftCluster<E: CommandExecutor> {
-    transport: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<E::Command>>>,
+    transport: Arc<dyn crate::raft::generic::transport::TransportInteraction<E::Command>>,
     node_count: usize,
     // Role change notifications
     role_change_tx: broadcast::Sender<RoleChange>,
@@ -48,7 +48,7 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
     pub async fn new_with_transport(
         node_id: u64,
         receiver: mpsc::UnboundedReceiver<Message<E::Command>>,
-        transport: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<E::Command>>>,
+        transport: Arc<dyn crate::raft::generic::transport::TransportInteraction<E::Command>>,
         executor: E,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Create role change broadcast channel
@@ -405,11 +405,10 @@ mod tests {
     async fn test_single_node_cluster_creation() {
         use crate::raft::generic::transport::{InMemoryClusterTransport, ClusterTransport};
 
-        let transport = Arc::new(InMemoryClusterTransport::<TestCommand>::new(vec![1]));
+        let transport = Arc::new(InMemoryClusterTransport::<TestCommandExecutor>::new(vec![1]));
         transport.start().await.expect("Transport start should succeed");
 
-        let executor = TestCommandExecutor::default();
-        let cluster = transport.create_cluster(1, executor).await;
+        let cluster = transport.create_cluster(1).await;
         assert!(cluster.is_ok());
 
         let cluster = cluster.unwrap();
@@ -425,11 +424,10 @@ mod tests {
         // Clear any previous test state for this prefix
         clear_test_state_for_prefix(TEST_PREFIX);
 
-        let transport = Arc::new(InMemoryClusterTransport::<TestCommand>::new(vec![1]));
+        let transport = Arc::new(InMemoryClusterTransport::<TestCommandExecutor>::new(vec![1]));
         transport.start().await.expect("Transport start should succeed");
 
-        let executor = TestCommandExecutor::default();
-        let cluster = transport.create_cluster(1, executor).await
+        let cluster = transport.create_cluster(1).await
             .expect("Failed to create single node cluster");
 
         // Wait for leadership establishment
@@ -529,11 +527,10 @@ mod tests {
         // Clear any previous test state for this prefix
         clear_test_state_for_prefix(TEST_PREFIX);
 
-        let transport = Arc::new(InMemoryClusterTransport::<TestCommand>::new(vec![1]));
+        let transport = Arc::new(InMemoryClusterTransport::<TestCommandExecutor>::new(vec![1]));
         transport.start().await.expect("Transport start should succeed");
 
-        let executor = TestCommandExecutor::default();
-        let cluster = transport.create_cluster(1, executor).await
+        let cluster = transport.create_cluster(1).await
             .expect("Failed to create single node cluster");
 
         // Wait for leadership establishment

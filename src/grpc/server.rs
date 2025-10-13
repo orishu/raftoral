@@ -20,28 +20,20 @@ use raft_proto::{
     RunWorkflowRequest, RunWorkflowResponse,
 };
 
-use crate::raft::generic::message::{Message, CommandExecutor};
+use crate::raft::generic::message::{Message, SerializableMessage, CommandExecutor};
 use crate::raft::generic::cluster::RaftCluster;
 
 /// gRPC service implementation for Raft communication
-pub struct RaftServiceImpl<C, E>
-where
-    C: Clone + std::fmt::Debug + serde::Serialize + for<'de> serde::Deserialize<'de> + Send + Sync + 'static,
-    E: CommandExecutor<Command = C>,
-{
-    transport: Arc<GrpcClusterTransport<Message<C>>>,
+pub struct RaftServiceImpl<E: CommandExecutor> {
+    transport: Arc<GrpcClusterTransport<E>>,
     cluster: Arc<RaftCluster<E>>,
     node_id: u64,
     address: String,
 }
 
-impl<C, E> RaftServiceImpl<C, E>
-where
-    C: Clone + std::fmt::Debug + serde::Serialize + for<'de> serde::Deserialize<'de> + Send + Sync + 'static,
-    E: CommandExecutor<Command = C>,
-{
+impl<E: CommandExecutor> RaftServiceImpl<E> {
     pub fn new(
-        transport: Arc<GrpcClusterTransport<Message<C>>>,
+        transport: Arc<GrpcClusterTransport<E>>,
         cluster: Arc<RaftCluster<E>>,
         node_id: u64,
         address: String,
@@ -51,25 +43,20 @@ where
 }
 
 #[tonic::async_trait]
-impl<C, E> RaftService for RaftServiceImpl<C, E>
-where
-    C: Clone + std::fmt::Debug + serde::Serialize + for<'de> serde::Deserialize<'de> + Send + Sync + 'static,
-    E: CommandExecutor<Command = C>,
-{
+impl<E: CommandExecutor> RaftService for RaftServiceImpl<E> {
     async fn send_message(
         &self,
         request: Request<GenericMessage>,
     ) -> Result<Response<MessageResponse>, Status> {
         let generic_msg = request.into_inner();
 
-        // Deserialize SerializableMessage which contains the command
-        let serializable_msg: crate::raft::generic::message::SerializableMessage<C> =
-            serde_json::from_slice(&generic_msg.serialized_message)
-                .map_err(|e| Status::invalid_argument(format!("Failed to deserialize: {}", e)))?;
+        // Deserialize to SerializableMessage first
+        let serializable: SerializableMessage<E::Command> = serde_json::from_slice(&generic_msg.serialized_message)
+            .map_err(|e| Status::invalid_argument(format!("Failed to deserialize: {}", e)))?;
 
-        // Convert to Message<C> (with callback: None)
-        let message = Message::from_serializable(serializable_msg)
-            .map_err(|e| Status::internal(format!("Failed to convert message: {}", e)))?;
+        // Convert to Message (callbacks will be None)
+        let message = Message::from_serializable(serializable)
+            .map_err(|e| Status::invalid_argument(format!("Failed to convert: {}", e)))?;
 
         // Get the sender for this node
         let sender = self.transport.get_node_sender(self.node_id).await
@@ -187,7 +174,7 @@ impl GrpcServerHandle {
 /// Start a gRPC server for a Raft node with graceful shutdown
 pub async fn start_grpc_server(
     address: String,
-    transport: Arc<GrpcClusterTransport<Message<crate::workflow::WorkflowCommand>>>,
+    transport: Arc<GrpcClusterTransport<crate::workflow::WorkflowCommandExecutor>>,
     node_manager: Arc<crate::nodemanager::NodeManager>,
     node_id: u64,
 ) -> Result<GrpcServerHandle, Box<dyn std::error::Error>> {
@@ -197,7 +184,7 @@ pub async fn start_grpc_server(
 /// Start a gRPC server with custom server configuration
 pub async fn start_grpc_server_with_config(
     address: String,
-    transport: Arc<GrpcClusterTransport<Message<crate::workflow::WorkflowCommand>>>,
+    transport: Arc<GrpcClusterTransport<crate::workflow::WorkflowCommandExecutor>>,
     node_manager: Arc<crate::nodemanager::NodeManager>,
     node_id: u64,
     server_config: Option<ServerConfigurator>,
