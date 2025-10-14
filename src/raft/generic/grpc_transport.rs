@@ -548,7 +548,6 @@ impl<E: CommandExecutor + Default + 'static> crate::raft::generic::transport::Tr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::generic::message::SerializableMessage;
     use serde::{Deserialize, Serialize};
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::time::{timeout, Duration};
@@ -641,15 +640,11 @@ mod tests {
                 &self,
                 request: Request<GenericMessage>,
             ) -> Result<Response<MessageResponse>, Status> {
-                let generic_msg = request.into_inner();
+                let proto_msg = request.into_inner();
 
-                // Deserialize to SerializableMessage first
-                let serializable: SerializableMessage<TestCommand> = serde_json::from_slice(&generic_msg.serialized_message)
+                // Convert directly from protobuf to Message
+                let message = Message::<TestCommand>::from_protobuf(proto_msg)
                     .map_err(|e| Status::invalid_argument(format!("Failed to deserialize: {}", e)))?;
-
-                // Convert to Message and extract the command if it's a Propose
-                let message = Message::<TestCommand>::from_serializable(serializable)
-                    .map_err(|e| Status::invalid_argument(format!("Failed to convert: {}", e)))?;
 
                 if let Message::Propose { command, .. } = message {
                     *self.received_command.lock().await = Some(command);

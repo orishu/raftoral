@@ -20,7 +20,7 @@ use raft_proto::{
     RunWorkflowRequest, RunWorkflowResponse,
 };
 
-use crate::raft::generic::message::{Message, SerializableMessage, CommandExecutor};
+use crate::raft::generic::message::{Message, CommandExecutor};
 use crate::raft::generic::cluster::RaftCluster;
 
 /// gRPC service implementation for Raft communication
@@ -48,15 +48,11 @@ impl<E: CommandExecutor> RaftService for RaftServiceImpl<E> {
         &self,
         request: Request<GenericMessage>,
     ) -> Result<Response<MessageResponse>, Status> {
-        let generic_msg = request.into_inner();
+        let proto_msg = request.into_inner();
 
-        // Deserialize to SerializableMessage first
-        let serializable: SerializableMessage<E::Command> = serde_json::from_slice(&generic_msg.serialized_message)
+        // Convert directly from protobuf to Message (no intermediate SerializableMessage)
+        let message = Message::<E::Command>::from_protobuf(proto_msg)
             .map_err(|e| Status::invalid_argument(format!("Failed to deserialize: {}", e)))?;
-
-        // Convert to Message (callbacks will be None)
-        let message = Message::from_serializable(serializable)
-            .map_err(|e| Status::invalid_argument(format!("Failed to convert: {}", e)))?;
 
         // Get the sender for this node
         let sender = self.transport.get_node_sender(self.node_id).await

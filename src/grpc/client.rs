@@ -1,9 +1,9 @@
 use tonic::transport::Channel;
 use std::sync::Arc;
 use crate::grpc::server::raft_proto::{
-    raft_service_client::RaftServiceClient, GenericMessage,
+    raft_service_client::RaftServiceClient,
 };
-use crate::raft::generic::message::{Message, SerializableMessage};
+use crate::raft::generic::message::Message;
 
 /// Type alias for channel creation function
 pub type ChannelBuilder = Arc<dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Channel, Box<dyn std::error::Error + Send + Sync>>> + Send>> + Send + Sync>;
@@ -70,17 +70,10 @@ impl RaftClient {
     where
         C: Clone + std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
     {
-        // Convert to serializable form (strips callbacks)
-        let serializable: SerializableMessage<C> = message.to_serializable()?;
+        // Convert directly to protobuf (no intermediate SerializableMessage needed)
+        let proto_msg = message.to_protobuf()?;
 
-        // Serialize to JSON
-        let serialized = serde_json::to_vec(&serializable)?;
-
-        let generic_msg = GenericMessage {
-            serialized_message: serialized,
-        };
-
-        let response = self.client.send_message(generic_msg).await?;
+        let response = self.client.send_message(proto_msg).await?;
         let msg_response = response.into_inner();
 
         if !msg_response.success {

@@ -1,6 +1,7 @@
 use serde::{Serialize, Deserialize};
 use serde::de::DeserializeOwned;
 use std::fmt::Debug;
+use crate::grpc::server::raft_proto;
 
 /// Trait for executing commands that have been committed through Raft
 pub trait CommandExecutor: Send + Sync + 'static {
@@ -83,32 +84,6 @@ where
     }
 }
 
-/// Serializable version of Message for network transmission
-/// Needed because raft::prelude::Message uses protobuf and isn't directly JSON-serializable
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(bound = "C: Clone + Debug + Serialize + DeserializeOwned")]
-pub enum SerializableMessage<C>
-where
-    C: Clone + Debug + Serialize + DeserializeOwned,
-{
-    Propose {
-        id: u8,
-        command: C,
-    },
-    Raft(Vec<u8>), // Serialized raft::prelude::Message
-    ConfChangeV2 {
-        id: u8,
-        change_bytes: Vec<u8>, // Serialized raft::prelude::ConfChangeV2
-    },
-    Campaign,
-    AddNode {
-        node_id: u64,
-        address: String,
-    },
-    RemoveNode {
-        node_id: u64,
-    },
-}
 
 pub enum Message<C>
 where
@@ -137,61 +112,92 @@ impl<C> Message<C>
 where
     C: Clone + Debug + Serialize + DeserializeOwned + Send + Sync + 'static,
 {
-    /// Convert to serializable form
-    pub fn to_serializable(&self) -> Result<SerializableMessage<C>, Box<dyn std::error::Error>> {
+    /// Convert Message<C> directly to protobuf GenericMessage
+    /// This eliminates the need for SerializableMessage and JSON serialization
+    pub fn to_protobuf(&self) -> Result<raft_proto::GenericMessage, Box<dyn std::error::Error>> {
         use protobuf::Message as ProtobufMessage;
 
-        Ok(match self {
-            Message::Propose { id, command } => SerializableMessage::Propose {
-                id: *id,
-                command: command.clone(),
+        let message = match self {
+            Message::Propose { id, command } => {
+                let command_json = serde_json::to_vec(command)?;
+                raft_proto::generic_message::Message::Propose(raft_proto::ProposeMessage {
+                    id: *id as u32,
+                    command_json,
+                })
             },
             Message::Raft(raft_msg) => {
                 let bytes = raft_msg.write_to_bytes()?;
-                SerializableMessage::Raft(bytes)
+                raft_proto::generic_message::Message::RaftMessage(bytes)
             },
             Message::ConfChangeV2 { id, change } => {
                 let bytes = change.write_to_bytes()?;
-                SerializableMessage::ConfChangeV2 {
-                    id: *id,
+                raft_proto::generic_message::Message::ConfChange(raft_proto::ConfChangeV2Message {
+                    id: *id as u32,
                     change_bytes: bytes,
-                }
+                })
             },
-            Message::Campaign => SerializableMessage::Campaign,
-            Message::AddNode { node_id, address } => SerializableMessage::AddNode {
-                node_id: *node_id,
-                address: address.clone(),
+            Message::Campaign => {
+                raft_proto::generic_message::Message::Campaign(raft_proto::CampaignMessage {})
             },
-            Message::RemoveNode { node_id } => SerializableMessage::RemoveNode { node_id: *node_id },
+            Message::AddNode { node_id, address } => {
+                raft_proto::generic_message::Message::AddNode(raft_proto::AddNodeMessage {
+                    node_id: *node_id,
+                    address: address.clone(),
+                })
+            },
+            Message::RemoveNode { node_id } => {
+                raft_proto::generic_message::Message::RemoveNode(raft_proto::RemoveNodeMessage {
+                    node_id: *node_id,
+                })
+            },
+        };
+
+        Ok(raft_proto::GenericMessage {
+            message: Some(message),
         })
     }
 
-    /// Create from serializable form
-    pub fn from_serializable(msg: SerializableMessage<C>) -> Result<Self, Box<dyn std::error::Error>> {
+    /// Convert protobuf GenericMessage directly to Message<C>
+    /// This eliminates the need for SerializableMessage and JSON deserialization
+    pub fn from_protobuf(proto_msg: raft_proto::GenericMessage) -> Result<Self, Box<dyn std::error::Error>> {
         use protobuf::Message as ProtobufMessage;
 
-        Ok(match msg {
-            SerializableMessage::Propose { id, command } => Message::Propose {
-                id,
-                command,
+        let message = proto_msg.message
+            .ok_or("GenericMessage missing message field")?;
+
+        Ok(match message {
+            raft_proto::generic_message::Message::Propose(propose) => {
+                let command: C = serde_json::from_slice(&propose.command_json)?;
+                Message::Propose {
+                    id: propose.id as u8,
+                    command,
+                }
             },
-            SerializableMessage::Raft(bytes) => {
+            raft_proto::generic_message::Message::RaftMessage(bytes) => {
                 let raft_msg = raft::prelude::Message::parse_from_bytes(&bytes)?;
                 Message::Raft(raft_msg)
             },
-            SerializableMessage::ConfChangeV2 { id, change_bytes } => {
-                let change = raft::prelude::ConfChangeV2::parse_from_bytes(&change_bytes)?;
+            raft_proto::generic_message::Message::ConfChange(conf_change) => {
+                let change = raft::prelude::ConfChangeV2::parse_from_bytes(&conf_change.change_bytes)?;
                 Message::ConfChangeV2 {
-                    id,
+                    id: conf_change.id as u8,
                     change,
                 }
             },
-            SerializableMessage::Campaign => Message::Campaign,
-            SerializableMessage::AddNode { node_id, address } => Message::AddNode {
-                node_id,
-                address,
+            raft_proto::generic_message::Message::Campaign(_) => {
+                Message::Campaign
             },
-            SerializableMessage::RemoveNode { node_id } => Message::RemoveNode { node_id },
+            raft_proto::generic_message::Message::AddNode(add_node) => {
+                Message::AddNode {
+                    node_id: add_node.node_id,
+                    address: add_node.address,
+                }
+            },
+            raft_proto::generic_message::Message::RemoveNode(remove_node) => {
+                Message::RemoveNode {
+                    node_id: remove_node.node_id,
+                }
+            },
         })
     }
 }

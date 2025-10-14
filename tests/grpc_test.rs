@@ -12,13 +12,13 @@ fn find_free_ports() -> (u16, u16) {
     (port1, port2)
 }
 
-// Disabled: test_grpc_message_passing - Uses old protobuf-specific API that has been replaced with generic serialization
+// Disabled: test_grpc_message_passing - Uses old protobuf-specific API that has been replaced with direct protobuf serialization
 // Modern message passing is tested in multi_node_test.rs
 /*
 #[tokio::test]
 async fn test_grpc_message_passing() {
     // This test used the old convert_workflow_command_to_proto and RaftMessage APIs
-    // which have been replaced with generic serialization via SerializableMessage
+    // which have been replaced with direct protobuf serialization via to_protobuf/from_protobuf
 }
 */
 

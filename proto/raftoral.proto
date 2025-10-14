@@ -3,8 +3,39 @@ syntax = "proto3";
 package raftoral;
 
 // Generic message envelope for any Message<Command> type
+// Now uses protobuf for message structure, JSON only for command payload
 message GenericMessage {
-    bytes serialized_message = 1;  // JSON-serialized Message<Command>
+    oneof message {
+        ProposeMessage propose = 1;
+        bytes raft_message = 2;          // Protobuf-serialized raft::prelude::Message
+        ConfChangeV2Message conf_change = 3;
+        CampaignMessage campaign = 4;
+        AddNodeMessage add_node = 5;
+        RemoveNodeMessage remove_node = 6;
+    }
+}
+
+message ProposeMessage {
+    uint32 id = 1;
+    bytes command_json = 2;  // JSON-serialized command
+}
+
+message ConfChangeV2Message {
+    uint32 id = 1;
+    bytes change_bytes = 2;  // Protobuf-serialized raft::prelude::ConfChangeV2
+}
+
+message CampaignMessage {
+    // Empty message
+}
+
+message AddNodeMessage {
+    uint64 node_id = 1;
+    string address = 2;
+}
+
+message RemoveNodeMessage {
+    uint64 node_id = 1;
 }
 
 // gRPC service for Raft communication
