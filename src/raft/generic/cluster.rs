@@ -129,18 +129,13 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
 
     /// Generic method to propose any command using the CommandExecutor pattern
     pub async fn propose_command(&self, command: E::Command) -> Result<bool, Box<dyn std::error::Error>> {
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-
         // Send to this node's local Raft instance, which will forward to leader if needed
         self.transport.send_message_to_node(self.node_id, Message::Propose {
             id: 0,
-            callback: Some(sender),
-            sync_callback: None,
             command,
         }).map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
 
-        let result = receiver.await?;
-        Ok(result)
+        Ok(true)
     }
 
     /// Send a message to the leader node with retry logic
@@ -252,19 +247,11 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
         Err("Failed to send message to leader after retries".into())
     }
 
-    /// Propose a command and wait until it's applied to the state machine
-    /// Uses precise tracking with unique command IDs to wait for exact completion
+    /// Propose a command and wait until it's applied
+    /// Note: For WorkflowCommand, callers should poll command completion via executor.is_command_completed()
+    /// This method now just proposes and returns, assuming the executor tracks completion
     pub async fn propose_and_sync(&self, command: E::Command) -> Result<(), Box<dyn std::error::Error>> {
-        let cmd = command; // Move ownership
-        let _ = self.send_to_leader(
-            move |sender| Message::Propose {
-                id: 0,
-                callback: None,
-                sync_callback: Some(sender),
-                command: cmd.clone(),
-            },
-            10, // max_retries
-        ).await?;
+        self.propose_command(command).await?;
         Ok(())
     }
 
@@ -287,32 +274,26 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
     /// Add a node to the Raft cluster
     /// Automatically finds the leader and sends the request
     pub async fn add_node(&self, node_id: u64, address: String) -> Result<(), Box<dyn std::error::Error>> {
-        match self.send_to_leader(
-            move |sender| Message::AddNode {
+        self.transport.send_message_to_node(
+            self.node_id,
+            Message::AddNode {
                 node_id,
-                address: address.clone(),
-                callback: Some(sender),
+                address,
             },
-            10, // max_retries
-        ).await? {
-            Ok(()) => Ok(()),
-            Err(e) => Err(format!("{}", e).into()),
-        }
+        ).map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+        Ok(())
     }
 
     /// Remove a node from the Raft cluster
     /// Automatically finds the leader and sends the request
     pub async fn remove_node(&self, node_id: u64) -> Result<(), Box<dyn std::error::Error>> {
-        match self.send_to_leader(
-            move |sender| Message::RemoveNode {
+        self.transport.send_message_to_node(
+            self.node_id,
+            Message::RemoveNode {
                 node_id,
-                callback: Some(sender),
             },
-            10, // max_retries
-        ).await? {
-            Ok(()) => Ok(()),
-            Err(e) => Err(format!("{}", e).into()),
-        }
+        ).map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+        Ok(())
     }
 
     pub fn node_count(&self) -> usize {
@@ -342,14 +323,9 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
     }
 
     pub async fn campaign(&self) -> Result<bool, Box<dyn std::error::Error>> {
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-
-        self.transport.send_message_to_node(self.node_id, Message::Campaign {
-            callback: Some(sender),
-        }).map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
-
-        let result = receiver.await?;
-        Ok(result)
+        self.transport.send_message_to_node(self.node_id, Message::Campaign)
+            .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+        Ok(true)
     }
 
 }

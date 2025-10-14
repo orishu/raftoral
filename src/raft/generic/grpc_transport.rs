@@ -710,8 +710,6 @@ mod tests {
         let test_command = TestCommand::TestMessage("Hello gRPC!".to_string());
         let message = Message::Propose {
             id: 1,
-            callback: None,
-            sync_callback: None,
             command: test_command.clone(),
         };
 

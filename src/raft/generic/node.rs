@@ -515,37 +515,13 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                 // Handle incoming messages
                 msg = self.mailbox.recv() => {
                     match msg {
-                        Some(Message::Propose { command, callback, sync_callback, .. }) => {
-                            let sync_id = if sync_callback.is_some() {
-                                Some(self.next_command_id.fetch_add(1, Ordering::SeqCst))
-                            } else {
-                                None
-                            };
-
-                            // Store sync callback if provided
-                            if let (Some(sync_cb), Some(id)) = (sync_callback, sync_id) {
-                                self.sync_commands.insert(id, sync_cb);
-                            }
-
-                            match self.propose_command(command, sync_id) {
-                                Ok(_) => {
-                                    if let Some(cb) = callback {
-                                        let _ = cb.send(true);
-                                    }
-                                },
+                        Some(Message::Propose { command, .. }) => {
+                            // No callbacks - just propose the command
+                            // Completion tracking is now done via command IDs in the executor
+                            match self.propose_command(command, None) {
+                                Ok(_) => {},
                                 Err(e) => {
                                     slog::error!(self.logger, "Failed to propose command"; "error" => %e);
-                                    if let Some(cb) = callback {
-                                        let _ = cb.send(false);
-                                    }
-                                    // Also notify sync callback of failure if it was set
-                                    if let Some(id) = sync_id {
-                                        if let Some(sync_cb) = self.sync_commands.remove(&id) {
-                                            let err_msg = format!("Failed to propose command: {}", e);
-                                            let err: Box<dyn std::error::Error + Send + Sync> = err_msg.into();
-                                            let _ = sync_cb.send(Err(err));
-                                        }
-                                    }
                                 }
                             }
                         },
@@ -554,37 +530,23 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                                 slog::error!(self.logger, "Failed to step raft message"; "error" => %e);
                             }
                         },
-                        Some(Message::ConfChangeV2 { change, callback, .. }) => {
+                        Some(Message::ConfChangeV2 { change, .. }) => {
                             match self.propose_conf_change_v2(change) {
-                                Ok(_) => {
-                                    if let Some(cb) = callback {
-                                        let _ = cb.send(true);
-                                    }
-                                },
+                                Ok(_) => {},
                                 Err(e) => {
                                     slog::error!(self.logger, "Failed to propose conf change v2"; "error" => %e);
-                                    if let Some(cb) = callback {
-                                        let _ = cb.send(false);
-                                    }
                                 }
                             }
                         },
-                        Some(Message::Campaign { callback }) => {
+                        Some(Message::Campaign) => {
                             match self.campaign() {
-                                Ok(_) => {
-                                    if let Some(cb) = callback {
-                                        let _ = cb.send(true);
-                                    }
-                                },
+                                Ok(_) => {},
                                 Err(e) => {
                                     slog::error!(self.logger, "Failed to start campaign"; "error" => %e);
-                                    if let Some(cb) = callback {
-                                        let _ = cb.send(false);
-                                    }
                                 }
                             }
                         },
-                        Some(Message::AddNode { node_id, address, callback }) => {
+                        Some(Message::AddNode { node_id, address }) => {
                             slog::info!(self.logger, "Preparing to add node as voter"; "node_id" => node_id, "address" => &address);
 
                             // Add node directly as voter (simpler approach with proper initialization)
@@ -607,11 +569,6 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                                 },
                                 Err(e) => {
                                     slog::error!(self.logger, "Failed to serialize node metadata"; "error" => %e);
-                                    if let Some(cb) = callback {
-                                        let err: Box<dyn std::error::Error + Send + Sync> =
-                                            format!("Failed to serialize metadata: {}", e).into();
-                                        let _ = cb.send(Err(err));
-                                    }
                                     continue;
                                 }
                             }
@@ -637,22 +594,13 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                                             slog::warn!(self.logger, "Failed to process ready after send_append"; "error" => %e);
                                         }
                                     }
-
-                                    if let Some(cb) = callback {
-                                        let _ = cb.send(Ok(()));
-                                    }
                                 },
                                 Err(e) => {
                                     slog::error!(self.logger, "Failed to propose add node"; "error" => %e, "node_id" => node_id);
-                                    if let Some(cb) = callback {
-                                        let err_msg = format!("Failed to add node: {}", e);
-                                        let err: Box<dyn std::error::Error + Send + Sync> = err_msg.into();
-                                        let _ = cb.send(Err(err));
-                                    }
                                 }
                             }
                         },
-                        Some(Message::RemoveNode { node_id, callback }) => {
+                        Some(Message::RemoveNode { node_id }) => {
                             // Create ConfChangeV2 for removing node
                             let mut conf_change = ConfChangeV2::default();
                             let mut change = ConfChangeSingle::default();
@@ -663,17 +611,9 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                             match self.propose_conf_change_v2(conf_change) {
                                 Ok(_) => {
                                     slog::info!(self.logger, "Proposed removing node"; "node_id" => node_id);
-                                    if let Some(cb) = callback {
-                                        let _ = cb.send(Ok(()));
-                                    }
                                 },
                                 Err(e) => {
                                     slog::error!(self.logger, "Failed to propose remove node"; "error" => %e, "node_id" => node_id);
-                                    if let Some(cb) = callback {
-                                        let err_msg = format!("Failed to remove node: {}", e);
-                                        let err: Box<dyn std::error::Error + Send + Sync> = err_msg.into();
-                                        let _ = cb.send(Err(err));
-                                    }
                                 }
                             }
                         },
