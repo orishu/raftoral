@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, broadcast};
 use raft::{prelude::*, StateRole};
@@ -49,7 +49,7 @@ pub struct RaftNode<E: CommandExecutor> {
     // For multi-node communication
     mailbox: mpsc::UnboundedReceiver<Message<E::Command>>,
     /// Transport interface for sending messages to peers
-    transport: Arc<dyn crate::raft::generic::transport::TransportInteraction<E::Command>>,
+    transport: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<E::Command>>>,
     /// Cached Raft configuration (voter IDs) - shared with RaftCluster for direct access
     /// Updated whenever configuration changes, eliminating need for QueryConfig messages
     cached_config: Arc<RwLock<Vec<u64>>>,
@@ -80,7 +80,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
     pub fn new(
         node_id: u64,
         mailbox: mpsc::UnboundedReceiver<Message<E::Command>>,
-        transport: Arc<dyn crate::raft::generic::transport::TransportInteraction<E::Command>>,
+        transport: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<E::Command>>>,
         executor: Arc<E>,
         role_change_tx: broadcast::Sender<RoleChange>,
         cached_config: Arc<RwLock<Vec<u64>>>,

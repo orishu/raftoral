@@ -85,6 +85,7 @@ where
 }
 
 
+#[derive(Clone, Debug)]
 pub enum Message<C>
 where
     C: Clone + Debug + Serialize + DeserializeOwned + Send + Sync + 'static,

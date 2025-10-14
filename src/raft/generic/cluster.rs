@@ -14,7 +14,7 @@ pub enum RoleChange {
 
 #[derive(Clone)]
 pub struct RaftCluster<E: CommandExecutor> {
-    transport: Arc<dyn crate::raft::generic::transport::TransportInteraction<E::Command>>,
+    transport: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<E::Command>>>,
     node_count: usize,
     // Role change notifications
     role_change_tx: broadcast::Sender<RoleChange>,
@@ -48,7 +48,7 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
     pub async fn new_with_transport(
         node_id: u64,
         receiver: mpsc::UnboundedReceiver<Message<E::Command>>,
-        transport: Arc<dyn crate::raft::generic::transport::TransportInteraction<E::Command>>,
+        transport: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<E::Command>>>,
         executor: E,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Create role change broadcast channel
@@ -357,7 +357,7 @@ mod tests {
         Noop,
     }
 
-    #[derive(Default)]
+    #[derive(Default, Clone, Debug)]
     struct TestCommandExecutor;
 
     impl CommandExecutor for TestCommandExecutor {
@@ -385,8 +385,9 @@ mod tests {
     #[tokio::test]
     async fn test_single_node_cluster_creation() {
         use crate::raft::generic::transport::{InMemoryClusterTransport, ClusterTransport};
+        use crate::raft::generic::message::Message;
 
-        let transport = Arc::new(InMemoryClusterTransport::<TestCommandExecutor>::new(vec![1]));
+        let transport = Arc::new(InMemoryClusterTransport::<Message<TestCommand>, TestCommandExecutor>::new(vec![1]));
         transport.start().await.expect("Transport start should succeed");
 
         let cluster = transport.create_cluster(1).await;
@@ -400,12 +401,13 @@ mod tests {
     #[tokio::test]
     async fn test_single_node_propose_and_apply() {
         use crate::raft::generic::transport::{InMemoryClusterTransport, ClusterTransport};
+        use crate::raft::generic::message::Message;
         const TEST_PREFIX: &str = "test1_";
 
         // Clear any previous test state for this prefix
         clear_test_state_for_prefix(TEST_PREFIX);
 
-        let transport = Arc::new(InMemoryClusterTransport::<TestCommandExecutor>::new(vec![1]));
+        let transport = Arc::new(InMemoryClusterTransport::<Message<TestCommand>, TestCommandExecutor>::new(vec![1]));
         transport.start().await.expect("Transport start should succeed");
 
         let cluster = transport.create_cluster(1).await
@@ -503,12 +505,13 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_commands_sequential() {
         use crate::raft::generic::transport::{InMemoryClusterTransport, ClusterTransport};
+        use crate::raft::generic::message::Message;
         const TEST_PREFIX: &str = "test2_";
 
         // Clear any previous test state for this prefix
         clear_test_state_for_prefix(TEST_PREFIX);
 
-        let transport = Arc::new(InMemoryClusterTransport::<TestCommandExecutor>::new(vec![1]));
+        let transport = Arc::new(InMemoryClusterTransport::<Message<TestCommand>, TestCommandExecutor>::new(vec![1]));
         transport.start().await.expect("Transport start should succeed");
 
         let cluster = transport.create_cluster(1).await

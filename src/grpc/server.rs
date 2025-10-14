@@ -25,7 +25,7 @@ use crate::raft::generic::cluster::RaftCluster;
 
 /// gRPC service implementation for Raft communication
 pub struct RaftServiceImpl<E: CommandExecutor> {
-    transport: Arc<GrpcClusterTransport<E>>,
+    transport: Arc<GrpcClusterTransport<Message<E::Command>, E>>,
     cluster: Arc<RaftCluster<E>>,
     node_id: u64,
     address: String,
@@ -33,7 +33,7 @@ pub struct RaftServiceImpl<E: CommandExecutor> {
 
 impl<E: CommandExecutor> RaftServiceImpl<E> {
     pub fn new(
-        transport: Arc<GrpcClusterTransport<E>>,
+        transport: Arc<GrpcClusterTransport<Message<E::Command>, E>>,
         cluster: Arc<RaftCluster<E>>,
         node_id: u64,
         address: String,
@@ -43,7 +43,7 @@ impl<E: CommandExecutor> RaftServiceImpl<E> {
 }
 
 #[tonic::async_trait]
-impl<E: CommandExecutor> RaftService for RaftServiceImpl<E> {
+impl<E: CommandExecutor + Default + 'static> RaftService for RaftServiceImpl<E> {
     async fn send_message(
         &self,
         request: Request<GenericMessage>,
@@ -170,7 +170,7 @@ impl GrpcServerHandle {
 /// Start a gRPC server for a Raft node with graceful shutdown
 pub async fn start_grpc_server(
     address: String,
-    transport: Arc<GrpcClusterTransport<crate::workflow::WorkflowCommandExecutor>>,
+    transport: Arc<GrpcClusterTransport<Message<crate::workflow::WorkflowCommand>, crate::workflow::WorkflowCommandExecutor>>,
     node_manager: Arc<crate::nodemanager::NodeManager>,
     node_id: u64,
 ) -> Result<GrpcServerHandle, Box<dyn std::error::Error>> {
@@ -180,7 +180,7 @@ pub async fn start_grpc_server(
 /// Start a gRPC server with custom server configuration
 pub async fn start_grpc_server_with_config(
     address: String,
-    transport: Arc<GrpcClusterTransport<crate::workflow::WorkflowCommandExecutor>>,
+    transport: Arc<GrpcClusterTransport<Message<crate::workflow::WorkflowCommand>, crate::workflow::WorkflowCommandExecutor>>,
     node_manager: Arc<crate::nodemanager::NodeManager>,
     node_id: u64,
     server_config: Option<ServerConfigurator>,

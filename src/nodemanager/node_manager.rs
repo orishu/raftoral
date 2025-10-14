@@ -3,9 +3,10 @@
 use std::sync::Arc;
 use crate::raft::RaftCluster;
 use crate::raft::generic::grpc_transport::GrpcClusterTransport;
+use crate::raft::generic::message::Message;
 use crate::raft::generic::transport::ClusterTransport;
-use crate::workflow::{WorkflowCommandExecutor, WorkflowRuntime};
-use super::management_executor::ManagementCommandExecutor;
+use crate::workflow::{WorkflowCommand, WorkflowCommandExecutor, WorkflowRuntime};
+use super::{ManagementCommand, ManagementCommandExecutor};
 
 /// NodeManager owns both the management cluster and workflow execution cluster(s)
 /// In future milestones, this will manage multiple execution clusters
@@ -29,7 +30,7 @@ impl NodeManager {
     /// TODO: In future milestones, implement proper message routing to allow
     /// multiple clusters to share the same transport without conflicts.
     pub async fn new(
-        transport: Arc<GrpcClusterTransport<WorkflowCommandExecutor>>,
+        transport: Arc<GrpcClusterTransport<Message<WorkflowCommand>, WorkflowCommandExecutor>>,
         node_id: u64,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Create workflow cluster
@@ -44,7 +45,7 @@ impl NodeManager {
             node_id,
             address: "127.0.0.1:0".to_string(),
         }];
-        let management_transport = Arc::new(GrpcClusterTransport::<ManagementCommandExecutor>::new(management_nodes));
+        let management_transport = Arc::new(GrpcClusterTransport::<Message<ManagementCommand>, ManagementCommandExecutor>::new(management_nodes));
         management_transport.start().await?;
         let management_cluster = management_transport.create_cluster(node_id).await?;
 
