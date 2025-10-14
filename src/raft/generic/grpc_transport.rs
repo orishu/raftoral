@@ -733,6 +733,7 @@ mod tests {
         let message = Message::Propose {
             id: 1,
             command: test_command.clone(),
+            sync_id: None,
         };
 
         // Send message

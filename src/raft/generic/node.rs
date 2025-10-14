@@ -7,7 +7,7 @@ use raft::{prelude::*, StateRole};
 use super::storage::MemStorageWithSnapshot;
 use slog::{Drain, Logger};
 use protobuf::Message as PbMessage;
-use crate::raft::generic::message::{Message, CommandExecutor, CommandWrapper};
+use crate::raft::generic::message::{Message, CommandExecutor};
 use crate::raft::generic::cluster::RoleChange;
 
 pub type SyncCallback = tokio::sync::oneshot::Sender<Result<(), Box<dyn std::error::Error + Send + Sync>>>;
@@ -74,6 +74,10 @@ pub struct RaftNode<E: CommandExecutor> {
 
     // Snapshot configuration
     snapshot_config: SnapshotConfig,
+
+    // Applied entries channel: send (log_index, context) when entries are applied
+    // Used by RaftCluster for synchronous command tracking
+    applied_tx: mpsc::UnboundedSender<(u64, Vec<u8>)>,
 }
 
 impl<E: CommandExecutor + 'static> RaftNode<E> {
@@ -85,6 +89,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
         role_change_tx: broadcast::Sender<RoleChange>,
         cached_config: Arc<RwLock<Vec<u64>>>,
         cached_conf_state: Arc<RwLock<raft::prelude::ConfState>>,
+        applied_tx: mpsc::UnboundedSender<(u64, Vec<u8>)>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let node_count = transport.list_nodes().len();
         let is_single_node = node_count == 1;
@@ -164,26 +169,38 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             current_role: StateRole::Follower, // Start as follower
             committed_index: 0,
             snapshot_config: SnapshotConfig::default(),
+            applied_tx,
         };
 
         Ok(node)
     }
 
     pub fn propose_command(&mut self, command: E::Command, sync_id: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
-        let wrapped_command = CommandWrapper {
-            id: sync_id,
-            command,
+        // Serialize command directly (no wrapper needed - sync_id goes in context)
+        let data = serde_json::to_vec(&command)?;
+
+        // Put sync_id in context as 8 bytes for synchronous tracking
+        let context = if let Some(id) = sync_id {
+            id.to_le_bytes().to_vec()
+        } else {
+            vec![]
         };
 
-        let data = serde_json::to_vec(&wrapped_command)?;
-        self.raft_group.propose(vec![], data)?;
+        self.raft_group.propose(context, data)?;
         Ok(())
     }
 
-    pub fn propose_conf_change_v2(&mut self, conf_change: ConfChangeV2) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn propose_conf_change_v2(&mut self, conf_change: ConfChangeV2, sync_id: Option<u64>) -> Result<(), Box<dyn std::error::Error>> {
+        // Put sync_id in context as 8 bytes for synchronous tracking
+        let context = if let Some(id) = sync_id {
+            id.to_le_bytes().to_vec()
+        } else {
+            vec![]
+        };
+
         // raft-rs 0.7.0 supports ConfChangeV2 through the ConfChangeI trait
         // Pass ConfChangeV2 directly - it will create EntryConfChangeV2 entries
-        self.raft_group.propose_conf_change(vec![], conf_change)?;
+        self.raft_group.propose_conf_change(context, conf_change)?;
         Ok(())
     }
 
@@ -319,26 +336,16 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
 
             match entry.entry_type {
                 EntryType::EntryNormal => {
-                    // All commands are now wrapped with CommandWrapper
-                    if let Ok(wrapped_command) = serde_json::from_slice::<CommandWrapper<E::Command>>(&entry.data) {
+                    // Deserialize command directly (no wrapper - sync_id is in context)
+                    if let Ok(command) = serde_json::from_slice::<E::Command>(&entry.data) {
                         // Track committed index
                         self.committed_index = entry.index;
 
-                        let result = self.apply_command(&wrapped_command.command, entry.index);
+                        let result = self.apply_command(&command, entry.index);
 
-                        // Notify the waiting sync callback if there's a sync ID
-                        if let Some(sync_id) = wrapped_command.id {
-                            if let Some(callback) = self.sync_commands.remove(&sync_id) {
-                                let callback_result = match &result {
-                                    Ok(_) => Ok(()),
-                                    Err(e) => {
-                                        let err: Box<dyn std::error::Error + Send + Sync> = format!("{}", e).into();
-                                        Err(err)
-                                    }
-                                };
-                                let _ = callback.send(callback_result);
-                            }
-                        }
+                        // Send applied entry notification with context (for sync tracking)
+                        // Context contains the sync_id as 8 bytes
+                        let _ = self.applied_tx.send((entry.index, entry.context.to_vec()));
 
                         result?;
                         last_applied_index = Some(entry.index);
@@ -365,6 +372,10 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                     } else {
                         slog::error!(self.logger, "Failed to parse conf change v2 from entry data");
                     }
+
+                    // Send applied entry notification with context (for sync tracking)
+                    let _ = self.applied_tx.send((entry.index, entry.context.to_vec()));
+
                     last_applied_index = Some(entry.index);
                 },
             }
@@ -515,10 +526,9 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                 // Handle incoming messages
                 msg = self.mailbox.recv() => {
                     match msg {
-                        Some(Message::Propose { command, .. }) => {
-                            // No callbacks - just propose the command
-                            // Completion tracking is now done via command IDs in the executor
-                            match self.propose_command(command, None) {
+                        Some(Message::Propose { command, sync_id, .. }) => {
+                            // Propose the command with sync_id for synchronous tracking
+                            match self.propose_command(command, sync_id) {
                                 Ok(_) => {},
                                 Err(e) => {
                                     slog::error!(self.logger, "Failed to propose command"; "error" => %e);
@@ -530,14 +540,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                                 slog::error!(self.logger, "Failed to step raft message"; "error" => %e);
                             }
                         },
-                        Some(Message::ConfChangeV2 { change, .. }) => {
-                            match self.propose_conf_change_v2(change) {
-                                Ok(_) => {},
-                                Err(e) => {
-                                    slog::error!(self.logger, "Failed to propose conf change v2"; "error" => %e);
-                                }
-                            }
-                        },
+                        // ConfChangeV2 message variant removed - use AddNode/RemoveNode instead
                         Some(Message::Campaign) => {
                             match self.campaign() {
                                 Ok(_) => {},
@@ -546,7 +549,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                                 }
                             }
                         },
-                        Some(Message::AddNode { node_id, address }) => {
+                        Some(Message::AddNode { node_id, address, sync_id }) => {
                             slog::info!(self.logger, "Preparing to add node as voter"; "node_id" => node_id, "address" => &address);
 
                             // Add node directly as voter (simpler approach with proper initialization)
@@ -573,7 +576,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                                 }
                             }
 
-                            match self.propose_conf_change_v2(conf_change) {
+                            match self.propose_conf_change_v2(conf_change, sync_id) {
                                 Ok(_) => {
                                     slog::info!(self.logger, "Proposed adding node"; "node_id" => node_id, "address" => address);
 
@@ -600,7 +603,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                                 }
                             }
                         },
-                        Some(Message::RemoveNode { node_id }) => {
+                        Some(Message::RemoveNode { node_id, sync_id }) => {
                             // Create ConfChangeV2 for removing node
                             let mut conf_change = ConfChangeV2::default();
                             let mut change = ConfChangeSingle::default();
@@ -608,7 +611,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                             change.node_id = node_id;
                             conf_change.changes.push(change);
 
-                            match self.propose_conf_change_v2(conf_change) {
+                            match self.propose_conf_change_v2(conf_change, sync_id) {
                                 Ok(_) => {
                                     slog::info!(self.logger, "Proposed removing node"; "node_id" => node_id);
                                 },

@@ -51,40 +51,6 @@ pub trait CommandExecutor: Send + Sync + 'static {
     }
 }
 
-/// Wrapper for commands with optional tracking ID
-#[derive(Clone, Debug, Serialize)]
-pub struct CommandWrapper<C>
-where
-    C: Clone + Debug + Serialize + DeserializeOwned + Send + Sync + 'static,
-{
-    pub id: Option<u64>,
-    pub command: C,
-}
-
-// Manual Deserialize implementation to work with command constraints
-impl<'de, C> Deserialize<'de> for CommandWrapper<C>
-where
-    C: Clone + Debug + Serialize + DeserializeOwned + Send + Sync + 'static,
-{
-    fn deserialize<D>(deserializer: D) -> Result<CommandWrapper<C>, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct CommandWrapperHelper<T> {
-            id: Option<u64>,
-            command: T,
-        }
-
-        let helper = CommandWrapperHelper::<C>::deserialize(deserializer)?;
-        Ok(CommandWrapper {
-            id: helper.id,
-            command: helper.command,
-        })
-    }
-}
-
-
 #[derive(Clone, Debug)]
 pub enum Message<C>
 where
@@ -93,19 +59,18 @@ where
     Propose {
         id: u8,
         command: C,
+        sync_id: Option<u64>,  // For synchronous proposal tracking
     },
     Raft(raft::prelude::Message),
-    ConfChangeV2 {
-        id: u8,
-        change: raft::prelude::ConfChangeV2,
-    },
     Campaign,
     AddNode {
         node_id: u64,
         address: String,
+        sync_id: Option<u64>,  // For synchronous tracking
     },
     RemoveNode {
         node_id: u64,
+        sync_id: Option<u64>,  // For synchronous tracking
     },
 }
 
@@ -119,36 +84,32 @@ where
         use protobuf::Message as ProtobufMessage;
 
         let message = match self {
-            Message::Propose { id, command } => {
+            Message::Propose { id, command, sync_id } => {
                 let command_json = serde_json::to_vec(command)?;
                 raft_proto::generic_message::Message::Propose(raft_proto::ProposeMessage {
                     id: *id as u32,
                     command_json,
+                    sync_id: sync_id.unwrap_or(0),
                 })
             },
             Message::Raft(raft_msg) => {
                 let bytes = raft_msg.write_to_bytes()?;
                 raft_proto::generic_message::Message::RaftMessage(bytes)
             },
-            Message::ConfChangeV2 { id, change } => {
-                let bytes = change.write_to_bytes()?;
-                raft_proto::generic_message::Message::ConfChange(raft_proto::ConfChangeV2Message {
-                    id: *id as u32,
-                    change_bytes: bytes,
-                })
-            },
             Message::Campaign => {
                 raft_proto::generic_message::Message::Campaign(raft_proto::CampaignMessage {})
             },
-            Message::AddNode { node_id, address } => {
+            Message::AddNode { node_id, address, sync_id } => {
                 raft_proto::generic_message::Message::AddNode(raft_proto::AddNodeMessage {
                     node_id: *node_id,
                     address: address.clone(),
+                    sync_id: sync_id.unwrap_or(0),
                 })
             },
-            Message::RemoveNode { node_id } => {
+            Message::RemoveNode { node_id, sync_id } => {
                 raft_proto::generic_message::Message::RemoveNode(raft_proto::RemoveNodeMessage {
                     node_id: *node_id,
+                    sync_id: sync_id.unwrap_or(0),
                 })
             },
         };
@@ -172,18 +133,12 @@ where
                 Message::Propose {
                     id: propose.id as u8,
                     command,
+                    sync_id: if propose.sync_id == 0 { None } else { Some(propose.sync_id) },
                 }
             },
             raft_proto::generic_message::Message::RaftMessage(bytes) => {
                 let raft_msg = raft::prelude::Message::parse_from_bytes(&bytes)?;
                 Message::Raft(raft_msg)
-            },
-            raft_proto::generic_message::Message::ConfChange(conf_change) => {
-                let change = raft::prelude::ConfChangeV2::parse_from_bytes(&conf_change.change_bytes)?;
-                Message::ConfChangeV2 {
-                    id: conf_change.id as u8,
-                    change,
-                }
             },
             raft_proto::generic_message::Message::Campaign(_) => {
                 Message::Campaign
@@ -192,12 +147,17 @@ where
                 Message::AddNode {
                     node_id: add_node.node_id,
                     address: add_node.address,
+                    sync_id: if add_node.sync_id == 0 { None } else { Some(add_node.sync_id) },
                 }
             },
             raft_proto::generic_message::Message::RemoveNode(remove_node) => {
                 Message::RemoveNode {
                     node_id: remove_node.node_id,
+                    sync_id: if remove_node.sync_id == 0 { None } else { Some(remove_node.sync_id) },
                 }
+            },
+            raft_proto::generic_message::Message::ConfChange(_) => {
+                return Err("ConfChangeV2 message variant is deprecated".into());
             },
         })
     }
