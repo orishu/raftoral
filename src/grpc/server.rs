@@ -24,11 +24,15 @@ use crate::raft::generic::message::{Message, CommandExecutor};
 use crate::raft::generic::cluster::RaftCluster;
 
 /// gRPC service implementation for Raft communication
+/// Now uses ClusterRouter for multi-cluster support
 pub struct RaftServiceImpl<E: CommandExecutor> {
     transport: Arc<GrpcClusterTransport<Message<E::Command>>>,
     cluster: Arc<RaftCluster<E>>,
     node_id: u64,
     address: String,
+    /// Optional cluster router for multi-cluster routing (Phase 2)
+    /// If None, falls back to single-cluster behavior (Phase 1)
+    cluster_router: Option<Arc<crate::grpc::ClusterRouter>>,
 }
 
 impl<E: CommandExecutor> RaftServiceImpl<E> {
@@ -38,7 +42,18 @@ impl<E: CommandExecutor> RaftServiceImpl<E> {
         node_id: u64,
         address: String,
     ) -> Self {
-        Self { transport, cluster, node_id, address }
+        Self { transport, cluster, node_id, address, cluster_router: None }
+    }
+
+    /// Create a new RaftServiceImpl with cluster routing support (Phase 2)
+    pub fn with_cluster_router(
+        transport: Arc<GrpcClusterTransport<Message<E::Command>>>,
+        cluster: Arc<RaftCluster<E>>,
+        node_id: u64,
+        address: String,
+        cluster_router: Arc<crate::grpc::ClusterRouter>,
+    ) -> Self {
+        Self { transport, cluster, node_id, address, cluster_router: Some(cluster_router) }
     }
 }
 
@@ -50,24 +65,31 @@ impl<E: CommandExecutor + Default + 'static> RaftService for RaftServiceImpl<E> 
     ) -> Result<Response<MessageResponse>, Status> {
         let proto_msg = request.into_inner();
 
-        // Phase 1: Validate cluster_id is 0 (single cluster mode)
-        if proto_msg.cluster_id != 0 {
-            return Err(Status::invalid_argument(
-                format!("Phase 1: Only cluster_id=0 supported, got {}", proto_msg.cluster_id)
-            ));
+        // Phase 2: Use cluster router if available, otherwise fallback to single-cluster
+        if let Some(router) = &self.cluster_router {
+            // Multi-cluster mode: route based on cluster_id
+            router.route_message(proto_msg).await?;
+        } else {
+            // Single-cluster mode (backward compatibility)
+            // Validate cluster_id is 0
+            if proto_msg.cluster_id != 0 {
+                return Err(Status::invalid_argument(
+                    format!("Single-cluster mode: Only cluster_id=0 supported, got {}", proto_msg.cluster_id)
+                ));
+            }
+
+            // Convert directly from protobuf to Message (no intermediate SerializableMessage)
+            let message = Message::<E::Command>::from_protobuf(proto_msg)
+                .map_err(|e| Status::invalid_argument(format!("Failed to deserialize: {}", e)))?;
+
+            // Get the sender for this node
+            let sender = self.transport.get_node_sender(self.node_id).await
+                .ok_or_else(|| Status::not_found(format!("Node {} not found", self.node_id)))?;
+
+            // Send the message to the node's local mailbox
+            sender.send(message)
+                .map_err(|e| Status::internal(format!("Failed to send message: {}", e)))?;
         }
-
-        // Convert directly from protobuf to Message (no intermediate SerializableMessage)
-        let message = Message::<E::Command>::from_protobuf(proto_msg)
-            .map_err(|e| Status::invalid_argument(format!("Failed to deserialize: {}", e)))?;
-
-        // Get the sender for this node
-        let sender = self.transport.get_node_sender(self.node_id).await
-            .ok_or_else(|| Status::not_found(format!("Node {} not found", self.node_id)))?;
-
-        // Send the message to the node's local mailbox
-        sender.send(message)
-            .map_err(|e| Status::internal(format!("Failed to send message: {}", e)))?;
 
         Ok(Response::new(MessageResponse {
             success: true,
@@ -172,6 +194,74 @@ impl GrpcServerHandle {
     pub fn shutdown(self) {
         let _ = self.shutdown_tx.send(());
     }
+}
+
+/// Start a gRPC server with multi-cluster routing support (Phase 2)
+pub async fn start_grpc_server_with_router(
+    address: String,
+    node_manager: Arc<crate::nodemanager::NodeManager>,
+    cluster_router: Arc<crate::grpc::ClusterRouter>,
+    node_id: u64,
+) -> Result<GrpcServerHandle, Box<dyn std::error::Error>> {
+    start_grpc_server_with_router_and_config(address, node_manager, cluster_router, node_id, None).await
+}
+
+/// Start a gRPC server with multi-cluster routing and custom server configuration (Phase 2)
+pub async fn start_grpc_server_with_router_and_config(
+    address: String,
+    node_manager: Arc<crate::nodemanager::NodeManager>,
+    cluster_router: Arc<crate::grpc::ClusterRouter>,
+    node_id: u64,
+    server_config: Option<ServerConfigurator>,
+) -> Result<GrpcServerHandle, Box<dyn std::error::Error>> {
+    let addr = address.parse()?;
+
+    // Create dummy transport for the service (not used with router)
+    // TODO: Clean this up when we fully remove transport from RaftServiceImpl
+    let nodes = vec![crate::raft::generic::grpc_transport::NodeConfig {
+        node_id,
+        address: address.clone(),
+    }];
+    let transport = Arc::new(GrpcClusterTransport::<Message<crate::workflow::WorkflowCommand>>::new(nodes));
+
+    let cluster = node_manager.workflow_cluster.clone();
+    let raft_service = RaftServiceImpl::with_cluster_router(
+        transport,
+        cluster,
+        node_id,
+        address,
+        cluster_router
+    );
+    let runtime = node_manager.workflow_runtime();
+    let workflow_service = WorkflowManagementImpl::new(runtime);
+
+    // Create reflection service
+    let reflection_service = ReflectionBuilder::configure()
+        .register_encoded_file_descriptor_set(raft_proto::FILE_DESCRIPTOR_SET)
+        .build_v1()?;
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        let mut server = Server::builder();
+
+        // Apply custom configuration if provided
+        if let Some(config_fn) = server_config {
+            server = config_fn(server);
+        }
+
+        server
+            .add_service(RaftServiceServer::new(raft_service))
+            .add_service(WorkflowManagementServer::new(workflow_service))
+            .add_service(reflection_service)
+            .serve_with_shutdown(addr, async {
+                shutdown_rx.await.ok();
+            })
+            .await
+            .expect("gRPC server failed");
+    });
+
+    Ok(GrpcServerHandle { shutdown_tx })
 }
 
 /// Start a gRPC server for a Raft node with graceful shutdown
