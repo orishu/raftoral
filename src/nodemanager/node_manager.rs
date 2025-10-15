@@ -31,7 +31,7 @@ impl NodeManager {
     pub fn create_cluster_router(&self) -> Result<Arc<crate::grpc::ClusterRouter>, Box<dyn std::error::Error>> {
         use crate::grpc::ClusterRouter;
 
-        let mut router = ClusterRouter::new();
+        let router = ClusterRouter::new();
 
         // Register management cluster (cluster_id = 0)
         // TODO: Actually use management_cluster when we implement it properly
@@ -47,17 +47,15 @@ impl NodeManager {
 
     /// Create a new NodeManager by creating both clusters from a shared transport
     ///
-    /// The transport is shared between management and workflow clusters since
-    /// execution clusters are "virtual" - they use the same underlying transport.
-    ///
-    /// TODO: In future milestones, implement proper message routing to allow
-    /// multiple clusters to share the same transport without conflicts.
+    /// Phase 3: Transport is now type-parameter-free!
+    /// The transport can now truly be shared between different cluster types.
     pub async fn new(
-        transport: Arc<GrpcClusterTransport<Message<WorkflowCommand>>>,
+        transport: Arc<GrpcClusterTransport>,
         node_id: u64,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Create workflow cluster using new pattern
-        let receiver = transport.extract_receiver(node_id)?;
+        // Phase 3: Use extract_typed_receiver to get Message<WorkflowCommand> receiver
+        let receiver = transport.extract_typed_receiver::<WorkflowCommand>(node_id)?;
         let executor = WorkflowCommandExecutor::default();
         let transport_ref: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<WorkflowCommand>>> = transport.clone();
         let workflow_cluster = Arc::new(RaftCluster::new(node_id, receiver, transport_ref, executor).await?);
@@ -70,15 +68,17 @@ impl NodeManager {
 
         // TODO: Create management cluster once we implement unified transport with routing
         // For now, create a placeholder that won't be used
+        // Phase 3: Transport is now type-parameter-free!
         let management_nodes = vec![crate::raft::generic::grpc_transport::NodeConfig {
             node_id,
             address: "127.0.0.1:0".to_string(),
         }];
-        let management_transport = Arc::new(GrpcClusterTransport::<Message<ManagementCommand>>::new(management_nodes));
+        let management_transport = Arc::new(GrpcClusterTransport::new(management_nodes));
         management_transport.start().await?;
 
         // Create management cluster using new pattern
-        let management_receiver = management_transport.extract_receiver(node_id)?;
+        // Phase 3: Use extract_typed_receiver to get Message<ManagementCommand> receiver
+        let management_receiver = management_transport.extract_typed_receiver::<ManagementCommand>(node_id)?;
         let management_executor = ManagementCommandExecutor::default();
         let management_transport_ref: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<ManagementCommand>>> = management_transport.clone();
         let management_cluster = Arc::new(RaftCluster::new(node_id, management_receiver, management_transport_ref, management_executor).await?);

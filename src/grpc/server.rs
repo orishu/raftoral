@@ -20,13 +20,14 @@ use raft_proto::{
     RunWorkflowRequest, RunWorkflowResponse,
 };
 
-use crate::raft::generic::message::{Message, CommandExecutor};
+use crate::raft::generic::message::CommandExecutor;
 use crate::raft::generic::cluster::RaftCluster;
 
 /// gRPC service implementation for Raft communication
 /// Now uses ClusterRouter for multi-cluster support
+/// Phase 3: Transport is now type-parameter-free!
 pub struct RaftServiceImpl<E: CommandExecutor> {
-    transport: Arc<GrpcClusterTransport<Message<E::Command>>>,
+    transport: Arc<GrpcClusterTransport>,
     cluster: Arc<RaftCluster<E>>,
     node_id: u64,
     address: String,
@@ -37,7 +38,7 @@ pub struct RaftServiceImpl<E: CommandExecutor> {
 
 impl<E: CommandExecutor> RaftServiceImpl<E> {
     pub fn new(
-        transport: Arc<GrpcClusterTransport<Message<E::Command>>>,
+        transport: Arc<GrpcClusterTransport>,
         cluster: Arc<RaftCluster<E>>,
         node_id: u64,
         address: String,
@@ -47,7 +48,7 @@ impl<E: CommandExecutor> RaftServiceImpl<E> {
 
     /// Create a new RaftServiceImpl with cluster routing support (Phase 2)
     pub fn with_cluster_router(
-        transport: Arc<GrpcClusterTransport<Message<E::Command>>>,
+        transport: Arc<GrpcClusterTransport>,
         cluster: Arc<RaftCluster<E>>,
         node_id: u64,
         address: String,
@@ -78,16 +79,13 @@ impl<E: CommandExecutor + Default + 'static> RaftService for RaftServiceImpl<E> 
                 ));
             }
 
-            // Convert directly from protobuf to Message (no intermediate SerializableMessage)
-            let message = Message::<E::Command>::from_protobuf(proto_msg)
-                .map_err(|e| Status::invalid_argument(format!("Failed to deserialize: {}", e)))?;
-
+            // Phase 3: Transport now works with GenericMessage
             // Get the sender for this node
             let sender = self.transport.get_node_sender(self.node_id).await
                 .ok_or_else(|| Status::not_found(format!("Node {} not found", self.node_id)))?;
 
-            // Send the message to the node's local mailbox
-            sender.send(message)
+            // Send the GenericMessage directly (will be deserialized by extract_typed_receiver adapter)
+            sender.send(proto_msg)
                 .map_err(|e| Status::internal(format!("Failed to send message: {}", e)))?;
         }
 
@@ -217,12 +215,12 @@ pub async fn start_grpc_server_with_router_and_config(
     let addr = address.parse()?;
 
     // Create dummy transport for the service (not used with router)
-    // TODO: Clean this up when we fully remove transport from RaftServiceImpl
+    // Phase 3: Transport is now type-parameter-free!
     let nodes = vec![crate::raft::generic::grpc_transport::NodeConfig {
         node_id,
         address: address.clone(),
     }];
-    let transport = Arc::new(GrpcClusterTransport::<Message<crate::workflow::WorkflowCommand>>::new(nodes));
+    let transport = Arc::new(GrpcClusterTransport::new(nodes));
 
     let cluster = node_manager.workflow_cluster.clone();
     let raft_service = RaftServiceImpl::with_cluster_router(
@@ -265,9 +263,10 @@ pub async fn start_grpc_server_with_router_and_config(
 }
 
 /// Start a gRPC server for a Raft node with graceful shutdown
+/// Phase 3: Transport is now type-parameter-free!
 pub async fn start_grpc_server(
     address: String,
-    transport: Arc<GrpcClusterTransport<Message<crate::workflow::WorkflowCommand>>>,
+    transport: Arc<GrpcClusterTransport>,
     node_manager: Arc<crate::nodemanager::NodeManager>,
     node_id: u64,
 ) -> Result<GrpcServerHandle, Box<dyn std::error::Error>> {
@@ -275,9 +274,10 @@ pub async fn start_grpc_server(
 }
 
 /// Start a gRPC server with custom server configuration
+/// Phase 3: Transport is now type-parameter-free!
 pub async fn start_grpc_server_with_config(
     address: String,
-    transport: Arc<GrpcClusterTransport<Message<crate::workflow::WorkflowCommand>>>,
+    transport: Arc<GrpcClusterTransport>,
     node_manager: Arc<crate::nodemanager::NodeManager>,
     node_id: u64,
     server_config: Option<ServerConfigurator>,

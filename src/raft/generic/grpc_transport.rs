@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::mpsc;
 use crate::raft::generic::message::Message;
 use crate::grpc::client::{RaftClient, ChannelBuilder, default_channel_builder};
+use crate::grpc::server::raft_proto::GenericMessage;
 
 /// Configuration for a node in the gRPC cluster
 #[derive(Clone, Debug)]
@@ -13,12 +14,11 @@ pub struct NodeConfig {
 
 /// All components needed to send messages to a peer node
 /// Consolidates sender, gRPC client, and forwarder handle for atomic management
-struct Destination<M>
-where
-    M: Clone + std::fmt::Debug + Send + Sync + 'static,
+/// Phase 3: Now works with GenericMessage (no type parameter)
+struct Destination
 {
-    /// Channel to send messages to this node
-    sender: mpsc::UnboundedSender<M>,
+    /// Channel to send messages to this node (now GenericMessage)
+    sender: mpsc::UnboundedSender<GenericMessage>,
 
     /// gRPC client for remote communication (None for local node or not yet connected)
     grpc_client: Option<Arc<tokio::sync::Mutex<RaftClient>>>,
@@ -29,24 +29,24 @@ where
 
 /// Generic gRPC-based transport for distributed Raft clusters
 ///
+/// Phase 3: Now works with GenericMessage (no type parameters!)
+/// This enables a single transport instance to be shared across multiple clusters
+/// with different command types (management, workflow, etc.)
+///
 /// This transport enables Raft nodes to communicate over network via gRPC.
 /// It maintains a mapping of node IDs to network addresses and provides
 /// the infrastructure for sending Raft messages between nodes.
-///
-/// Generic over:
-/// - M: Message type being transported (typically Message<C>)
-pub struct GrpcClusterTransport<M>
-where
-    M: Clone + std::fmt::Debug + Send + Sync + 'static,
+pub struct GrpcClusterTransport
 {
     /// Unified peer management: node_id -> all communication components
-    destinations: Arc<RwLock<HashMap<u64, Destination<M>>>>,
+    destinations: Arc<RwLock<HashMap<u64, Destination>>>,
 
     /// Node configurations (node_id -> address)
     nodes: Arc<RwLock<HashMap<u64, NodeConfig>>>,
 
     /// Receivers for each node (held until extract_receiver is called)
-    node_receivers: Arc<Mutex<HashMap<u64, mpsc::UnboundedReceiver<M>>>>,
+    /// Now returns GenericMessage receivers
+    node_receivers: Arc<Mutex<HashMap<u64, mpsc::UnboundedReceiver<GenericMessage>>>>,
 
     /// Shutdown signal
     shutdown_tx: Arc<Mutex<Option<tokio::sync::broadcast::Sender<()>>>>,
@@ -59,11 +59,10 @@ where
     discovered_voters: Arc<RwLock<Vec<u64>>>,
 }
 
-impl<M> GrpcClusterTransport<M>
-where
-    M: Clone + std::fmt::Debug + Send + Sync + 'static,
+impl GrpcClusterTransport
 {
     /// Create a new gRPC transport with the given node configurations
+    /// Phase 3: Now type-parameter-free!
     pub fn new(nodes: Vec<NodeConfig>) -> Self {
         Self::new_with_channel_builder(nodes, default_channel_builder())
     }
@@ -134,15 +133,51 @@ where
         }
     }
 
-    /// Extract the receiver for a specific node
+    /// Extract the receiver for a specific node (raw GenericMessage receiver)
     /// This removes the receiver from the internal map, so it can only be called once per node
+    /// Phase 3: Returns GenericMessage receiver
     pub fn extract_receiver(
         &self,
         node_id: u64,
-    ) -> Result<mpsc::UnboundedReceiver<M>, Box<dyn std::error::Error>> {
+    ) -> Result<mpsc::UnboundedReceiver<GenericMessage>, Box<dyn std::error::Error>> {
         let mut receivers = self.node_receivers.lock().unwrap();
         receivers.remove(&node_id)
             .ok_or_else(|| format!("Node {} receiver already extracted or doesn't exist", node_id).into())
+    }
+
+    /// Extract a typed receiver that deserializes GenericMessage → Message<C>
+    /// This creates an adapter channel that performs deserialization
+    /// Phase 3: Helper for RaftCluster which needs Message<C>
+    pub fn extract_typed_receiver<C>(
+        &self,
+        node_id: u64,
+    ) -> Result<mpsc::UnboundedReceiver<Message<C>>, Box<dyn std::error::Error>>
+    where
+        C: Clone + std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+    {
+        let generic_rx = self.extract_receiver(node_id)?;
+
+        // Create adapter channel
+        let (typed_tx, typed_rx) = mpsc::unbounded_channel();
+
+        // Spawn adapter task that deserializes GenericMessage → Message<C>
+        tokio::spawn(async move {
+            let mut rx = generic_rx;
+            while let Some(generic_msg) = rx.recv().await {
+                match Message::<C>::from_protobuf(generic_msg) {
+                    Ok(message) => {
+                        if typed_tx.send(message).is_err() {
+                            break; // Receiver dropped
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to deserialize message: {}", e);
+                    }
+                }
+            }
+        });
+
+        Ok(typed_rx)
     }
 
     /// Start the transport by creating the shutdown channel and connecting to all nodes
@@ -225,13 +260,12 @@ where
     }
 }
 
-// Methods that work with any message type M (happens to include Message<C>)
-impl<C> GrpcClusterTransport<crate::raft::generic::message::Message<C>>
-where
-    C: Clone + std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+// Phase 3: All methods now work with GenericMessage
+impl GrpcClusterTransport
 {
     /// Add a new node to the transport configuration
     /// IMPORTANT: This creates gRPC client and forwarder for the new node
+    /// Phase 3: Now works with GenericMessage
     pub async fn add_node(&self, node: NodeConfig) -> Result<(), Box<dyn std::error::Error>> {
         // Check if already exists
         {
@@ -312,10 +346,11 @@ where
     }
 
     /// Spawn a background task that forwards messages to a remote peer via gRPC
+    /// Phase 3: Now works with GenericMessage directly (already serialized)
     fn spawn_peer_forwarder(
         &self,
         target_node_id: u64,
-        mut forwarder_rx: mpsc::UnboundedReceiver<crate::raft::generic::message::Message<C>>,
+        mut forwarder_rx: mpsc::UnboundedReceiver<GenericMessage>,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     ) -> tokio::task::JoinHandle<()> {
         let destinations = self.destinations.clone();
@@ -323,7 +358,7 @@ where
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    Some(message) = forwarder_rx.recv() => {
+                    Some(proto_msg) = forwarder_rx.recv() => {
                         // Get the gRPC client for this node from destination
                         let client_arc = {
                             let dests = destinations.read().unwrap();
@@ -333,16 +368,9 @@ where
                         if let Some(client) = client_arc {
                             let mut client = client.lock().await;
 
-                            // Serialize Message<C> to GenericMessage before sending
-                            match message.to_protobuf() {
-                                Ok(proto_msg) => {
-                                    if let Err(e) = client.send_message(proto_msg).await {
-                                        eprintln!("Failed to send message to node {}: {}", target_node_id, e);
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("Failed to serialize message for node {}: {}", target_node_id, e);
-                                }
+                            // Phase 3: Message is already serialized to GenericMessage
+                            if let Err(e) = client.send_message(proto_msg).await {
+                                eprintln!("Failed to send message to node {}: {}", target_node_id, e);
                             }
                         }
                     }
@@ -355,15 +383,17 @@ where
     }
 
     /// Internal method to get a sender for a specific node
-    pub async fn get_node_sender(&self, node_id: u64) -> Option<mpsc::UnboundedSender<crate::raft::generic::message::Message<C>>> {
+    /// Phase 3: Now returns GenericMessage sender
+    pub async fn get_node_sender(&self, node_id: u64) -> Option<mpsc::UnboundedSender<GenericMessage>> {
         let destinations = self.destinations.read().unwrap();
         destinations.get(&node_id).map(|dest| dest.sender.clone())
     }
 }
 
-// Implement TransportInteraction trait for unified transport interaction
-// Implement TransportInteraction for Message<C>
-impl<C> crate::raft::generic::transport::TransportInteraction<Message<C>> for GrpcClusterTransport<Message<C>>
+// Phase 3: TransportInteraction implementation
+// The transport is type-parameter-free, but the trait is still generic over Message<C>
+// This impl converts Message<C> → GenericMessage at the boundary
+impl<C> crate::raft::generic::transport::TransportInteraction<Message<C>> for GrpcClusterTransport
 where
     C: Clone + std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
 {
@@ -372,11 +402,14 @@ where
         target_node_id: u64,
         message: Message<C>
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Phase 3: Serialize Message<C> → GenericMessage at the transport boundary
+        let proto_msg = message.to_protobuf()?;
+
         let destinations = self.destinations.read().unwrap();
         let dest = destinations.get(&target_node_id)
             .ok_or_else(|| format!("Node {} not found", target_node_id))?;
 
-        dest.sender.send(message)
+        dest.sender.send(proto_msg)
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
         Ok(())
@@ -520,7 +553,7 @@ mod tests {
             NodeConfig { node_id: 2, address: "127.0.0.1:5002".to_string() },
         ];
 
-        let transport = GrpcClusterTransport::<Message<TestCommand>>::new(nodes);
+        let transport = GrpcClusterTransport::new(nodes);
 
         // Verify we can get node addresses
         assert_eq!(
@@ -535,7 +568,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_remove_node() {
-        let transport = GrpcClusterTransport::<Message<TestCommand>>::new(vec![]);
+        let transport = GrpcClusterTransport::new(vec![]);
 
         // Add a node
         let node = NodeConfig { node_id: 1, address: "127.0.0.1:5001".to_string() };
