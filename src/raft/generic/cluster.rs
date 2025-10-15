@@ -35,18 +35,22 @@ pub struct RaftCluster<E: CommandExecutor> {
 }
 
 impl<E: CommandExecutor + 'static> RaftCluster<E> {
-    /// Create a new cluster node with pre-configured transport channels
+    /// Create a new Raft cluster node
     ///
-    /// This is the primary constructor used by ClusterTransport implementations.
-    /// It creates a single RaftCluster instance that represents one node in a
-    /// potentially multi-node cluster.
-    ///
-    /// # Arguments
+    /// # Parameters
     /// * `node_id` - Unique identifier for this node
     /// * `receiver` - Channel to receive messages for this node
     /// * `transport` - Transport implementation for sending messages to peers
     /// * `executor` - Command executor for applying committed commands
-    pub async fn new_with_transport(
+    ///
+    /// # Example
+    /// ```ignore
+    /// let transport = Arc::new(InMemoryClusterTransport::new(vec![1, 2, 3]));
+    /// let receiver = transport.extract_receiver(1).await?;
+    /// let executor = MyExecutor::default();
+    /// let cluster = RaftCluster::new(1, receiver, transport, executor).await?;
+    /// ```
+    pub async fn new(
         node_id: u64,
         receiver: mpsc::UnboundedReceiver<Message<E::Command>>,
         transport: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<E::Command>>>,
@@ -382,13 +386,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_single_node_cluster_creation() {
-        use crate::raft::generic::transport::{InMemoryClusterTransport, ClusterTransport};
+        use crate::raft::generic::transport::InMemoryClusterTransport;
         use crate::raft::generic::message::Message;
 
-        let transport = Arc::new(InMemoryClusterTransport::<Message<TestCommand>, TestCommandExecutor>::new(vec![1]));
-        transport.start().await.expect("Transport start should succeed");
-
-        let cluster = transport.create_cluster(1).await;
+        let transport = Arc::new(InMemoryClusterTransport::<Message<TestCommand>>::new(vec![1]));
+        let receiver = transport.extract_receiver(1).await.expect("Extract receiver");
+        let executor = TestCommandExecutor;
+        let transport_ref: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<TestCommand>>> = transport.clone();
+        let cluster = RaftCluster::new(1, receiver, transport_ref, executor).await;
         assert!(cluster.is_ok());
 
         let cluster = cluster.unwrap();
@@ -398,18 +403,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_single_node_propose_and_apply() {
-        use crate::raft::generic::transport::{InMemoryClusterTransport, ClusterTransport};
+        use crate::raft::generic::transport::InMemoryClusterTransport;
         use crate::raft::generic::message::Message;
         const TEST_PREFIX: &str = "test1_";
 
         // Clear any previous test state for this prefix
         clear_test_state_for_prefix(TEST_PREFIX);
 
-        let transport = Arc::new(InMemoryClusterTransport::<Message<TestCommand>, TestCommandExecutor>::new(vec![1]));
-        transport.start().await.expect("Transport start should succeed");
-
-        let cluster = transport.create_cluster(1).await
-            .expect("Failed to create single node cluster");
+        let transport = Arc::new(InMemoryClusterTransport::<Message<TestCommand>>::new(vec![1]));
+        let receiver = transport.extract_receiver(1).await.expect("Extract receiver");
+        let executor = TestCommandExecutor;
+        let transport_ref: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<TestCommand>>> = transport.clone();
+        let cluster = Arc::new(RaftCluster::new(1, receiver, transport_ref, executor).await
+            .expect("Failed to create single node cluster"));
 
         // Wait for leadership establishment
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -502,18 +508,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_commands_sequential() {
-        use crate::raft::generic::transport::{InMemoryClusterTransport, ClusterTransport};
+        use crate::raft::generic::transport::InMemoryClusterTransport;
         use crate::raft::generic::message::Message;
         const TEST_PREFIX: &str = "test2_";
 
         // Clear any previous test state for this prefix
         clear_test_state_for_prefix(TEST_PREFIX);
 
-        let transport = Arc::new(InMemoryClusterTransport::<Message<TestCommand>, TestCommandExecutor>::new(vec![1]));
-        transport.start().await.expect("Transport start should succeed");
-
-        let cluster = transport.create_cluster(1).await
-            .expect("Failed to create single node cluster");
+        let transport = Arc::new(InMemoryClusterTransport::<Message<TestCommand>>::new(vec![1]));
+        let receiver = transport.extract_receiver(1).await.expect("Extract receiver");
+        let executor = TestCommandExecutor;
+        let transport_ref: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<TestCommand>>> = transport.clone();
+        let cluster = Arc::new(RaftCluster::new(1, receiver, transport_ref, executor).await
+            .expect("Failed to create single node cluster"));
 
         // Wait for leadership establishment
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;

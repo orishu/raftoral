@@ -118,15 +118,24 @@ impl WorkflowRuntime {
 
     /// Create a new workflow runtime and cluster with in-memory transport
     pub async fn new_single_node(node_id: u64) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
-        use crate::raft::generic::transport::{InMemoryClusterTransport, ClusterTransport};
+        use crate::raft::generic::transport::InMemoryClusterTransport;
         use crate::raft::generic::message::Message;
+        use crate::raft::generic::cluster::RaftCluster;
 
         // Create in-memory transport for single node
-        let transport = Arc::new(InMemoryClusterTransport::<Message<WorkflowCommand>, WorkflowCommandExecutor>::new(vec![node_id]));
-        transport.start().await?;
+        let transport = Arc::new(InMemoryClusterTransport::<Message<WorkflowCommand>>::new(vec![node_id]));
 
-        // Create cluster via transport
-        let cluster = transport.create_cluster(node_id).await?;
+        // Extract the receiver for this node
+        let receiver = transport.extract_receiver(node_id).await?;
+
+        // Create executor
+        let executor = WorkflowCommandExecutor::default();
+
+        // Create transport reference
+        let transport_ref: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<WorkflowCommand>>> = transport.clone();
+
+        // Create cluster
+        let cluster = Arc::new(RaftCluster::new(node_id, receiver, transport_ref, executor).await?);
 
         let runtime = Arc::new(WorkflowRuntime {
             cluster: cluster.clone(),

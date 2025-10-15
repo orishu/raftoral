@@ -2,8 +2,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use serde::{Serialize, Deserialize};
-use crate::raft::generic::message::{Message, CommandExecutor};
-use crate::raft::generic::cluster::RaftCluster;
 
 /// Unified interface for Raft nodes to interact with the transport layer
 ///
@@ -69,106 +67,51 @@ impl NodeMetadata {
     }
 }
 
-/// Transport layer abstraction for Raft cluster communication
-///
-/// This trait provides an abstraction for how Raft nodes communicate with each other.
-/// Different implementations can provide:
-/// - InMemoryClusterTransport: For local testing with multiple nodes in the same process
-/// - GrpcClusterTransport: For distributed operation with nodes on different machines
-///
-/// The transport is responsible for:
-/// 1. Creating all communication channels (sender/receiver pairs) for each node
-/// 2. Providing channel handles to RaftCluster instances during creation
-/// 3. Facilitating message routing between nodes (in-memory or over network)
-///
-/// Generic over:
-/// - M: Message type being transported (typically Message<C> where C is a command type)
-/// - E: CommandExecutor type (needed to instantiate RaftCluster)
-pub trait ClusterTransport<M, E>: Send + Sync
-where
-    M: Send + Sync + 'static,
-    E: CommandExecutor,
-{
-    /// Create a RaftCluster instance for a specific node
-    ///
-    /// # Arguments
-    /// * `node_id` - The unique ID of the node to create
-    ///
-    /// # Returns
-    /// A RaftCluster instance configured to communicate with peers via this transport
-    fn create_cluster(
-        self: &Arc<Self>,
-        node_id: u64,
-    ) -> impl std::future::Future<Output = Result<Arc<RaftCluster<E>>, Box<dyn std::error::Error>>> + Send;
-
-    /// Get the list of all node IDs in this transport configuration
-    fn node_ids(&self) -> impl std::future::Future<Output = Vec<u64>> + Send;
-
-    /// Start the transport layer (e.g., background message routing tasks)
-    fn start(&self) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> + Send;
-
-    /// Shutdown the transport layer gracefully
-    fn shutdown(&self) -> impl std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> + Send;
-
-    /// Add a peer node dynamically (called when ConfChange is applied)
-    /// Returns Ok(()) if peer was added or already exists
-    fn add_peer(&self, node_id: u64, address: String) -> Result<(), Box<dyn std::error::Error>>;
-
-    /// Remove a peer node dynamically (called when node is removed)
-    fn remove_peer(&self, node_id: u64) -> Result<(), Box<dyn std::error::Error>>;
-}
-
 /// In-memory transport for local multi-node testing
 ///
 /// This transport creates multiple RaftCluster instances in the same process,
-/// with message routing facilitated by tokio channels. A background task
-/// routes messages from each node's sender to the appropriate peer's receiver.
+/// with message routing facilitated by tokio channels.
 ///
 /// Generic over:
 /// - M: Message type being transported
-/// - E: CommandExecutor type for creating clusters
 ///
 /// # Example
 /// ```no_run
-/// use raftoral::raft::generic::transport::{ClusterTransport, InMemoryClusterTransport};
+/// use raftoral::raft::generic::transport::InMemoryClusterTransport;
 /// use raftoral::raft::generic::message::Message;
+/// use raftoral::raft::generic::cluster::RaftCluster;
 /// use raftoral::workflow::{WorkflowCommandExecutor, WorkflowCommand};
 /// use std::sync::Arc;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// // Create transport for 3-node cluster
-/// let transport = Arc::new(InMemoryClusterTransport::<Message<WorkflowCommand>, WorkflowCommandExecutor>::new(vec![1, 2, 3]));
-/// transport.start().await?;
+/// let transport = Arc::new(InMemoryClusterTransport::<Message<WorkflowCommand>>::new(vec![1, 2, 3]));
 ///
-/// // Create cluster instances for each node (executors created internally)
-/// let cluster1 = transport.create_cluster(1).await?;
-/// let cluster2 = transport.create_cluster(2).await?;
-/// let cluster3 = transport.create_cluster(3).await?;
+/// // Extract receiver and create cluster manually
+/// let receiver = transport.extract_receiver(1).await?;
+/// let executor = WorkflowCommandExecutor::default();
+/// let cluster1 = RaftCluster::new(1, receiver, transport.clone(), executor).await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct InMemoryClusterTransport<M, E>
+pub struct InMemoryClusterTransport<M>
 where
     M: Send + Sync + 'static,
-    E: CommandExecutor,
 {
     /// Node IDs in this cluster
     node_ids: Vec<u64>,
     /// Senders for each node (node_id -> sender to that node's receiver)
     /// Shared with RaftNode instances for immediate visibility of changes
     node_senders: Arc<std::sync::RwLock<HashMap<u64, mpsc::UnboundedSender<M>>>>,
-    /// Receivers for each node (held until create_cluster is called)
+    /// Receivers for each node (held until extract_receiver is called)
     node_receivers: Arc<tokio::sync::Mutex<HashMap<u64, mpsc::UnboundedReceiver<M>>>>,
     /// Shutdown signal
     shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
-    /// Phantom data for executor type
-    _phantom: std::marker::PhantomData<E>,
 }
 
-impl<M, E> InMemoryClusterTransport<M, E>
+impl<M> InMemoryClusterTransport<M>
 where
     M: Send + Sync + 'static,
-    E: CommandExecutor + 'static,
 {
     /// Create a new in-memory transport for the given node IDs
     pub fn new(node_ids: Vec<u64>) -> Self {
@@ -187,78 +130,25 @@ where
             node_senders: Arc::new(std::sync::RwLock::new(node_senders_map)),
             node_receivers: Arc::new(tokio::sync::Mutex::new(node_receivers_map)),
             shutdown_tx: None,
-            _phantom: std::marker::PhantomData,
         }
     }
-}
 
-// Implement ClusterTransport specifically for Message<C>
-impl<E> ClusterTransport<Message<E::Command>, E> for InMemoryClusterTransport<Message<E::Command>, E>
-where
-    E: CommandExecutor + Default + 'static,
-{
-    async fn create_cluster(
-        self: &Arc<Self>,
+    /// Extract the receiver for a specific node
+    /// This removes the receiver from the internal map, so it can only be called once per node
+    pub async fn extract_receiver(
+        &self,
         node_id: u64,
-    ) -> Result<Arc<RaftCluster<E>>, Box<dyn std::error::Error>> {
-        // Create a new executor instance
-        let executor = E::default();
-        // Extract the receiver for this node
-        let receiver = {
-            let mut receivers = self.node_receivers.lock().await;
-            receivers.remove(&node_id)
-                .ok_or_else(|| format!("Node {} receiver already claimed or doesn't exist", node_id))?
-        };
-
-        // Create transport interface as Arc<dyn TransportInteraction>
-        let transport: Arc<dyn TransportInteraction<Message<E::Command>>> = self.clone();
-
-        // Create the cluster with transport interface
-        let cluster = RaftCluster::new_with_transport(
-            node_id,
-            receiver,
-            transport,
-            executor,
-        ).await?;
-
-        Ok(Arc::new(cluster))
-    }
-
-    async fn node_ids(&self) -> Vec<u64> {
-        self.node_ids.clone()
-    }
-
-    async fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
-        // For in-memory transport, no background routing is needed
-        // Messages are sent directly via the mpsc channels
-        Ok(())
-    }
-
-    async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error>> {
-        // Signal shutdown if we have a sender
-        if let Some(tx) = &self.shutdown_tx {
-            let _ = tx.send(());
-        }
-        Ok(())
-    }
-
-    fn add_peer(&self, _node_id: u64, _address: String) -> Result<(), Box<dyn std::error::Error>> {
-        // In-memory transport has fixed nodes at construction time
-        // This is a no-op for testing - nodes are pre-configured
-        Ok(())
-    }
-
-    fn remove_peer(&self, _node_id: u64) -> Result<(), Box<dyn std::error::Error>> {
-        // In-memory transport - no-op
-        Ok(())
+    ) -> Result<mpsc::UnboundedReceiver<M>, Box<dyn std::error::Error>> {
+        let mut receivers = self.node_receivers.lock().await;
+        receivers.remove(&node_id)
+            .ok_or_else(|| format!("Node {} receiver already extracted or doesn't exist", node_id).into())
     }
 }
 
 // Implement TransportInteraction for InMemoryClusterTransport
-impl<M, E> TransportInteraction<M> for InMemoryClusterTransport<M, E>
+impl<M> TransportInteraction<M> for InMemoryClusterTransport<M>
 where
     M: Send + Sync + 'static,
-    E: CommandExecutor + 'static,
 {
     fn send_message_to_node(
         &self,
@@ -300,41 +190,24 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Clone, Debug, Serialize, Deserialize)]
-    enum TestCommand {
-        Noop,
-    }
-
-    #[derive(Default, Clone, Debug)]
-    struct TestExecutor;
-
-    impl CommandExecutor for TestExecutor {
-        type Command = TestCommand;
-
-        fn apply_with_index(&self, _command: &Self::Command, _logger: &slog::Logger, _log_index: u64) -> Result<(), Box<dyn std::error::Error>> {
-            Ok(())
-        }
-    }
+    use crate::raft::generic::message::Message;
 
     #[tokio::test]
     async fn test_in_memory_transport_creation() {
-        let transport = InMemoryClusterTransport::<Message<TestCommand>, TestExecutor>::new(vec![1, 2, 3]);
-        assert_eq!(transport.node_ids().await, vec![1, 2, 3]);
+        let transport = InMemoryClusterTransport::<Message<String>>::new(vec![1, 2, 3]);
+        assert_eq!(transport.list_nodes().len(), 3);
     }
 
     #[tokio::test]
-    async fn test_in_memory_transport_cluster_creation() {
-        let transport = Arc::new(InMemoryClusterTransport::<Message<TestCommand>, TestExecutor>::new(vec![1, 2, 3]));
-        transport.start().await.expect("Transport start should succeed");
+    async fn test_in_memory_transport_extract_receiver() {
+        let transport = InMemoryClusterTransport::<Message<String>>::new(vec![1, 2, 3]);
 
-        // Create cluster for node 1
-        let cluster1 = transport.create_cluster(1).await;
-        assert!(cluster1.is_ok(), "Should create cluster for node 1");
+        // Extract receiver for node 1
+        let receiver1 = transport.extract_receiver(1).await;
+        assert!(receiver1.is_ok(), "Should extract receiver for node 1");
 
-        // Try to create same node again - should fail
-        let cluster1_again = transport.create_cluster(1).await;
-        assert!(cluster1_again.is_err(), "Should not allow creating same node twice");
+        // Try to extract same receiver again - should fail
+        let receiver1_again = transport.extract_receiver(1).await;
+        assert!(receiver1_again.is_err(), "Should not allow extracting same receiver twice");
     }
 }

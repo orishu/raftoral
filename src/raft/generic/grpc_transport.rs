@@ -1,9 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::mpsc;
-use crate::raft::generic::message::{Message, CommandExecutor};
-use crate::raft::generic::cluster::RaftCluster;
-use crate::raft::generic::transport::ClusterTransport;
+use crate::raft::generic::message::Message;
 use crate::grpc::client::{RaftClient, ChannelBuilder, default_channel_builder};
 
 /// Configuration for a node in the gRPC cluster
@@ -37,11 +35,9 @@ where
 ///
 /// Generic over:
 /// - M: Message type being transported (typically Message<C>)
-/// - E: CommandExecutor type (needed to instantiate RaftCluster)
-pub struct GrpcClusterTransport<M, E>
+pub struct GrpcClusterTransport<M>
 where
     M: Clone + std::fmt::Debug + Send + Sync + 'static,
-    E: CommandExecutor,
 {
     /// Unified peer management: node_id -> all communication components
     destinations: Arc<RwLock<HashMap<u64, Destination<M>>>>,
@@ -49,7 +45,7 @@ where
     /// Node configurations (node_id -> address)
     nodes: Arc<RwLock<HashMap<u64, NodeConfig>>>,
 
-    /// Receivers for each node (held until create_cluster is called)
+    /// Receivers for each node (held until extract_receiver is called)
     node_receivers: Arc<Mutex<HashMap<u64, mpsc::UnboundedReceiver<M>>>>,
 
     /// Shutdown signal
@@ -61,15 +57,11 @@ where
     /// Discovered cluster configuration (voters from discovery)
     /// Used to initialize joining nodes with proper Raft configuration
     discovered_voters: Arc<RwLock<Vec<u64>>>,
-
-    /// Phantom data for executor type
-    _phantom: std::marker::PhantomData<E>,
 }
 
-impl<M, E> GrpcClusterTransport<M, E>
+impl<M> GrpcClusterTransport<M>
 where
     M: Clone + std::fmt::Debug + Send + Sync + 'static,
-    E: CommandExecutor,
 {
     /// Create a new gRPC transport with the given node configurations
     pub fn new(nodes: Vec<NodeConfig>) -> Self {
@@ -139,10 +131,55 @@ where
             shutdown_tx: Arc::new(Mutex::new(None)),
             channel_builder,
             discovered_voters: Arc::new(RwLock::new(Vec::new())),
-            _phantom: std::marker::PhantomData,
         }
     }
 
+    /// Extract the receiver for a specific node
+    /// This removes the receiver from the internal map, so it can only be called once per node
+    pub fn extract_receiver(
+        &self,
+        node_id: u64,
+    ) -> Result<mpsc::UnboundedReceiver<M>, Box<dyn std::error::Error>> {
+        let mut receivers = self.node_receivers.lock().unwrap();
+        receivers.remove(&node_id)
+            .ok_or_else(|| format!("Node {} receiver already extracted or doesn't exist", node_id).into())
+    }
+
+    /// Start the transport by creating the shutdown channel and connecting to all nodes
+    pub async fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
+        // Create shutdown channel
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        {
+            *self.shutdown_tx.lock().unwrap() = Some(shutdown_tx.clone());
+        }
+
+        // Get all nodes
+        let node_list: Vec<NodeConfig> = {
+            let nodes = self.nodes.read().unwrap();
+            nodes.values().cloned().collect()
+        };
+
+        // Create gRPC clients for all nodes using the configured channel builder
+        for node in &node_list {
+            match RaftClient::connect_with_channel_builder(
+                node.address.clone(),
+                self.channel_builder.clone()
+            ).await {
+                Ok(client) => {
+                    let mut dests = self.destinations.write().unwrap();
+                    if let Some(dest) = dests.get_mut(&node.node_id) {
+                        dest.grpc_client = Some(Arc::new(tokio::sync::Mutex::new(client)));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Warning: Failed to connect to node {}: {}", node.node_id, e);
+                    // Continue anyway - the node might not be up yet
+                }
+            }
+        }
+
+        Ok(())
+    }
     /// Remove a node from the transport configuration
     pub async fn remove_node(&self, node_id: u64) -> Result<(), Box<dyn std::error::Error>> {
         // Remove destination (forwarder will exit when sender is dropped)
@@ -188,10 +225,10 @@ where
     }
 }
 
-// Specialized implementation for Message<E::Command>
-impl<E> GrpcClusterTransport<Message<E::Command>, E>
+// Methods that work with any message type M (happens to include Message<C>)
+impl<C> GrpcClusterTransport<crate::raft::generic::message::Message<C>>
 where
-    E: CommandExecutor + Default + 'static,
+    C: Clone + std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
 {
     /// Add a new node to the transport configuration
     /// IMPORTANT: This creates gRPC client and forwarder for the new node
@@ -278,7 +315,7 @@ where
     fn spawn_peer_forwarder(
         &self,
         target_node_id: u64,
-        mut forwarder_rx: mpsc::UnboundedReceiver<Message<E::Command>>,
+        mut forwarder_rx: mpsc::UnboundedReceiver<crate::raft::generic::message::Message<C>>,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     ) -> tokio::task::JoinHandle<()> {
         let destinations = self.destinations.clone();
@@ -311,130 +348,42 @@ where
     }
 
     /// Internal method to get a sender for a specific node
-    pub async fn get_node_sender(&self, node_id: u64) -> Option<mpsc::UnboundedSender<Message<E::Command>>> {
+    pub async fn get_node_sender(&self, node_id: u64) -> Option<mpsc::UnboundedSender<crate::raft::generic::message::Message<C>>> {
         let destinations = self.destinations.read().unwrap();
         destinations.get(&node_id).map(|dest| dest.sender.clone())
     }
 }
 
-// Implement ClusterTransport specifically for Message<C>
-impl<E> ClusterTransport<Message<E::Command>, E> for GrpcClusterTransport<Message<E::Command>, E>
+// Implement TransportInteraction trait for unified transport interaction
+// Implement TransportInteraction for Message<C>
+impl<C> crate::raft::generic::transport::TransportInteraction<Message<C>> for GrpcClusterTransport<Message<C>>
 where
-    E: CommandExecutor + Default + 'static,
+    C: Clone + std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
 {
-    async fn create_cluster(
-        self: &Arc<Self>,
+    fn send_message_to_node(
+        &self,
+        target_node_id: u64,
+        message: Message<C>
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let destinations = self.destinations.read().unwrap();
+        let dest = destinations.get(&target_node_id)
+            .ok_or_else(|| format!("Node {} not found", target_node_id))?;
+
+        dest.sender.send(message)
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        Ok(())
+    }
+
+    fn list_nodes(&self) -> Vec<u64> {
+        self.destinations.read().unwrap().keys().copied().collect()
+    }
+
+    fn add_peer(
+        &self,
         node_id: u64,
-    ) -> Result<Arc<RaftCluster<E>>, Box<dyn std::error::Error>> {
-        // Create a new executor instance
-        let executor = E::default();
-
-        // Extract the receiver for this node
-        let receiver = {
-            let mut receivers = self.node_receivers.lock().unwrap();
-            receivers.remove(&node_id)
-                .ok_or_else(|| format!("Node {} receiver already claimed or doesn't exist", node_id))?
-        };
-
-        // Get shutdown receiver
-        let shutdown_rx = {
-            let shutdown_tx = self.shutdown_tx.lock().unwrap();
-            shutdown_tx.as_ref()
-                .ok_or("Transport not started - call start() before create_cluster()")?
-                .subscribe()
-        };
-
-        // Create forwarders for outgoing messages to remote peers
-        // Each forwarder reads from its channel and sends via gRPC
-        let peer_ids: Vec<u64> = {
-            let dests = self.destinations.read().unwrap();
-            dests.keys()
-                .filter(|&&id| id != node_id)
-                .copied()
-                .collect()
-        };
-
-        for peer_id in peer_ids {
-            // Create a channel that will replace the direct sender in destinations
-            let (forwarder_tx, forwarder_rx) = mpsc::unbounded_channel();
-
-            // Spawn forwarder task for this peer
-            let handle = self.spawn_peer_forwarder(peer_id, forwarder_rx, shutdown_rx.resubscribe());
-
-            // Update destination to use forwarder sender and store handle
-            {
-                let mut dests = self.destinations.write().unwrap();
-                if let Some(dest) = dests.get_mut(&peer_id) {
-                    dest.sender = forwarder_tx;
-                    dest.forwarder_handle = Some(handle);
-                }
-            }
-        }
-
-        // Create the cluster with transport reference
-        // Cast self to Arc<dyn TransportInteraction>
-        let transport: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<E::Command>>> =
-            self.clone() as Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<E::Command>>>;
-
-        let cluster = RaftCluster::new_with_transport(
-            node_id,
-            receiver,
-            transport,
-            executor,
-        ).await?;
-
-        Ok(Arc::new(cluster))
-    }
-
-    async fn node_ids(&self) -> Vec<u64> {
-        let nodes = self.nodes.read().unwrap();
-        nodes.keys().copied().collect()
-    }
-
-    async fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
-        // Create shutdown channel
-        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
-        {
-            *self.shutdown_tx.lock().unwrap() = Some(shutdown_tx.clone());
-        }
-
-        // Get all nodes
-        let node_list: Vec<NodeConfig> = {
-            let nodes = self.nodes.read().unwrap();
-            nodes.values().cloned().collect()
-        };
-
-        // Create gRPC clients for all nodes using the configured channel builder
-        for node in &node_list {
-            match RaftClient::connect_with_channel_builder(
-                node.address.clone(),
-                self.channel_builder.clone()
-            ).await {
-                Ok(client) => {
-                    let mut dests = self.destinations.write().unwrap();
-                    if let Some(dest) = dests.get_mut(&node.node_id) {
-                        dest.grpc_client = Some(Arc::new(tokio::sync::Mutex::new(client)));
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Warning: Failed to connect to node {}: {}", node.node_id, e);
-                    // Continue anyway - the node might not be up yet
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let shutdown_tx = self.shutdown_tx.lock().unwrap();
-        if let Some(tx) = shutdown_tx.as_ref() {
-            let _ = tx.send(());
-        }
-        Ok(())
-    }
-
-    fn add_peer(&self, node_id: u64, address: String) -> Result<(), Box<dyn std::error::Error>> {
+        address: String
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Check if already exists
         {
             let nodes = self.nodes.read().unwrap();
@@ -505,7 +454,10 @@ where
         Ok(())
     }
 
-    fn remove_peer(&self, node_id: u64) -> Result<(), Box<dyn std::error::Error>> {
+    fn remove_peer(
+        &self,
+        node_id: u64
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Remove destination (forwarder will exit when sender is dropped)
         self.destinations.write().unwrap().remove(&node_id);
 
@@ -517,55 +469,6 @@ where
 
         Ok(())
     }
-}
-
-// Implement TransportInteraction trait for unified transport interaction
-// Implement TransportInteraction for Message<C>
-impl<E> crate::raft::generic::transport::TransportInteraction<Message<E::Command>> for GrpcClusterTransport<Message<E::Command>, E>
-where
-    E: CommandExecutor + Default + 'static,
-{
-    fn send_message_to_node(
-        &self,
-        target_node_id: u64,
-        message: Message<E::Command>
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let destinations = self.destinations.read().unwrap();
-        let dest = destinations.get(&target_node_id)
-            .ok_or_else(|| format!("Node {} not found", target_node_id))?;
-
-        dest.sender.send(message)
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-
-        Ok(())
-    }
-
-    fn list_nodes(&self) -> Vec<u64> {
-        self.destinations.read().unwrap().keys().copied().collect()
-    }
-
-    fn add_peer(
-        &self,
-        node_id: u64,
-        address: String
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Call the ClusterTransport trait method explicitly
-        <Self as ClusterTransport<Message<E::Command>, E>>::add_peer(self, node_id, address)
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("{}", e).into()
-            })
-    }
-
-    fn remove_peer(
-        &self,
-        node_id: u64
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Call the ClusterTransport trait method explicitly
-        <Self as ClusterTransport<Message<E::Command>, E>>::remove_peer(self, node_id)
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("{}", e).into()
-            })
-    }
 
     fn get_discovered_voters(&self) -> Vec<u64> {
         self.discovered_voters.read().unwrap().clone()
@@ -575,6 +478,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raft::generic::message::CommandExecutor;
     use serde::{Deserialize, Serialize};
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::time::{timeout, Duration};
@@ -609,7 +513,7 @@ mod tests {
             NodeConfig { node_id: 2, address: "127.0.0.1:5002".to_string() },
         ];
 
-        let transport = GrpcClusterTransport::<Message<TestCommand>, TestExecutor>::new(nodes);
+        let transport = GrpcClusterTransport::<Message<TestCommand>>::new(nodes);
 
         // Verify we can get node addresses
         assert_eq!(
@@ -624,7 +528,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_remove_node() {
-        let transport = GrpcClusterTransport::<Message<TestCommand>, TestExecutor>::new(vec![]);
+        let transport = GrpcClusterTransport::<Message<TestCommand>>::new(vec![]);
 
         // Add a node
         let node = NodeConfig { node_id: 1, address: "127.0.0.1:5001".to_string() };

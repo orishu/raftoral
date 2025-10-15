@@ -8,6 +8,6 @@ pub mod grpc_transport;
 pub use message::Message;
 pub use node::RaftNode;
 pub use cluster::{RaftCluster, RoleChange};
-pub use transport::{ClusterTransport, InMemoryClusterTransport};
+pub use transport::InMemoryClusterTransport;
 pub use storage::MemStorageWithSnapshot;
 pub use grpc_transport::{GrpcClusterTransport, NodeConfig};
