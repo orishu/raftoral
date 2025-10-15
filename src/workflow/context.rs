@@ -110,9 +110,7 @@ impl WorkflowRun {
         let input_bytes = serde_json::to_vec(&input).map_err(|e| WorkflowError::SerializationError(e.to_string()))?;
 
         // Propose WorkflowStart command - proposer becomes the owner
-        let command_id = cluster.generate_command_id();
         let command = WorkflowCommand::WorkflowStart(WorkflowStartData {
-            command_id,
             workflow_id: workflow_id.to_string(),
             workflow_type: String::new(),
             version: 0,
@@ -184,9 +182,7 @@ impl WorkflowRun {
             &self.runtime.cluster,
             || async {
                 // Owner operation: Propose WorkflowEnd command with result
-                let command_id = self.runtime.cluster.generate_command_id();
                 let command = WorkflowCommand::WorkflowEnd(WorkflowEndData {
-                    command_id,
                     workflow_id: workflow_id_owned.clone(),
                     result: result_bytes_owned.clone(),
                 });

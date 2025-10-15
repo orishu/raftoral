@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fmt::Debug;
 use crate::grpc::server::raft_proto;
@@ -57,7 +57,6 @@ where
     C: Clone + Debug + Serialize + DeserializeOwned + Send + Sync + 'static,
 {
     Propose {
-        id: u8,
         command: C,
         sync_id: Option<u64>,  // For synchronous proposal tracking
     },
@@ -84,10 +83,9 @@ where
         use protobuf::Message as ProtobufMessage;
 
         let message = match self {
-            Message::Propose { id, command, sync_id } => {
+            Message::Propose { command, sync_id } => {
                 let command_json = serde_json::to_vec(command)?;
                 raft_proto::generic_message::Message::Propose(raft_proto::ProposeMessage {
-                    id: *id as u32,
                     command_json,
                     sync_id: sync_id.unwrap_or(0),
                 })
@@ -131,7 +129,6 @@ where
             raft_proto::generic_message::Message::Propose(propose) => {
                 let command: C = serde_json::from_slice(&propose.command_json)?;
                 Message::Propose {
-                    id: propose.id as u8,
                     command,
                     sync_id: if propose.sync_id == 0 { None } else { Some(propose.sync_id) },
                 }

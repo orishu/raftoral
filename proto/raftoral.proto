@@ -16,9 +16,8 @@ message GenericMessage {
 }
 
 message ProposeMessage {
-    uint32 id = 1;
-    bytes command_json = 2;  // JSON-serialized command
-    uint64 sync_id = 3;      // For synchronous proposal tracking (0 = async)
+    bytes command_json = 1;  // JSON-serialized command
+    uint64 sync_id = 2;      // For synchronous proposal tracking (0 = async)
 }
 
 message ConfChangeV2Message {

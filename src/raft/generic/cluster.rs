@@ -19,9 +19,6 @@ pub struct RaftCluster<E: CommandExecutor> {
     node_count: usize,
     // Role change notifications
     role_change_tx: broadcast::Sender<RoleChange>,
-    // Command ID counter for precise tracking
-    #[allow(dead_code)] // Reserved for future command tracking
-    next_command_id: Arc<AtomicU64>,
     // Command executor for applying commands
     pub executor: Arc<E>,
     // Track the current leader node ID (0 = unknown)
@@ -35,9 +32,6 @@ pub struct RaftCluster<E: CommandExecutor> {
     // Sync ID tracking: map of sync_id -> oneshot sender
     // Used for synchronous command/confchange operations
     sync_waiters: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<(), String>>>>>,
-    // Applied entries channel: RaftNode sends (log_index, context) when entries are applied
-    // Only needs to be sent, not received (Clone doesn't need the receiver)
-    applied_tx: mpsc::UnboundedSender<(u64, Vec<u8>)>,
 }
 
 impl<E: CommandExecutor + 'static> RaftCluster<E> {
@@ -143,14 +137,12 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
             transport,
             node_count,
             role_change_tx: role_change_tx.clone(),
-            next_command_id: Arc::new(AtomicU64::new(1)),
             executor: executor_arc.clone(),
             leader_id: leader_id_arc.clone(),
             node_id,
             cached_config: cached_config_arc,
             cached_conf_state: cached_conf_state_arc,
             sync_waiters,
-            applied_tx,
         };
 
         // Give the node time to initialize
@@ -168,7 +160,6 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
     pub async fn propose_command(&self, command: E::Command) -> Result<bool, Box<dyn std::error::Error>> {
         // Send to this node's local Raft instance, which will forward to leader if needed
         self.transport.send_message_to_node(self.node_id, Message::Propose {
-            id: 0,
             command,
             sync_id: None,
         }).map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
@@ -176,118 +167,12 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
         Ok(true)
     }
 
-    /// Send a message to the leader node with retry logic
-    /// This is the common implementation used by propose_and_sync, add_node, and remove_node
-    async fn send_to_leader<R>(
-        &self,
-        create_message: impl Fn(tokio::sync::oneshot::Sender<R>) -> Message<E::Command>,
-        max_retries: usize,
-    ) -> Result<R, Box<dyn std::error::Error>>
+    /// Helper method to perform a synchronous operation with timeout and cleanup
+    /// This eliminates code duplication between propose_and_sync, add_node, and remove_node
+    async fn sync_operation<F>(&self, create_message: F, timeout_secs: u64, operation_name: &str) -> Result<(), Box<dyn std::error::Error>>
     where
-        R: Send + 'static,
+        F: Fn(u64) -> Message<E::Command>,
     {
-        let mut retry_delay_ms = 100;
-
-        for retry in 0..max_retries {
-            // If this node is the leader, try sending to self first
-            if self.leader_id.load(Ordering::SeqCst) == self.node_id {
-                let (sender, receiver) = tokio::sync::oneshot::channel();
-                let message = create_message(sender);
-
-                if self.transport.send_message_to_node(self.node_id, message).is_ok() {
-                    match tokio::time::timeout(std::time::Duration::from_millis(500), receiver).await {
-                        Ok(Ok(result)) => return Ok(result),
-                        _ => {
-                            // Failed as leader
-                        }
-                    }
-                }
-            }
-
-            // Check if we know the leader from role changes
-            let known_leader_id = self.leader_id.load(Ordering::SeqCst);
-
-            // Try sending to known leader
-            if known_leader_id != 0 && known_leader_id != self.node_id {
-                let (sender, receiver) = tokio::sync::oneshot::channel();
-                let message = create_message(sender);
-
-                if self.transport.send_message_to_node(known_leader_id, message).is_ok() {
-                    match tokio::time::timeout(std::time::Duration::from_millis(500), receiver).await {
-                        Ok(Ok(result)) => return Ok(result),
-                        _ => {
-                            // Known leader failed, will try discovery
-                        }
-                    }
-                }
-            }
-
-            // Leader unknown or failed - try scanning all nodes to find the leader
-            // This is a fallback for when the role change subscription misses the initial election
-            let node_ids = self.transport.list_nodes();
-            for node_id in node_ids {
-                let (test_sender, test_receiver) = tokio::sync::oneshot::channel();
-                let test_message = create_message(test_sender);
-
-                if self.transport.send_message_to_node(node_id, test_message).is_ok() {
-                    match tokio::time::timeout(std::time::Duration::from_millis(500), test_receiver).await {
-                        Ok(Ok(result)) => {
-                            // Found the leader! Update our cached leader_id
-                            self.leader_id.store(node_id, Ordering::SeqCst);
-                            return Ok(result);
-                        },
-                        _ => {
-                            // This node isn't the leader or failed, try next
-                            continue;
-                        }
-                    }
-                }
-            }
-
-            // Still no leader found - subscribe to role changes and wait for one to emerge
-            let mut role_rx = self.role_change_tx.subscribe();
-
-            // Wait for a leader to emerge
-            let wait_result = tokio::time::timeout(
-                std::time::Duration::from_millis(retry_delay_ms),
-                async {
-                    while let Ok(role_change) = role_rx.recv().await {
-                        if let RoleChange::BecameLeader(leader_id) = role_change {
-                            return Some(leader_id);
-                        }
-                    }
-                    None
-                }
-            ).await;
-
-            if let Ok(Some(leader_id)) = wait_result {
-                // We learned who the leader is, try sending to them
-                let (sender, receiver) = tokio::sync::oneshot::channel();
-                let message = create_message(sender);
-
-                if self.transport.send_message_to_node(leader_id, message).is_ok() {
-                    match tokio::time::timeout(std::time::Duration::from_millis(500), receiver).await {
-                        Ok(Ok(result)) => return Ok(result),
-                        _ => {
-                            // Failed, will retry
-                        }
-                    }
-                }
-            }
-
-            // Increase retry delay with exponential backoff
-            if retry < max_retries - 1 {
-                tokio::time::sleep(std::time::Duration::from_millis(retry_delay_ms)).await;
-                retry_delay_ms = (retry_delay_ms * 2).min(2000);
-            }
-        }
-
-        Err("Failed to send message to leader after retries".into())
-    }
-
-    /// Propose a command and wait until it's applied
-    /// Uses synchronous tracking via sync_id mechanism
-    pub async fn propose_and_sync(&self, command: E::Command) -> Result<(), Box<dyn std::error::Error>> {
         // Generate random sync_id
         let sync_id = rand::random::<u64>();
 
@@ -300,18 +185,52 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
             waiters.insert(sync_id, tx);
         }
 
-        // Send the message with sync_id to the local node (which routes to leader if needed)
-        self.transport.send_message_to_node(
-            self.node_id,
-            Message::Propose {
-                id: 0,
-                command,
-                sync_id: Some(sync_id),
-            },
-        ).map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+        // Try to send to leader (first try self if we're leader, then known leader, then scan)
+        let mut sent = false;
+
+        // Try 1: If we're the leader, send to self
+        if self.leader_id.load(Ordering::SeqCst) == self.node_id {
+            let message = create_message(sync_id);
+            if self.transport.send_message_to_node(self.node_id, message).is_ok() {
+                sent = true;
+            }
+        }
+
+        // Try 2: If not sent yet and we know the leader, send to known leader
+        if !sent {
+            let known_leader_id = self.leader_id.load(Ordering::SeqCst);
+            if known_leader_id != 0 {
+                let message = create_message(sync_id);
+                if self.transport.send_message_to_node(known_leader_id, message).is_ok() {
+                    sent = true;
+                }
+            }
+        }
+
+        // Try 3: If still not sent, scan all nodes to find the leader
+        if !sent {
+            let node_ids = self.transport.list_nodes();
+            for node_id in node_ids {
+                if node_id == self.node_id {
+                    continue; // Already tried self if we were leader
+                }
+                let message = create_message(sync_id);
+                if self.transport.send_message_to_node(node_id, message).is_ok() {
+                    sent = true;
+                    break;
+                }
+            }
+        }
+
+        if !sent {
+            // Failed to send - clean up the waiter
+            let mut waiters = self.sync_waiters.lock().unwrap();
+            waiters.remove(&sync_id);
+            return Err(format!("Failed to send {} to any node", operation_name).into());
+        }
 
         // Wait for the entry to be applied
-        match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
             Ok(Ok(Ok(()))) => Ok(()),
             Ok(Ok(Err(e))) => Err(e.into()),
             Ok(Err(_)) => Err("Oneshot channel dropped before completion".into()),
@@ -319,9 +238,22 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
                 // Timeout - clean up the waiter
                 let mut waiters = self.sync_waiters.lock().unwrap();
                 waiters.remove(&sync_id);
-                Err("Timeout waiting for command to be applied".into())
+                Err(format!("Timeout waiting for {} to be applied", operation_name).into())
             }
         }
+    }
+
+    /// Propose a command and wait until it's applied
+    /// Uses synchronous tracking via sync_id mechanism
+    pub async fn propose_and_sync(&self, command: E::Command) -> Result<(), Box<dyn std::error::Error>> {
+        self.sync_operation(
+            |sync_id| Message::Propose {
+                command: command.clone(),
+                sync_id: Some(sync_id),
+            },
+            5,
+            "command",
+        ).await
     }
 
     /// Check if this cluster is currently the leader
@@ -343,74 +275,28 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
     /// Add a node to the Raft cluster
     /// Automatically finds the leader and sends the request
     pub async fn add_node(&self, node_id: u64, address: String) -> Result<(), Box<dyn std::error::Error>> {
-        // Generate random sync_id for synchronous tracking
-        let sync_id = rand::random::<u64>();
-        let (tx, rx) = oneshot::channel();
-
-        // Register the oneshot sender
-        {
-            let mut waiters = self.sync_waiters.lock().unwrap();
-            waiters.insert(sync_id, tx);
-        }
-
-        // Send the message with sync_id to the local node (which routes to leader if needed)
-        self.transport.send_message_to_node(
-            self.node_id,
-            Message::AddNode {
+        self.sync_operation(
+            |sync_id| Message::AddNode {
                 node_id,
-                address,
+                address: address.clone(),
                 sync_id: Some(sync_id),
             },
-        ).map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
-
-        // Wait for the entry to be applied
-        match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
-            Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Ok(Err(e))) => Err(e.into()),
-            Ok(Err(_)) => Err("Oneshot channel dropped before completion".into()),
-            Err(_) => {
-                // Timeout - clean up the waiter
-                let mut waiters = self.sync_waiters.lock().unwrap();
-                waiters.remove(&sync_id);
-                Err("Timeout waiting for add_node to be applied".into())
-            }
-        }
+            5,
+            "add_node",
+        ).await
     }
 
     /// Remove a node from the Raft cluster
     /// Automatically finds the leader and sends the request
     pub async fn remove_node(&self, node_id: u64) -> Result<(), Box<dyn std::error::Error>> {
-        // Generate random sync_id for synchronous tracking
-        let sync_id = rand::random::<u64>();
-        let (tx, rx) = oneshot::channel();
-
-        // Register the oneshot sender
-        {
-            let mut waiters = self.sync_waiters.lock().unwrap();
-            waiters.insert(sync_id, tx);
-        }
-
-        // Send the message with sync_id to the local node (which routes to leader if needed)
-        self.transport.send_message_to_node(
-            self.node_id,
-            Message::RemoveNode {
+        self.sync_operation(
+            |sync_id| Message::RemoveNode {
                 node_id,
                 sync_id: Some(sync_id),
             },
-        ).map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
-
-        // Wait for the entry to be applied
-        match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
-            Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Ok(Err(e))) => Err(e.into()),
-            Ok(Err(_)) => Err("Oneshot channel dropped before completion".into()),
-            Err(_) => {
-                // Timeout - clean up the waiter
-                let mut waiters = self.sync_waiters.lock().unwrap();
-                waiters.remove(&sync_id);
-                Err("Timeout waiting for remove_node to be applied".into())
-            }
-        }
+            5,
+            "remove_node",
+        ).await
     }
 
     pub fn node_count(&self) -> usize {
@@ -432,11 +318,6 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
     /// Get the ID of this node
     pub fn node_id(&self) -> u64 {
         self.node_id
-    }
-
-    /// Generate a unique command ID for tracking command completion
-    pub fn generate_command_id(&self) -> u64 {
-        self.next_command_id.fetch_add(1, Ordering::SeqCst)
     }
 
     pub async fn campaign(&self) -> Result<bool, Box<dyn std::error::Error>> {

@@ -363,9 +363,7 @@ impl WorkflowRuntime {
                 let key_owned_clone = key_owned.clone();
                 async move {
                     // Owner operation: Propose SetCheckpoint command and return the value
-                    let command_id = cluster.generate_command_id();
                     let command = WorkflowCommand::SetCheckpoint(CheckpointData {
-                        command_id,
                         workflow_id: workflow_id_owned_clone.clone(),
                         key: key_owned_clone.clone(),
                         value: serialized_value_clone,
@@ -495,9 +493,7 @@ impl WorkflowRuntime {
 
         // Propose WorkflowStart command with proposer as owner
         // The proposing node becomes the owner and will execute the workflow
-        let command_id = self.cluster.generate_command_id();
         let command = WorkflowCommand::WorkflowStart(WorkflowStartData {
-            command_id,
             workflow_id: workflow_id.clone(),
             workflow_type: workflow_type.to_string(),
             version,

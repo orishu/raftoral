@@ -40,9 +40,6 @@ pub(crate) struct WorkflowState {
     /// Checkpoint history for snapshot creation (never popped, only appended)
     /// Complete history for active workflows, cleaned up on workflow completion
     pub checkpoint_history: crate::workflow::snapshot::CheckpointHistory,
-    /// Track command completion by command ID (for propose_and_sync polling)
-    /// Maps command_id -> (completed: bool, error: Option<String>)
-    pub command_completions: HashMap<u64, (bool, Option<String>)>,
 }
 
 /// Command executor for workflow commands with embedded state
@@ -168,24 +165,6 @@ impl WorkflowCommandExecutor {
         )
     }
 
-    /// Mark a command as completed (called after apply)
-    pub(crate) fn mark_command_completed(&self, command_id: u64, error: Option<String>) {
-        let mut state = self.state.lock().unwrap();
-        state.command_completions.insert(command_id, (true, error));
-    }
-
-    /// Check if a command is completed (for polling in propose_and_sync)
-    pub fn is_command_completed(&self, command_id: u64) -> Option<Result<(), String>> {
-        let state = self.state.lock().unwrap();
-        state.command_completions.get(&command_id).map(|(_, error)| {
-            if let Some(err) = error {
-                Err(err.clone())
-            } else {
-                Ok(())
-            }
-        })
-    }
-
     /// Get state for snapshot creation (only active workflows)
     pub fn get_state_for_snapshot(&self) -> crate::workflow::snapshot::SnapshotState {
         let state = self.state.lock().unwrap();
@@ -259,9 +238,6 @@ impl CommandExecutor for WorkflowCommandExecutor {
 
                 // Emit started event
                 self.emit_started_event(&data.workflow_id);
-
-                // Mark command as completed (for propose_and_sync polling)
-                self.mark_command_completed(data.command_id, None);
 
                 // Only the OWNER node spawns workflow execution
                 let is_owner = self.get_node_id()
@@ -352,9 +328,6 @@ impl CommandExecutor for WorkflowCommandExecutor {
                     .retain(|key, _| !key.starts_with(&prefix));
 
                 self.emit_completed_event(&data.workflow_id, data.result.clone());
-
-                // Mark command as completed (for propose_and_sync polling)
-                self.mark_command_completed(data.command_id, None);
             },
             WorkflowCommand::SetCheckpoint(data) => {
                 slog::info!(logger, "Set checkpoint";
@@ -392,9 +365,6 @@ impl CommandExecutor for WorkflowCommandExecutor {
                 }
 
                 self.emit_checkpoint_event(&data.workflow_id, &data.key, data.value.clone());
-
-                // Mark command as completed (for propose_and_sync polling)
-                self.mark_command_completed(data.command_id, None);
             },
             WorkflowCommand::OwnerChange(data) => {
                 slog::info!(logger, "Owner change";
@@ -412,9 +382,6 @@ impl CommandExecutor for WorkflowCommandExecutor {
                 // waiting on checkpoints. The OwnershipChanged event will wake up the new owner's
                 // execution, which will then check ownership and continue executing actively.
                 self.emit_ownership_changed_event(&data.workflow_id, data.new_owner_node_id);
-
-                // Mark command as completed (for propose_and_sync polling)
-                self.mark_command_completed(data.command_id, None);
             },
         }
         Ok(())
@@ -479,9 +446,7 @@ impl CommandExecutor for WorkflowCommandExecutor {
                     let new_owner_id = available_nodes[idx % available_nodes.len()];
 
                     // Propose OwnerChange command
-                    let command_id = runtime.cluster.generate_command_id();
                     let command = WorkflowCommand::OwnerChange(OwnerChangeData {
-                        command_id,
                         workflow_id: workflow_id.clone(),
                         old_owner_node_id: removed_node_id,
                         new_owner_node_id: new_owner_id,

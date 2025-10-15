@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, broadcast};
 use raft::{prelude::*, StateRole};
@@ -55,10 +54,6 @@ pub struct RaftNode<E: CommandExecutor> {
     cached_config: Arc<RwLock<Vec<u64>>>,
     /// Cached full configuration state (voters and learners separately)
     cached_conf_state: Arc<RwLock<raft::prelude::ConfState>>,
-
-    // Sync command tracking (command_id -> completion callback)
-    sync_commands: HashMap<u64, SyncCallback>,
-    next_command_id: AtomicU64,
 
     // Command executor for applying committed commands
     executor: Arc<E>,
@@ -162,8 +157,6 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             transport,
             cached_config,
             cached_conf_state,
-            sync_commands: HashMap::new(),
-            next_command_id: AtomicU64::new(1),
             executor,
             role_change_tx,
             current_role: StateRole::Follower, // Start as follower
