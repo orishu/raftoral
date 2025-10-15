@@ -50,6 +50,13 @@ impl<E: CommandExecutor + Default + 'static> RaftService for RaftServiceImpl<E> 
     ) -> Result<Response<MessageResponse>, Status> {
         let proto_msg = request.into_inner();
 
+        // Phase 1: Validate cluster_id is 0 (single cluster mode)
+        if proto_msg.cluster_id != 0 {
+            return Err(Status::invalid_argument(
+                format!("Phase 1: Only cluster_id=0 supported, got {}", proto_msg.cluster_id)
+            ));
+        }
+
         // Convert directly from protobuf to Message (no intermediate SerializableMessage)
         let message = Message::<E::Command>::from_protobuf(proto_msg)
             .map_err(|e| Status::invalid_argument(format!("Failed to deserialize: {}", e)))?;

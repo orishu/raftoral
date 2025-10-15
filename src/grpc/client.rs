@@ -2,8 +2,8 @@ use tonic::transport::Channel;
 use std::sync::Arc;
 use crate::grpc::server::raft_proto::{
     raft_service_client::RaftServiceClient,
+    GenericMessage,
 };
-use crate::raft::generic::message::Message;
 
 /// Type alias for channel creation function
 pub type ChannelBuilder = Arc<dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Channel, Box<dyn std::error::Error + Send + Sync>>> + Send>> + Send + Sync>;
@@ -62,17 +62,13 @@ impl RaftClient {
         Ok(Self { client })
     }
 
-    /// Send a generic message to the peer node
-    pub async fn send_message<C>(
+    /// Send a pre-serialized GenericMessage to the peer node
+    /// The caller is responsible for serializing Message<C> to GenericMessage
+    pub async fn send_message(
         &mut self,
-        message: &Message<C>,
+        proto_msg: GenericMessage,
     ) -> Result<(), Box<dyn std::error::Error>>
-    where
-        C: Clone + std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
     {
-        // Convert directly to protobuf (no intermediate SerializableMessage needed)
-        let proto_msg = message.to_protobuf()?;
-
         let response = self.client.send_message(proto_msg).await?;
         let msg_response = response.into_inner();
 

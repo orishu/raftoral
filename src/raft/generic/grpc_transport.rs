@@ -333,9 +333,16 @@ where
                         if let Some(client) = client_arc {
                             let mut client = client.lock().await;
 
-                            // Simply forward the message via gRPC - completely generic!
-                            if let Err(e) = client.send_message(&message).await {
-                                eprintln!("Failed to send message to node {}: {}", target_node_id, e);
+                            // Serialize Message<C> to GenericMessage before sending
+                            match message.to_protobuf() {
+                                Ok(proto_msg) => {
+                                    if let Err(e) = client.send_message(proto_msg).await {
+                                        eprintln!("Failed to send message to node {}: {}", target_node_id, e);
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to serialize message for node {}: {}", target_node_id, e);
+                                }
                             }
                         }
                     }
@@ -639,10 +646,11 @@ mod tests {
             sync_id: None,
         };
 
-        // Send message
+        // Send message - serialize to protobuf first
+        let proto_msg = message.to_protobuf().expect("Failed to serialize message");
         let result = timeout(
             Duration::from_secs(5),
-            client.send_message(&message)
+            client.send_message(proto_msg)
         ).await;
 
         assert!(result.is_ok(), "Message send should not timeout");

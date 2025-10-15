@@ -5,6 +5,7 @@ package raftoral;
 // Generic message envelope for any Message<Command> type
 // Now uses protobuf for message structure, JSON only for command payload
 message GenericMessage {
+    uint64 cluster_id = 7;  // 0 = management cluster, other = execution cluster ID
     oneof message {
         ProposeMessage propose = 1;
         bytes raft_message = 2;          // Protobuf-serialized raft::prelude::Message
