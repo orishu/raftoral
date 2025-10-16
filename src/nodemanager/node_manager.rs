@@ -31,16 +31,13 @@ impl NodeManager {
     pub fn create_cluster_router(&self) -> Result<Arc<crate::grpc::ClusterRouter>, Box<dyn std::error::Error>> {
         use crate::grpc::ClusterRouter;
 
-        let router = ClusterRouter::new();
+        let mut router = ClusterRouter::new();
 
         // Register management cluster (cluster_id = 0)
-        // TODO: Actually use management_cluster when we implement it properly
-        // For now, we'll skip registering it since it's a placeholder
+        router.register_management_cluster(self.management_cluster.local_sender.clone());
 
         // Register workflow execution cluster (cluster_id = 1 by default)
-        // Get the receiver from transport and register it
-        // NOTE: This requires access to the transport's receiver, which we'll need to expose
-        // For now, we'll document this as a TODO for when we actually use multi-cluster routing
+        router.register_execution_cluster(1, self.workflow_cluster.local_sender.clone())?;
 
         Ok(Arc::new(router))
     }
@@ -53,12 +50,11 @@ impl NodeManager {
         transport: Arc<GrpcClusterTransport>,
         node_id: u64,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // Create workflow cluster using new pattern
-        // Phase 3: Use extract_typed_receiver to get Message<WorkflowCommand> receiver
-        let receiver = transport.extract_typed_receiver::<WorkflowCommand>(node_id)?;
+        // Create workflow cluster
+        // RaftCluster::new creates its own mailbox internally
         let executor = WorkflowCommandExecutor::default();
         let transport_ref: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<WorkflowCommand>>> = transport.clone();
-        let workflow_cluster = Arc::new(RaftCluster::new(node_id, receiver, transport_ref, executor).await?);
+        let workflow_cluster = Arc::new(RaftCluster::new(node_id, transport_ref, executor).await?);
 
         // Create workflow runtime
         let workflow_runtime = WorkflowRuntime::new(workflow_cluster.clone());
@@ -76,12 +72,11 @@ impl NodeManager {
         let management_transport = Arc::new(GrpcClusterTransport::new(management_nodes));
         management_transport.start().await?;
 
-        // Create management cluster using new pattern
-        // Phase 3: Use extract_typed_receiver to get Message<ManagementCommand> receiver
-        let management_receiver = management_transport.extract_typed_receiver::<ManagementCommand>(node_id)?;
+        // Create management cluster
+        // RaftCluster::new creates its own mailbox internally
         let management_executor = ManagementCommandExecutor::default();
         let management_transport_ref: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<ManagementCommand>>> = management_transport.clone();
-        let management_cluster = Arc::new(RaftCluster::new(node_id, management_receiver, management_transport_ref, management_executor).await?);
+        let management_cluster = Arc::new(RaftCluster::new(node_id, management_transport_ref, management_executor).await?);
 
         Ok(Self {
             management_cluster,

@@ -32,6 +32,10 @@ pub struct RaftCluster<E: CommandExecutor> {
     // Sync ID tracking: map of sync_id -> oneshot sender
     // Used for synchronous command/confchange operations
     sync_waiters: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<(), String>>>>>,
+    // Local mailbox sender for sending messages to this node's RaftNode
+    // Used for self-messaging instead of going through transport
+    // Public so that InMemoryClusterTransport can register it
+    pub local_sender: mpsc::UnboundedSender<Message<E::Command>>,
 }
 
 impl<E: CommandExecutor + 'static> RaftCluster<E> {
@@ -39,23 +43,48 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
     ///
     /// # Parameters
     /// * `node_id` - Unique identifier for this node
-    /// * `receiver` - Channel to receive messages for this node
     /// * `transport` - Transport implementation for sending messages to peers
     /// * `executor` - Command executor for applying committed commands
     ///
     /// # Example
     /// ```ignore
     /// let transport = Arc::new(InMemoryClusterTransport::new(vec![1, 2, 3]));
-    /// let receiver = transport.extract_receiver(1).await?;
     /// let executor = MyExecutor::default();
-    /// let cluster = RaftCluster::new(1, receiver, transport, executor).await?;
+    /// let cluster = RaftCluster::new(1, transport, executor).await?;
     /// ```
     pub async fn new(
         node_id: u64,
-        receiver: mpsc::UnboundedReceiver<Message<E::Command>>,
         transport: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<E::Command>>>,
         executor: E,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Create mailbox channel for this node
+        let (local_sender, mailbox_receiver) = mpsc::unbounded_channel();
+
+        // Determine initial node count from discovered voters (peer nodes)
+        // For InMemoryClusterTransport, this will be empty initially (no peers registered yet)
+        // For GrpcClusterTransport, this comes from peer discovery
+        // Note: transport only handles outgoing messages to OTHER nodes, so discovered_voters
+        // represents peer nodes only. Total cluster size = discovered_voters + self (this node)
+        let discovered_voters = transport.get_discovered_voters();
+        let node_count = if discovered_voters.is_empty() {
+            // No discovered voters means single-node bootstrap (only this node, no peers)
+            1
+        } else {
+            // Multi-node: discovered peers + this node
+            discovered_voters.len() + 1
+        };
+
+        // Special handling for InMemoryClusterTransport: register this node
+        // This is necessary because InMemoryClusterTransport is an in-process testing transport
+        // that routes messages via channels. Even though conceptually the transport is for
+        // "outgoing to peers", the raft-rs library may internally send messages that need routing.
+        // GrpcClusterTransport doesn't need this because it receives from the network.
+        use std::any::Any;
+        use crate::raft::generic::transport::InMemoryClusterTransport;
+        if let Some(in_memory_transport) = (transport.as_ref() as &dyn Any).downcast_ref::<InMemoryClusterTransport<Message<E::Command>>>() {
+            in_memory_transport.register_node(node_id, local_sender.clone());
+        }
+
         // Create role change broadcast channel
         let (role_change_tx, _role_change_rx) = broadcast::channel(100);
 
@@ -63,8 +92,6 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
 
         // Set node ID on executor (for ownership checks)
         executor_arc.set_node_id(node_id);
-
-        let node_count = transport.list_nodes().len();
 
         // Determine if this is a single-node or multi-node setup
         let is_single_node = node_count == 1;
@@ -119,7 +146,7 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
         let transport_for_node = transport.clone();
         let node = RaftNode::<E>::new(
             node_id,
-            receiver,
+            mailbox_receiver,
             transport_for_node,
             executor_arc.clone(),
             role_tx_for_node,
@@ -147,6 +174,7 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
             cached_config: cached_config_arc,
             cached_conf_state: cached_conf_state_arc,
             sync_waiters,
+            local_sender,
         };
 
         // Give the node time to initialize
@@ -162,8 +190,8 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
 
     /// Generic method to propose any command using the CommandExecutor pattern
     pub async fn propose_command(&self, command: E::Command) -> Result<bool, Box<dyn std::error::Error>> {
-        // Send to this node's local Raft instance, which will forward to leader if needed
-        self.transport.send_message_to_node(self.node_id, Message::Propose {
+        // Send to this node's local Raft instance via local channel
+        self.local_sender.send(Message::Propose {
             command,
             sync_id: None,
         }).map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
@@ -192,10 +220,10 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
         // Try to send to leader (first try self if we're leader, then known leader, then scan)
         let mut sent = false;
 
-        // Try 1: If we're the leader, send to self
+        // Try 1: If we're the leader, send to self via local channel
         if self.leader_id.load(Ordering::SeqCst) == self.node_id {
             let message = create_message(sync_id);
-            if self.transport.send_message_to_node(self.node_id, message).is_ok() {
+            if self.local_sender.send(message).is_ok() {
                 sent = true;
             }
         }
@@ -325,7 +353,7 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
     }
 
     pub async fn campaign(&self) -> Result<bool, Box<dyn std::error::Error>> {
-        self.transport.send_message_to_node(self.node_id, Message::Campaign)
+        self.local_sender.send(Message::Campaign)
             .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
         Ok(true)
     }
@@ -389,16 +417,38 @@ mod tests {
         use crate::raft::generic::transport::InMemoryClusterTransport;
         use crate::raft::generic::message::Message;
 
-        let transport = Arc::new(InMemoryClusterTransport::<Message<TestCommand>>::new(vec![1]));
-        let receiver = transport.extract_receiver(1).await.expect("Extract receiver");
+        let transport = Arc::new(InMemoryClusterTransport::<Message<TestCommand>>::new());
         let executor = TestCommandExecutor;
         let transport_ref: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<TestCommand>>> = transport.clone();
-        let cluster = RaftCluster::new(1, receiver, transport_ref, executor).await;
+        let cluster = RaftCluster::new(1, transport_ref, executor).await;
         assert!(cluster.is_ok());
 
-        let cluster = cluster.unwrap();
+        let cluster = Arc::new(cluster.unwrap());
+
         assert_eq!(cluster.node_count(), 1);
-        assert_eq!(cluster.get_node_ids(), vec![1]);
+
+        // Wait for leadership and config to be established
+        // Subscribe to role changes first
+        let mut role_rx = cluster.subscribe_role_changes();
+
+        // Wait for BecameLeader event with timeout
+        let timeout = tokio::time::Duration::from_secs(2);
+        match tokio::time::timeout(timeout, async {
+            while let Ok(role_change) = role_rx.recv().await {
+                if matches!(role_change, crate::raft::RoleChange::BecameLeader(_)) {
+                    return;
+                }
+            }
+        }).await {
+            Ok(_) => {
+                // Wait a bit more for config to be populated
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                assert_eq!(cluster.get_node_ids(), vec![1]);
+            },
+            Err(_) => {
+                panic!("Timeout waiting for leadership");
+            }
+        }
     }
 
     #[tokio::test]
@@ -410,11 +460,10 @@ mod tests {
         // Clear any previous test state for this prefix
         clear_test_state_for_prefix(TEST_PREFIX);
 
-        let transport = Arc::new(InMemoryClusterTransport::<Message<TestCommand>>::new(vec![1]));
-        let receiver = transport.extract_receiver(1).await.expect("Extract receiver");
+        let transport = Arc::new(InMemoryClusterTransport::<Message<TestCommand>>::new());
         let executor = TestCommandExecutor;
         let transport_ref: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<TestCommand>>> = transport.clone();
-        let cluster = Arc::new(RaftCluster::new(1, receiver, transport_ref, executor).await
+        let cluster = Arc::new(RaftCluster::new(1, transport_ref, executor).await
             .expect("Failed to create single node cluster"));
 
         // Wait for leadership establishment
@@ -515,11 +564,10 @@ mod tests {
         // Clear any previous test state for this prefix
         clear_test_state_for_prefix(TEST_PREFIX);
 
-        let transport = Arc::new(InMemoryClusterTransport::<Message<TestCommand>>::new(vec![1]));
-        let receiver = transport.extract_receiver(1).await.expect("Extract receiver");
+        let transport = Arc::new(InMemoryClusterTransport::<Message<TestCommand>>::new());
         let executor = TestCommandExecutor;
         let transport_ref: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<TestCommand>>> = transport.clone();
-        let cluster = Arc::new(RaftCluster::new(1, receiver, transport_ref, executor).await
+        let cluster = Arc::new(RaftCluster::new(1, transport_ref, executor).await
             .expect("Failed to create single node cluster"));
 
         // Wait for leadership establishment

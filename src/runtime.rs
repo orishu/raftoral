@@ -239,22 +239,26 @@ impl RaftoralGrpcRuntime {
         ).await?);
         info!("NodeManager ready with management and workflow clusters");
 
-        // Start gRPC server with optional custom configuration
+        // Create ClusterRouter for multi-cluster message routing
+        let cluster_router = node_manager.create_cluster_router()?;
+        info!("ClusterRouter configured for management (cluster_id=0) and workflow (cluster_id=1) clusters");
+
+        // Start gRPC server with ClusterRouter and optional custom configuration
         // Server must be started BEFORE add_node so it can receive Raft messages
         let server_handle = if let Some(server_config) = config.server_configurator {
-            start_grpc_server_with_config(
+            crate::grpc::start_grpc_server_with_router_and_config(
                 config.listen_address.clone(),
-                transport.clone(),
                 node_manager.clone(),
+                cluster_router,
                 node_id,
                 Some(server_config),
             )
             .await?
         } else {
-            start_grpc_server(
+            crate::grpc::start_grpc_server_with_router(
                 config.listen_address.clone(),
-                transport.clone(),
                 node_manager.clone(),
+                cluster_router,
                 node_id,
             )
             .await?

@@ -1,7 +1,6 @@
 pub mod server;
 pub mod client;
 pub mod bootstrap;
-pub mod cluster_router;
 
 pub use server::{
     start_grpc_server, start_grpc_server_with_config,
@@ -10,4 +9,5 @@ pub use server::{
 };
 pub use client::RaftClient;
 pub use bootstrap::{discover_peers, DiscoveredPeer};
-pub use cluster_router::ClusterRouter;
+// ClusterRouter is now in raft::generic::cluster_router
+pub use crate::raft::generic::ClusterRouter;

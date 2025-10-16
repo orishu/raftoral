@@ -122,11 +122,8 @@ impl WorkflowRuntime {
         use crate::raft::generic::message::Message;
         use crate::raft::generic::cluster::RaftCluster;
 
-        // Create in-memory transport for single node
-        let transport = Arc::new(InMemoryClusterTransport::<Message<WorkflowCommand>>::new(vec![node_id]));
-
-        // Extract the receiver for this node
-        let receiver = transport.extract_receiver(node_id).await?;
+        // Create in-memory transport
+        let transport = Arc::new(InMemoryClusterTransport::<Message<WorkflowCommand>>::new());
 
         // Create executor
         let executor = WorkflowCommandExecutor::default();
@@ -134,8 +131,8 @@ impl WorkflowRuntime {
         // Create transport reference
         let transport_ref: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<WorkflowCommand>>> = transport.clone();
 
-        // Create cluster
-        let cluster = Arc::new(RaftCluster::new(node_id, receiver, transport_ref, executor).await?);
+        // Create cluster (mailbox channel created internally)
+        let cluster = Arc::new(RaftCluster::new(node_id, transport_ref, executor).await?);
 
         let runtime = Arc::new(WorkflowRuntime {
             cluster: cluster.clone(),

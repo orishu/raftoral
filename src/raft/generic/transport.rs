@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::any::Any;
 use tokio::sync::mpsc;
 use serde::{Serialize, Deserialize};
 
@@ -8,7 +9,10 @@ use serde::{Serialize, Deserialize};
 /// This trait provides all necessary operations for RaftCluster and RaftNode to
 /// communicate with peers without directly accessing transport internals.
 /// Generic over message type M - any type that can serve as a message.
-pub trait TransportInteraction<M>: Send + Sync
+///
+/// Note: Requires Any for downcasting to concrete types (e.g., InMemoryClusterTransport)
+/// in specific scenarios like testing transports that need special initialization.
+pub trait TransportInteraction<M>: Send + Sync + Any
 where
     M: Send + Sync + 'static,
 {
@@ -98,50 +102,26 @@ pub struct InMemoryClusterTransport<M>
 where
     M: Send + Sync + 'static,
 {
-    /// Node IDs in this cluster
-    node_ids: Vec<u64>,
-    /// Senders for each node (node_id -> sender to that node's receiver)
-    /// Shared with RaftNode instances for immediate visibility of changes
+    /// Senders for each node (node_id -> sender to that node's mailbox)
+    /// Populated when RaftCluster instances register themselves
     node_senders: Arc<std::sync::RwLock<HashMap<u64, mpsc::UnboundedSender<M>>>>,
-    /// Receivers for each node (held until extract_receiver is called)
-    node_receivers: Arc<tokio::sync::Mutex<HashMap<u64, mpsc::UnboundedReceiver<M>>>>,
-    /// Shutdown signal
-    shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
 }
 
 impl<M> InMemoryClusterTransport<M>
 where
     M: Send + Sync + 'static,
 {
-    /// Create a new in-memory transport for the given node IDs
-    pub fn new(node_ids: Vec<u64>) -> Self {
-        let mut node_senders_map = HashMap::new();
-        let mut node_receivers_map = HashMap::new();
-
-        // Create unbounded channels for each node
-        for &node_id in &node_ids {
-            let (sender, receiver) = mpsc::unbounded_channel();
-            node_senders_map.insert(node_id, sender);
-            node_receivers_map.insert(node_id, receiver);
-        }
-
+    /// Create a new in-memory transport
+    pub fn new() -> Self {
         InMemoryClusterTransport {
-            node_ids,
-            node_senders: Arc::new(std::sync::RwLock::new(node_senders_map)),
-            node_receivers: Arc::new(tokio::sync::Mutex::new(node_receivers_map)),
-            shutdown_tx: None,
+            node_senders: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
     }
 
-    /// Extract the receiver for a specific node
-    /// This removes the receiver from the internal map, so it can only be called once per node
-    pub async fn extract_receiver(
-        &self,
-        node_id: u64,
-    ) -> Result<mpsc::UnboundedReceiver<M>, Box<dyn std::error::Error>> {
-        let mut receivers = self.node_receivers.lock().await;
-        receivers.remove(&node_id)
-            .ok_or_else(|| format!("Node {} receiver already extracted or doesn't exist", node_id).into())
+    /// Register a node's mailbox sender with the transport
+    /// Called by RaftCluster during initialization
+    pub fn register_node(&self, node_id: u64, sender: mpsc::UnboundedSender<M>) {
+        self.node_senders.write().unwrap().insert(node_id, sender);
     }
 }
 
@@ -191,23 +171,23 @@ where
 mod tests {
     use super::*;
     use crate::raft::generic::message::Message;
+    use tokio::sync::mpsc;
 
     #[tokio::test]
     async fn test_in_memory_transport_creation() {
-        let transport = InMemoryClusterTransport::<Message<String>>::new(vec![1, 2, 3]);
-        assert_eq!(transport.list_nodes().len(), 3);
+        let transport = InMemoryClusterTransport::<Message<String>>::new();
+        assert_eq!(transport.list_nodes().len(), 0);
     }
 
     #[tokio::test]
-    async fn test_in_memory_transport_extract_receiver() {
-        let transport = InMemoryClusterTransport::<Message<String>>::new(vec![1, 2, 3]);
+    async fn test_in_memory_transport_register_node() {
+        let transport = InMemoryClusterTransport::<Message<String>>::new();
 
-        // Extract receiver for node 1
-        let receiver1 = transport.extract_receiver(1).await;
-        assert!(receiver1.is_ok(), "Should extract receiver for node 1");
+        // Create a channel and register node
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        transport.register_node(1, sender);
 
-        // Try to extract same receiver again - should fail
-        let receiver1_again = transport.extract_receiver(1).await;
-        assert!(receiver1_again.is_err(), "Should not allow extracting same receiver twice");
+        assert_eq!(transport.list_nodes().len(), 1);
+        assert!(transport.list_nodes().contains(&1));
     }
 }

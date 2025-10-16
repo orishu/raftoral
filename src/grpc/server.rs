@@ -79,13 +79,12 @@ impl<E: CommandExecutor + Default + 'static> RaftService for RaftServiceImpl<E> 
                 ));
             }
 
-            // Phase 3: Transport now works with GenericMessage
-            // Get the sender for this node
-            let sender = self.transport.get_node_sender(self.node_id).await
-                .ok_or_else(|| Status::not_found(format!("Node {} not found", self.node_id)))?;
+            // Deserialize and send directly to cluster's local mailbox
+            use crate::raft::generic::message::Message;
+            let message = Message::<E::Command>::from_protobuf(proto_msg)
+                .map_err(|e| Status::invalid_argument(format!("Failed to deserialize message: {}", e)))?;
 
-            // Send the GenericMessage directly (will be deserialized by extract_typed_receiver adapter)
-            sender.send(proto_msg)
+            self.cluster.local_sender.send(message)
                 .map_err(|e| Status::internal(format!("Failed to send message: {}", e)))?;
         }
 
