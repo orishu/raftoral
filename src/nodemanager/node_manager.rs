@@ -32,11 +32,11 @@ impl NodeManager {
         transport: Arc<GrpcClusterTransport>,
         node_id: u64,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // Create workflow cluster
+        // Create workflow cluster (cluster_id = 1)
         // RaftCluster::new creates its own mailbox internally
         let executor = WorkflowCommandExecutor::default();
         let transport_ref: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<WorkflowCommand>>> = transport.clone();
-        let workflow_cluster = Arc::new(RaftCluster::new(node_id, transport_ref, executor).await?);
+        let workflow_cluster = Arc::new(RaftCluster::new(node_id, 1, transport_ref, executor).await?);
 
         // Create workflow runtime
         let workflow_runtime = WorkflowRuntime::new(workflow_cluster.clone());
@@ -54,11 +54,11 @@ impl NodeManager {
         let management_transport = Arc::new(GrpcClusterTransport::new(management_nodes));
         management_transport.start().await?;
 
-        // Create management cluster
+        // Create management cluster (cluster_id = 0)
         // RaftCluster::new creates its own mailbox internally
         let management_executor = ManagementCommandExecutor::default();
         let management_transport_ref: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<ManagementCommand>>> = management_transport.clone();
-        let management_cluster = Arc::new(RaftCluster::new(node_id, management_transport_ref, management_executor).await?);
+        let management_cluster = Arc::new(RaftCluster::new(node_id, 0, management_transport_ref, management_executor).await?);
 
         // Create ClusterRouter and register both clusters
         // This enables multi-cluster routing where:

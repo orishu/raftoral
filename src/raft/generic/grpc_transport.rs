@@ -400,10 +400,12 @@ where
     fn send_message_to_node(
         &self,
         target_node_id: u64,
-        message: Message<C>
+        message: Message<C>,
+        cluster_id: u64,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Phase 3: Serialize Message<C> → GenericMessage at the transport boundary
-        let proto_msg = message.to_protobuf()?;
+        // Include cluster_id for proper routing on the receiving end
+        let proto_msg = message.to_protobuf(cluster_id)?;
 
         let destinations = self.destinations.read().unwrap();
         let dest = destinations.get(&target_node_id)
@@ -679,8 +681,8 @@ mod tests {
             sync_id: None,
         };
 
-        // Send message - serialize to protobuf first
-        let proto_msg = message.to_protobuf().expect("Failed to serialize message");
+        // Send message - serialize to protobuf first (cluster_id = 1 for test)
+        let proto_msg = message.to_protobuf(1).expect("Failed to serialize message");
         let result = timeout(
             Duration::from_secs(5),
             client.send_message(proto_msg)

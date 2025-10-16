@@ -132,7 +132,7 @@ impl WorkflowRuntime {
         let transport_ref: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<WorkflowCommand>>> = transport.clone();
 
         // Create cluster (mailbox channel created internally)
-        let cluster = Arc::new(RaftCluster::new(node_id, transport_ref, executor).await?);
+        let cluster = Arc::new(RaftCluster::new(node_id, 1, transport_ref, executor).await?);
 
         let runtime = Arc::new(WorkflowRuntime {
             cluster: cluster.clone(),

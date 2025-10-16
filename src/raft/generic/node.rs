@@ -43,6 +43,7 @@ pub struct RaftNode<E: CommandExecutor> {
     #[allow(dead_code)] // Reserved for future use
     storage: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     node_id: u64,
+    cluster_id: u64,  // Cluster ID for multi-cluster routing
     logger: Logger,
 
     // For multi-node communication
@@ -78,6 +79,7 @@ pub struct RaftNode<E: CommandExecutor> {
 impl<E: CommandExecutor + 'static> RaftNode<E> {
     pub fn new(
         node_id: u64,
+        cluster_id: u64,
         mailbox: mpsc::UnboundedReceiver<Message<E::Command>>,
         transport: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<E::Command>>>,
         executor: Arc<E>,
@@ -152,6 +154,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             raft_group,
             storage: Arc::new(RwLock::new(HashMap::new())),
             node_id,
+            cluster_id,
             logger,
             mailbox,
             transport,
@@ -310,7 +313,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
         for msg in messages {
             let msg_to = msg.to;
             let raft_msg = Message::Raft(msg);
-            if let Err(e) = self.transport.send_message_to_node(msg_to, raft_msg) {
+            if let Err(e) = self.transport.send_message_to_node(msg_to, raft_msg, self.cluster_id) {
                 slog::warn!(self.logger, "Failed to send message"; "to" => msg_to, "error" => %e);
             }
         }

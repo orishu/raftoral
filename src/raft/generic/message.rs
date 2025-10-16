@@ -79,7 +79,10 @@ where
 {
     /// Convert Message<C> directly to protobuf GenericMessage
     /// This eliminates the need for SerializableMessage and JSON serialization
-    pub fn to_protobuf(&self) -> Result<raft_proto::GenericMessage, Box<dyn std::error::Error + Send + Sync>> {
+    ///
+    /// # Arguments
+    /// * `cluster_id` - The cluster ID for routing (0 = management, 1+ = execution clusters)
+    pub fn to_protobuf(&self, cluster_id: u64) -> Result<raft_proto::GenericMessage, Box<dyn std::error::Error + Send + Sync>> {
         use protobuf::Message as ProtobufMessage;
 
         let message = match self {
@@ -113,7 +116,7 @@ where
         };
 
         Ok(raft_proto::GenericMessage {
-            cluster_id: 0,  // Phase 1: Always 0 (single cluster mode)
+            cluster_id,
             message: Some(message),
         })
     }

@@ -16,12 +16,18 @@ pub trait TransportInteraction<M>: Send + Sync + Any
 where
     M: Send + Sync + 'static,
 {
-    /// Send a message to a specific node
+    /// Send a message to a specific node with cluster ID for routing
     /// Returns error if node doesn't exist or send fails
+    ///
+    /// # Arguments
+    /// * `target_node_id` - The node to send the message to
+    /// * `message` - The message to send
+    /// * `cluster_id` - The cluster ID for multi-cluster routing (0 = management, 1+ = execution)
     fn send_message_to_node(
         &self,
         target_node_id: u64,
-        message: M
+        message: M,
+        cluster_id: u64,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     /// Get list of all known node IDs
@@ -133,7 +139,8 @@ where
     fn send_message_to_node(
         &self,
         target_node_id: u64,
-        message: M
+        message: M,
+        _cluster_id: u64,  // In-memory transport doesn't use cluster_id (single process)
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let senders = self.node_senders.read().unwrap();
         let sender = senders.get(&target_node_id)
