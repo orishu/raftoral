@@ -1,7 +1,7 @@
 use raftoral::raft::generic::grpc_transport::{GrpcClusterTransport, NodeConfig};
-use raftoral::raft::generic::transport::ClusterTransport;
-use raftoral::workflow::{WorkflowCommandExecutor, WorkflowRuntime, WorkflowContext};
+use raftoral::workflow::WorkflowContext;
 use raftoral::grpc::{start_grpc_server, discover_peers};
+use raftoral::nodemanager::NodeManager;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use serde::{Deserialize, Serialize};
@@ -27,20 +27,21 @@ async fn test_three_node_grpc_cluster_bootstrap() {
     let addr1 = format!("127.0.0.1:{}", port1);
     println!("  Node 1 address: {}", addr1);
 
-    let transport1 = Arc::new(GrpcClusterTransport::<WorkflowCommandExecutor>::new(vec![
+    let transport1 = Arc::new(GrpcClusterTransport::new(vec![
         NodeConfig { node_id: 1, address: addr1.clone() },
     ]));
     transport1.start().await.expect("Transport 1 should start");
 
-    let cluster1 = transport1.create_cluster(1).await.expect("Should create cluster 1");
-    let runtime1 = WorkflowRuntime::new(cluster1.clone());
+    // Phase 3: Use NodeManager
+    let node_manager1 = Arc::new(NodeManager::new(transport1.clone(), 1).await.expect("Should create node manager 1"));
+    let cluster1 = node_manager1.workflow_cluster.clone();
+    let runtime1 = node_manager1.workflow_runtime();
 
     let server1 = start_grpc_server(
         addr1.clone(),
         transport1.clone(),
-        cluster1.clone(),
+        node_manager1.clone(),
         1,
-        runtime1.clone()
     ).await.expect("Should start server 1");
     println!("✓ Node 1 bootstrapped and running\n");
 
@@ -62,17 +63,15 @@ async fn test_three_node_grpc_cluster_bootstrap() {
     println!("  Node 2 address: {}", addr2);
 
     // IMPORTANT: Create transport with ONLY node 2 initially
-    let transport2 = Arc::new(GrpcClusterTransport::<WorkflowCommandExecutor>::new(vec![
+    let transport2 = Arc::new(GrpcClusterTransport::new(vec![
         NodeConfig { node_id: 2, address: addr2.clone() },
     ]));
     transport2.start().await.expect("Transport 2 should start");
 
-    // CRITICAL: Set discovered voter configuration BEFORE creating cluster
-    // This initializes the joining node with proper Raft configuration
+    // Set discovered voters from discovery
     transport2.set_discovered_voters(discovered[0].voters.clone());
-    println!("  Set discovered voters on transport 2");
 
-    // CRITICAL: Add node 1 to transport BEFORE creating cluster
+    // Phase 3: Add node 1 to transport BEFORE creating cluster
     // This prevents node 2 from being detected as single-node and campaigning
     transport2.add_node(NodeConfig { node_id: 1, address: addr1.clone() }).await
         .expect("Should add node 1 to transport 2");
@@ -80,15 +79,16 @@ async fn test_three_node_grpc_cluster_bootstrap() {
     // Give time for gRPC client to be created
     sleep(Duration::from_millis(100)).await;
 
-    let cluster2 = transport2.create_cluster(2).await.expect("Should create cluster 2");
-    let runtime2 = WorkflowRuntime::new(cluster2.clone());
+    // Phase 3: Use NodeManager
+    let node_manager2 = Arc::new(NodeManager::new(transport2.clone(), 2).await.expect("Should create node manager 2"));
+    let cluster2 = node_manager2.workflow_cluster.clone();
+    let runtime2 = node_manager2.workflow_runtime();
 
     let server2 = start_grpc_server(
         addr2.clone(),
         transport2.clone(),
-        cluster2.clone(),
+        node_manager2.clone(),
         2,
-        runtime2.clone()
     ).await.expect("Should start server 2");
 
     // Give server time to be fully ready
@@ -119,16 +119,15 @@ async fn test_three_node_grpc_cluster_bootstrap() {
     println!("  Node 3 address: {}", addr3);
 
     // IMPORTANT: Create transport with ONLY node 3 initially
-    let transport3 = Arc::new(GrpcClusterTransport::<WorkflowCommandExecutor>::new(vec![
+    let transport3 = Arc::new(GrpcClusterTransport::new(vec![
         NodeConfig { node_id: 3, address: addr3.clone() },
     ]));
     transport3.start().await.expect("Transport 3 should start");
 
-    // CRITICAL: Set discovered voter configuration BEFORE creating cluster
+    // Set discovered voters from discovery
     transport3.set_discovered_voters(discovered[0].voters.clone());
-    println!("  Set discovered voters on transport 3");
 
-    // CRITICAL: Add existing cluster members to transport BEFORE creating cluster
+    // Add existing cluster members to transport BEFORE creating cluster
     // This prevents node 3 from being detected as single-node and campaigning
     transport3.add_node(NodeConfig { node_id: 1, address: addr1.clone() }).await
         .expect("Should add node 1 to transport 3");
@@ -138,15 +137,16 @@ async fn test_three_node_grpc_cluster_bootstrap() {
     // Give time for gRPC clients to be created
     sleep(Duration::from_millis(100)).await;
 
-    let cluster3 = transport3.create_cluster(3).await.expect("Should create cluster 3");
-    let runtime3 = WorkflowRuntime::new(cluster3.clone());
+    // Phase 3: Use NodeManager
+    let node_manager3 = Arc::new(NodeManager::new(transport3.clone(), 3).await.expect("Should create node manager 3"));
+    let cluster3 = node_manager3.workflow_cluster.clone();
+    let runtime3 = node_manager3.workflow_runtime();
 
     let server3 = start_grpc_server(
         addr3.clone(),
         transport3.clone(),
-        cluster3.clone(),
+        node_manager3.clone(),
         3,
-        runtime3.clone()
     ).await.expect("Should start server 3");
 
     // Give node 3's server a moment to be fully ready before adding to cluster

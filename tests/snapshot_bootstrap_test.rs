@@ -1,6 +1,5 @@
 use raftoral::raft::generic::grpc_transport::{GrpcClusterTransport, NodeConfig};
-use raftoral::raft::generic::transport::ClusterTransport;
-use raftoral::workflow::WorkflowCommandExecutor;
+use raftoral::workflow::{WorkflowCommandExecutor, WorkflowCommand};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
@@ -13,21 +12,23 @@ async fn test_snapshot_based_bootstrap() {
     let port1 = port_check::free_local_port().expect("Should find free port for node 1");
     let addr1 = format!("127.0.0.1:{}", port1);
 
-    let transport1 = Arc::new(GrpcClusterTransport::<WorkflowCommandExecutor>::new(vec![
+    let transport1 = Arc::new(GrpcClusterTransport::new(vec![
         NodeConfig { node_id: 1, address: addr1.clone() },
     ]));
     transport1.start().await.expect("Transport 1 should start");
 
-    let cluster1 = transport1.create_cluster(1).await.expect("Should create cluster 1");
+    // Phase 3: Use NodeManager pattern
+    let receiver1 = transport1.extract_typed_receiver::<WorkflowCommand>(1).expect("Should extract receiver");
+    let executor1 = WorkflowCommandExecutor::default();
+    let transport_ref1: Arc<dyn raftoral::raft::generic::transport::TransportInteraction<raftoral::raft::generic::message::Message<WorkflowCommand>>> = transport1.clone();
+    let cluster1 = Arc::new(raftoral::raft::RaftCluster::new(1, receiver1, transport_ref1, executor1).await.expect("Should create cluster"));
 
     // Step 2: Add MANY dummy entries to force snapshot threshold
     println!("Step 2: Adding 1500 dummy entries to trigger snapshot");
-    use raftoral::workflow::{WorkflowCommand, CheckpointData};
+    use raftoral::workflow::CheckpointData;
 
     for i in 0..1500 {
-        let command_id = cluster1.generate_command_id();
         let dummy_checkpoint = WorkflowCommand::SetCheckpoint(CheckpointData {
-            command_id,
             workflow_id: format!("dummy_workflow_{}", i),
             key: format!("key_{}", i),
             value: vec![i as u8],
@@ -53,7 +54,7 @@ async fn test_snapshot_based_bootstrap() {
     let port2 = port_check::free_local_port().expect("Should find free port for node 2");
     let addr2 = format!("127.0.0.1:{}", port2);
 
-    let transport2 = Arc::new(GrpcClusterTransport::<WorkflowCommandExecutor>::new(vec![
+    let transport2 = Arc::new(GrpcClusterTransport::new(vec![
         NodeConfig { node_id: 2, address: addr2.clone() },
     ]));
     transport2.start().await.expect("Transport 2 should start");
@@ -64,7 +65,11 @@ async fn test_snapshot_based_bootstrap() {
 
     sleep(Duration::from_millis(100)).await;
 
-    let cluster2 = transport2.create_cluster(2).await.expect("Should create cluster 2");
+    // Phase 3: Use NodeManager pattern
+    let receiver2 = transport2.extract_typed_receiver::<WorkflowCommand>(2).expect("Should extract receiver");
+    let executor2 = WorkflowCommandExecutor::default();
+    let transport_ref2: Arc<dyn raftoral::raft::generic::transport::TransportInteraction<raftoral::raft::generic::message::Message<WorkflowCommand>>> = transport2.clone();
+    let cluster2 = Arc::new(raftoral::raft::RaftCluster::new(2, receiver2, transport_ref2, executor2).await.expect("Should create cluster"));
 
     // Add node 2 to cluster via node 1
     println!("  Adding node 2 as learner via ConfChange...");

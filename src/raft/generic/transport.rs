@@ -181,9 +181,9 @@ where
     }
 
     fn get_discovered_voters(&self) -> Vec<u64> {
-        // In-memory transport doesn't use discovery - return empty
-        // Tests using InMemoryClusterTransport don't need this feature
-        Vec::new()
+        // In-memory transport: return all node IDs as voters
+        // This allows multi-node tests to bootstrap with proper voter configuration
+        self.node_senders.read().unwrap().keys().copied().collect()
     }
 }
 

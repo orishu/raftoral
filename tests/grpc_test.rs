@@ -1,7 +1,7 @@
 use raftoral::raft::generic::grpc_transport::{GrpcClusterTransport, NodeConfig};
-use raftoral::raft::generic::transport::ClusterTransport;
-use raftoral::workflow::{WorkflowCommandExecutor, WorkflowRuntime};
+// Phase 3: WorkflowCommandExecutor and WorkflowRuntime no longer needed at top level
 use raftoral::grpc::start_grpc_server;
+use raftoral::nodemanager::NodeManager;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
@@ -33,7 +33,7 @@ async fn test_grpc_transport_node_management() {
         NodeConfig { node_id: 1, address: node1_addr.clone() },
     ];
 
-    let transport = GrpcClusterTransport::<WorkflowCommandExecutor>::new(nodes);
+    let transport = GrpcClusterTransport::new(nodes);
 
     // Verify initial node
     assert_eq!(
@@ -74,13 +74,12 @@ async fn test_grpc_transport_node_ids() {
         NodeConfig { node_id: 2, address: "127.0.0.1:5002".to_string() },
     ];
 
-    let transport = GrpcClusterTransport::<WorkflowCommandExecutor>::new(nodes);
+    let transport = GrpcClusterTransport::new(nodes);
 
-    // Get node IDs - should work now with async method
-    let mut node_ids = transport.node_ids().await;
-    node_ids.sort(); // Sort since HashMap doesn't guarantee order
-
-    assert_eq!(node_ids, vec![1, 2, 3]);
+    // Phase 3: Verify node addresses instead of getting IDs from internal state
+    assert_eq!(transport.get_node_address(1).await, Some("127.0.0.1:5001".to_string()));
+    assert_eq!(transport.get_node_address(2).await, Some("127.0.0.1:5002".to_string()));
+    assert_eq!(transport.get_node_address(3).await, Some("127.0.0.1:5003".to_string()));
     println!("✓ Successfully retrieved node IDs from gRPC transport");
 }
 
@@ -96,20 +95,18 @@ async fn test_discovery_rpc() {
         NodeConfig { node_id: 1, address: address.clone() },
     ];
 
-    let transport = Arc::new(GrpcClusterTransport::<WorkflowCommandExecutor>::new(nodes));
+    let transport = Arc::new(GrpcClusterTransport::new(nodes));
     transport.start().await.expect("Should start transport");
-    let cluster = transport.create_cluster(1).await.expect("Should create cluster");
 
-    // Create workflow runtime
-    let runtime = WorkflowRuntime::new(cluster.clone());
+    // Phase 3: Use NodeManager to create cluster with extract_typed_receiver
+    let node_manager = Arc::new(NodeManager::new(transport.clone(), 1).await.expect("Should create node manager"));
 
     // Start gRPC server
     let _server = start_grpc_server(
         address.clone(),
         transport.clone(),
-        cluster,
+        node_manager,
         1,
-        runtime
     ).await.expect("Should start server");
 
     // Give server time to start

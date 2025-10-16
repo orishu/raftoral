@@ -1,4 +1,5 @@
-use raftoral::raft::generic::transport::{ClusterTransport, InMemoryClusterTransport};
+use raftoral::raft::generic::transport::InMemoryClusterTransport;
+use raftoral::raft::generic::message::Message;
 use raftoral::workflow::{WorkflowCommandExecutor, WorkflowRuntime, WorkflowContext};
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,14 +17,32 @@ struct FibonacciOutput {
 
 #[tokio::test]
 async fn test_three_node_cluster_workflow_execution() {
-    // Create a 3-node cluster transport
-    let transport = Arc::new(InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3]));
-    transport.start().await.expect("Transport should start");
+    use raftoral::workflow::WorkflowCommand;
+    use raftoral::raft::RaftCluster;
 
-    // Create clusters and runtimes for all 3 nodes
-    let runtime1 = WorkflowRuntime::new(transport.create_cluster(1).await.expect("Should create cluster 1"));
-    let runtime2 = WorkflowRuntime::new(transport.create_cluster(2).await.expect("Should create cluster 2"));
-    let runtime3 = WorkflowRuntime::new(transport.create_cluster(3).await.expect("Should create cluster 3"));
+    // Phase 3: Create a 3-node cluster transport with Message<WorkflowCommand>
+    let transport = Arc::new(InMemoryClusterTransport::<Message<WorkflowCommand>>::new(vec![1, 2, 3]));
+
+    // Create clusters manually using extract_receiver pattern
+    let receiver1 = transport.extract_receiver(1).await.expect("Should extract receiver 1");
+    let executor1 = WorkflowCommandExecutor::default();
+    let transport_ref1: Arc<dyn raftoral::raft::generic::transport::TransportInteraction<Message<WorkflowCommand>>> = transport.clone();
+    let cluster1 = Arc::new(RaftCluster::new(1, receiver1, transport_ref1, executor1).await.expect("Should create cluster 1"));
+
+    let receiver2 = transport.extract_receiver(2).await.expect("Should extract receiver 2");
+    let executor2 = WorkflowCommandExecutor::default();
+    let transport_ref2: Arc<dyn raftoral::raft::generic::transport::TransportInteraction<Message<WorkflowCommand>>> = transport.clone();
+    let cluster2 = Arc::new(RaftCluster::new(2, receiver2, transport_ref2, executor2).await.expect("Should create cluster 2"));
+
+    let receiver3 = transport.extract_receiver(3).await.expect("Should extract receiver 3");
+    let executor3 = WorkflowCommandExecutor::default();
+    let transport_ref3: Arc<dyn raftoral::raft::generic::transport::TransportInteraction<Message<WorkflowCommand>>> = transport.clone();
+    let cluster3 = Arc::new(RaftCluster::new(3, receiver3, transport_ref3, executor3).await.expect("Should create cluster 3"));
+
+    // Create runtimes
+    let runtime1 = WorkflowRuntime::new(cluster1);
+    let runtime2 = WorkflowRuntime::new(cluster2);
+    let runtime3 = WorkflowRuntime::new(cluster3);
 
     // Register the same fibonacci workflow on all 3 nodes
     let fibonacci_fn = |input: FibonacciInput, _context: WorkflowContext| async move {
@@ -100,14 +119,32 @@ async fn test_three_node_cluster_basic_consensus() {
     #[derive(Clone, Debug, Serialize, Deserialize)]
     struct SimpleOutput {}
 
-    // Create a 3-node cluster transport
-    let transport = Arc::new(InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3]));
-    transport.start().await.expect("Transport should start");
+    use raftoral::workflow::WorkflowCommand;
+    use raftoral::raft::RaftCluster;
 
-    // Create clusters and runtimes for all 3 nodes
-    let runtime1 = WorkflowRuntime::new(transport.create_cluster(1).await.expect("Should create cluster 1"));
-    let runtime2 = WorkflowRuntime::new(transport.create_cluster(2).await.expect("Should create cluster 2"));
-    let runtime3 = WorkflowRuntime::new(transport.create_cluster(3).await.expect("Should create cluster 3"));
+    // Phase 3: Create a 3-node cluster transport with Message<WorkflowCommand>
+    let transport = Arc::new(InMemoryClusterTransport::<Message<WorkflowCommand>>::new(vec![1, 2, 3]));
+
+    // Create clusters manually using extract_receiver pattern
+    let receiver1 = transport.extract_receiver(1).await.expect("Should extract receiver 1");
+    let executor1 = WorkflowCommandExecutor::default();
+    let transport_ref1: Arc<dyn raftoral::raft::generic::transport::TransportInteraction<Message<WorkflowCommand>>> = transport.clone();
+    let cluster1 = Arc::new(RaftCluster::new(1, receiver1, transport_ref1, executor1).await.expect("Should create cluster 1"));
+
+    let receiver2 = transport.extract_receiver(2).await.expect("Should extract receiver 2");
+    let executor2 = WorkflowCommandExecutor::default();
+    let transport_ref2: Arc<dyn raftoral::raft::generic::transport::TransportInteraction<Message<WorkflowCommand>>> = transport.clone();
+    let cluster2 = Arc::new(RaftCluster::new(2, receiver2, transport_ref2, executor2).await.expect("Should create cluster 2"));
+
+    let receiver3 = transport.extract_receiver(3).await.expect("Should extract receiver 3");
+    let executor3 = WorkflowCommandExecutor::default();
+    let transport_ref3: Arc<dyn raftoral::raft::generic::transport::TransportInteraction<Message<WorkflowCommand>>> = transport.clone();
+    let cluster3 = Arc::new(RaftCluster::new(3, receiver3, transport_ref3, executor3).await.expect("Should create cluster 3"));
+
+    // Create runtimes
+    let runtime1 = WorkflowRuntime::new(cluster1);
+    let runtime2 = WorkflowRuntime::new(cluster2);
+    let runtime3 = WorkflowRuntime::new(cluster3);
 
     // Register a simple workflow on all nodes
     let simple_fn = |_input: SimpleInput, _context: WorkflowContext| async move {
@@ -175,13 +212,17 @@ async fn test_three_node_cluster_basic_consensus() {
 
 #[tokio::test]
 async fn test_cluster_node_count() {
-    let transport = Arc::new(InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3, 4, 5]));
-    assert_eq!(transport.node_ids().await, vec![1, 2, 3, 4, 5]);
+    use raftoral::workflow::WorkflowCommand;
+    use raftoral::raft::RaftCluster;
 
-    transport.start().await.expect("Transport should start");
+    // Phase 3: Create transport with Message<WorkflowCommand>
+    let transport = Arc::new(InMemoryClusterTransport::<Message<WorkflowCommand>>::new(vec![1, 2, 3, 4, 5]));
 
-    let cluster1 = transport.create_cluster(1).await
-        .expect("Should create cluster 1");
+    // Create cluster for node 1
+    let receiver1 = transport.extract_receiver(1).await.expect("Should extract receiver 1");
+    let executor1 = WorkflowCommandExecutor::default();
+    let transport_ref1: Arc<dyn raftoral::raft::generic::transport::TransportInteraction<Message<WorkflowCommand>>> = transport.clone();
+    let cluster1 = Arc::new(RaftCluster::new(1, receiver1, transport_ref1, executor1).await.expect("Should create cluster 1"));
 
     // Cluster should report correct node count (all nodes in the configuration)
     assert_eq!(cluster1.node_count(), 5);
@@ -209,14 +250,32 @@ async fn test_snapshot_based_catch_up() {
     println!("  4. Add 4th node and restore from snapshot");
     println!("  5. Verify 4th node continues execution from snapshot state\n");
 
-    // Create a 3-node cluster transport
-    let transport = Arc::new(InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3]));
-    transport.start().await.expect("Transport should start");
+    use raftoral::workflow::WorkflowCommand;
+    use raftoral::raft::RaftCluster;
 
-    // Create clusters and runtimes for first 3 nodes
-    let runtime1 = WorkflowRuntime::new(transport.create_cluster(1).await.expect("Should create cluster 1"));
-    let runtime2 = WorkflowRuntime::new(transport.create_cluster(2).await.expect("Should create cluster 2"));
-    let runtime3 = WorkflowRuntime::new(transport.create_cluster(3).await.expect("Should create cluster 3"));
+    // Phase 3: Create a 3-node cluster transport with Message<WorkflowCommand>
+    let transport = Arc::new(InMemoryClusterTransport::<Message<WorkflowCommand>>::new(vec![1, 2, 3]));
+
+    // Create clusters manually using extract_receiver pattern
+    let receiver1 = transport.extract_receiver(1).await.expect("Should extract receiver 1");
+    let executor1 = WorkflowCommandExecutor::default();
+    let transport_ref1: Arc<dyn raftoral::raft::generic::transport::TransportInteraction<Message<WorkflowCommand>>> = transport.clone();
+    let cluster1 = Arc::new(RaftCluster::new(1, receiver1, transport_ref1, executor1).await.expect("Should create cluster 1"));
+
+    let receiver2 = transport.extract_receiver(2).await.expect("Should extract receiver 2");
+    let executor2 = WorkflowCommandExecutor::default();
+    let transport_ref2: Arc<dyn raftoral::raft::generic::transport::TransportInteraction<Message<WorkflowCommand>>> = transport.clone();
+    let cluster2 = Arc::new(RaftCluster::new(2, receiver2, transport_ref2, executor2).await.expect("Should create cluster 2"));
+
+    let receiver3 = transport.extract_receiver(3).await.expect("Should extract receiver 3");
+    let executor3 = WorkflowCommandExecutor::default();
+    let transport_ref3: Arc<dyn raftoral::raft::generic::transport::TransportInteraction<Message<WorkflowCommand>>> = transport.clone();
+    let cluster3 = Arc::new(RaftCluster::new(3, receiver3, transport_ref3, executor3).await.expect("Should create cluster 3"));
+
+    // Create runtimes
+    let runtime1 = WorkflowRuntime::new(cluster1);
+    let runtime2 = WorkflowRuntime::new(cluster2);
+    let runtime3 = WorkflowRuntime::new(cluster3);
 
     // Register workflow that creates multiple checkpoints with delays
     // This workflow takes ~5 seconds to complete (10 iterations * 500ms)
@@ -306,11 +365,14 @@ async fn test_snapshot_based_catch_up() {
     println!("=== Now adding node 4 with snapshot ===");
 
     // Create a new transport with 4 nodes to simulate adding a node
-    let transport4 = Arc::new(InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3, 4]));
-    transport4.start().await.expect("Transport should start");
+    let transport4 = Arc::new(InMemoryClusterTransport::<Message<WorkflowCommand>>::new(vec![1, 2, 3, 4]));
 
     // Create node 4
-    let runtime4 = WorkflowRuntime::new(transport4.create_cluster(4).await.expect("Should create cluster 4"));
+    let receiver4 = transport4.extract_receiver(4).await.expect("Should extract receiver 4");
+    let executor4 = WorkflowCommandExecutor::default();
+    let transport_ref4: Arc<dyn raftoral::raft::generic::transport::TransportInteraction<Message<WorkflowCommand>>> = transport4.clone();
+    let cluster4 = Arc::new(RaftCluster::new(4, receiver4, transport_ref4, executor4).await.expect("Should create cluster 4"));
+    let runtime4 = WorkflowRuntime::new(cluster4);
 
     // Register workflow on node 4
     runtime4.register_workflow_closure("computation", 1, computation_fn.clone())
@@ -384,14 +446,31 @@ async fn test_automatic_snapshot_on_node_join() {
     println!("  5. Add 4th node via ConfChange (receives snapshot automatically)");
     println!("  6. Verify 4th node has correct workflow state from snapshot\n");
 
+    use raftoral::workflow::WorkflowCommand;
+    use raftoral::raft::RaftCluster;
+
     // Create a 4-node transport with all channels pre-created
-    let transport = Arc::new(InMemoryClusterTransport::<WorkflowCommandExecutor>::new(vec![1, 2, 3, 4]));
-    transport.start().await.expect("Transport should start");
+    let transport = Arc::new(InMemoryClusterTransport::<Message<WorkflowCommand>>::new(vec![1, 2, 3, 4]));
 
     // Create clusters and runtimes for first 3 nodes
-    let runtime1 = WorkflowRuntime::new(transport.create_cluster(1).await.expect("Should create cluster 1"));
-    let runtime2 = WorkflowRuntime::new(transport.create_cluster(2).await.expect("Should create cluster 2"));
-    let runtime3 = WorkflowRuntime::new(transport.create_cluster(3).await.expect("Should create cluster 3"));
+    let receiver1 = transport.extract_receiver(1).await.expect("Should extract receiver 1");
+    let executor1 = WorkflowCommandExecutor::default();
+    let transport_ref1: Arc<dyn raftoral::raft::generic::transport::TransportInteraction<Message<WorkflowCommand>>> = transport.clone();
+    let cluster1 = Arc::new(RaftCluster::new(1, receiver1, transport_ref1, executor1).await.expect("Should create cluster 1"));
+
+    let receiver2 = transport.extract_receiver(2).await.expect("Should extract receiver 2");
+    let executor2 = WorkflowCommandExecutor::default();
+    let transport_ref2: Arc<dyn raftoral::raft::generic::transport::TransportInteraction<Message<WorkflowCommand>>> = transport.clone();
+    let cluster2 = Arc::new(RaftCluster::new(2, receiver2, transport_ref2, executor2).await.expect("Should create cluster 2"));
+
+    let receiver3 = transport.extract_receiver(3).await.expect("Should extract receiver 3");
+    let executor3 = WorkflowCommandExecutor::default();
+    let transport_ref3: Arc<dyn raftoral::raft::generic::transport::TransportInteraction<Message<WorkflowCommand>>> = transport.clone();
+    let cluster3 = Arc::new(RaftCluster::new(3, receiver3, transport_ref3, executor3).await.expect("Should create cluster 3"));
+
+    let runtime1 = WorkflowRuntime::new(cluster1);
+    let runtime2 = WorkflowRuntime::new(cluster2);
+    let runtime3 = WorkflowRuntime::new(cluster3);
 
     // Register workflow that creates many checkpoints to trigger snapshot
     // Each iteration creates a checkpoint, and we'll do enough to exceed snapshot threshold
@@ -470,7 +549,11 @@ async fn test_automatic_snapshot_on_node_join() {
 
     // Now create node 4 from the same transport
     println!("\n=== Creating 4th node ===");
-    let runtime4 = WorkflowRuntime::new(transport.create_cluster(4).await.expect("Should create cluster 4"));
+    let receiver4 = transport.extract_receiver(4).await.expect("Should extract receiver 4");
+    let executor4 = WorkflowCommandExecutor::default();
+    let transport_ref4: Arc<dyn raftoral::raft::generic::transport::TransportInteraction<Message<WorkflowCommand>>> = transport.clone();
+    let cluster4 = Arc::new(RaftCluster::new(4, receiver4, transport_ref4, executor4).await.expect("Should create cluster 4"));
+    let runtime4 = WorkflowRuntime::new(cluster4);
 
     // Register workflow on node 4
     runtime4.register_workflow_closure("computation", 1, computation_fn.clone())
