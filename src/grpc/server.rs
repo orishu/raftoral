@@ -197,21 +197,22 @@ impl GrpcServerHandle {
 pub async fn start_grpc_server_with_router(
     address: String,
     node_manager: Arc<crate::nodemanager::NodeManager>,
-    cluster_router: Arc<crate::grpc::ClusterRouter>,
     node_id: u64,
 ) -> Result<GrpcServerHandle, Box<dyn std::error::Error>> {
-    start_grpc_server_with_router_and_config(address, node_manager, cluster_router, node_id, None).await
+    start_grpc_server_with_router_and_config(address, node_manager, node_id, None).await
 }
 
 /// Start a gRPC server with multi-cluster routing and custom server configuration (Phase 2)
 pub async fn start_grpc_server_with_router_and_config(
     address: String,
     node_manager: Arc<crate::nodemanager::NodeManager>,
-    cluster_router: Arc<crate::grpc::ClusterRouter>,
     node_id: u64,
     server_config: Option<ServerConfigurator>,
 ) -> Result<GrpcServerHandle, Box<dyn std::error::Error>> {
     let addr = address.parse()?;
+
+    // Get ClusterRouter from NodeManager
+    let cluster_router = node_manager.cluster_router();
 
     // Create dummy transport for the service (not used with router)
     // Phase 3: Transport is now type-parameter-free!

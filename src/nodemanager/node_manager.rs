@@ -8,7 +8,7 @@ use crate::workflow::{WorkflowCommand, WorkflowCommandExecutor, WorkflowRuntime}
 use super::{ManagementCommand, ManagementCommandExecutor};
 
 /// NodeManager owns both the management cluster and workflow execution cluster(s)
-/// In future milestones, this will manage multiple execution clusters
+/// In future milestones, the workflow cluster will become a HashMap for multiple execution clusters
 pub struct NodeManager {
     /// Management cluster - tracks execution cluster membership and workflow lifecycle
     management_cluster: Arc<RaftCluster<ManagementCommandExecutor>>,
@@ -18,30 +18,12 @@ pub struct NodeManager {
 
     /// Workflow runtime (public API for starting workflows)
     workflow_runtime: Arc<WorkflowRuntime>,
+
+    /// ClusterRouter for routing incoming gRPC messages to appropriate clusters
+    cluster_router: Arc<crate::grpc::ClusterRouter>,
 }
 
 impl NodeManager {
-    /// Create a ClusterRouter and register both management and workflow clusters
-    ///
-    /// This enables Phase 2 multi-cluster routing where:
-    /// - cluster_id = 0 routes to management cluster
-    /// - cluster_id = 1 (default) routes to workflow execution cluster
-    ///
-    /// Returns the configured ClusterRouter ready for use with the gRPC server.
-    pub fn create_cluster_router(&self) -> Result<Arc<crate::grpc::ClusterRouter>, Box<dyn std::error::Error>> {
-        use crate::grpc::ClusterRouter;
-
-        let mut router = ClusterRouter::new();
-
-        // Register management cluster (cluster_id = 0)
-        router.register_management_cluster(self.management_cluster.local_sender.clone());
-
-        // Register workflow execution cluster (cluster_id = 1 by default)
-        router.register_execution_cluster(1, self.workflow_cluster.local_sender.clone())?;
-
-        Ok(Arc::new(router))
-    }
-
     /// Create a new NodeManager by creating both clusters from a shared transport
     ///
     /// Phase 3: Transport is now type-parameter-free!
@@ -78,11 +60,27 @@ impl NodeManager {
         let management_transport_ref: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<ManagementCommand>>> = management_transport.clone();
         let management_cluster = Arc::new(RaftCluster::new(node_id, management_transport_ref, management_executor).await?);
 
+        // Create ClusterRouter and register both clusters
+        // This enables multi-cluster routing where:
+        // - cluster_id = 0 routes to management cluster
+        // - cluster_id = 1 (default) routes to workflow execution cluster
+        use crate::raft::generic::ClusterRouter;
+        let mut router = ClusterRouter::new();
+        router.register_management_cluster(management_cluster.local_sender.clone());
+        router.register_execution_cluster(1, workflow_cluster.local_sender.clone())?;
+        let cluster_router = Arc::new(router);
+
         Ok(Self {
             management_cluster,
             workflow_cluster,
             workflow_runtime,
+            cluster_router,
         })
+    }
+
+    /// Get the cluster router for message routing
+    pub fn cluster_router(&self) -> Arc<crate::raft::generic::ClusterRouter> {
+        self.cluster_router.clone()
     }
 
     /// Get the workflow runtime for public API access
@@ -90,18 +88,24 @@ impl NodeManager {
         self.workflow_runtime.clone()
     }
 
-    /// Add a node to the workflow cluster
-    /// TODO: In future milestones, this will route to the appropriate execution cluster
+    /// Add a node to both management and workflow clusters
     pub async fn add_node(&self, node_id: u64, address: String) -> Result<(), String> {
+        // Add to both clusters
+        self.management_cluster.add_node(node_id, address.clone()).await
+            .map_err(|e| format!("Failed to add node to management cluster: {}", e))?;
         self.workflow_cluster.add_node(node_id, address).await
-            .map_err(|e| e.to_string())
+            .map_err(|e| format!("Failed to add node to workflow cluster: {}", e))?;
+        Ok(())
     }
 
-    /// Remove a node from the workflow cluster
-    /// TODO: In future milestones, this will handle removal from all execution clusters
+    /// Remove a node from both management and workflow clusters
     pub async fn remove_node(&self, node_id: u64) -> Result<(), String> {
+        // Remove from both clusters
+        self.management_cluster.remove_node(node_id).await
+            .map_err(|e| format!("Failed to remove node from management cluster: {}", e))?;
         self.workflow_cluster.remove_node(node_id).await
-            .map_err(|e| e.to_string())
+            .map_err(|e| format!("Failed to remove node from workflow cluster: {}", e))?;
+        Ok(())
     }
 
     /// Get cluster size (workflow cluster for now)

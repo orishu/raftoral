@@ -5,7 +5,7 @@
 //! of bootstrapping, peer discovery, and graceful shutdown.
 
 use crate::grpc::{
-    bootstrap, discover_peers, start_grpc_server, start_grpc_server_with_config,
+    bootstrap, discover_peers,
     GrpcServerHandle, ServerConfigurator,
 };
 use crate::grpc::client::ChannelBuilder;
@@ -233,23 +233,20 @@ impl RaftoralGrpcRuntime {
         info!("Transport started");
 
         // Create NodeManager (creates both management and workflow clusters internally)
+        // ClusterRouter is created and configured inside NodeManager
         let node_manager = Arc::new(crate::nodemanager::NodeManager::new(
             transport.clone(),
             node_id,
         ).await?);
         info!("NodeManager ready with management and workflow clusters");
-
-        // Create ClusterRouter for multi-cluster message routing
-        let cluster_router = node_manager.create_cluster_router()?;
         info!("ClusterRouter configured for management (cluster_id=0) and workflow (cluster_id=1) clusters");
 
-        // Start gRPC server with ClusterRouter and optional custom configuration
+        // Start gRPC server - gets ClusterRouter from NodeManager internally
         // Server must be started BEFORE add_node so it can receive Raft messages
         let server_handle = if let Some(server_config) = config.server_configurator {
             crate::grpc::start_grpc_server_with_router_and_config(
                 config.listen_address.clone(),
                 node_manager.clone(),
-                cluster_router,
                 node_id,
                 Some(server_config),
             )
@@ -258,7 +255,6 @@ impl RaftoralGrpcRuntime {
             crate::grpc::start_grpc_server_with_router(
                 config.listen_address.clone(),
                 node_manager.clone(),
-                cluster_router,
                 node_id,
             )
             .await?
