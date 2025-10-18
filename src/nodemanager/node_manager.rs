@@ -50,8 +50,9 @@ impl NodeManager {
         let management_transport_ref: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<ManagementCommand>>> = transport.clone();
         let management_cluster = Arc::new(RaftCluster::new(node_id, 0, management_transport_ref, management_executor).await?);
 
-        // Set workflow cluster reference in management executor for dynamic cluster construction
+        // Set cluster references in management executor for dynamic cluster construction
         management_cluster.executor.set_workflow_cluster(workflow_cluster.clone());
+        management_cluster.executor.set_management_cluster(management_cluster.clone());
 
         // Create ClusterRouter and register both clusters
         // This enables multi-cluster routing where:

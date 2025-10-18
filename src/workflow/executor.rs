@@ -394,7 +394,7 @@ impl CommandExecutor for WorkflowCommandExecutor {
     }
 
     /// Handle node removal - reassign workflows if this node is the leader
-    fn on_node_removed(&self, removed_node_id: u64, logger: &slog::Logger) {
+    fn on_node_removed(&self, removed_node_id: u64, _is_leader: bool, logger: &slog::Logger) {
         slog::info!(logger, "Node removed from cluster";
                    "removed_node_id" => removed_node_id);
 

@@ -427,14 +427,16 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                             }
 
                             // Notify the executor so it can handle dynamic cluster construction
-                            self.executor.on_node_added(node_id, &meta.address, &self.logger);
+                            let is_leader = self.is_leader();
+                            self.executor.on_node_added(node_id, &meta.address, is_leader, &self.logger);
                         }
                     }
                 },
                 ConfChangeType::RemoveNode => {
                     slog::info!(self.logger, "Removing node from cluster (v2)"; "node_id" => node_id);
                     // Notify the executor so it can handle ownership reassignment
-                    self.executor.on_node_removed(node_id, &self.logger);
+                    let is_leader = self.is_leader();
+                    self.executor.on_node_removed(node_id, is_leader, &self.logger);
 
                     // Update transport to remove peer
                     match self.transport.remove_peer(node_id) {
