@@ -193,17 +193,17 @@ impl GrpcServerHandle {
     }
 }
 
-/// Start a gRPC server with multi-cluster routing support (Phase 2)
-pub async fn start_grpc_server_with_router(
+/// Start a gRPC server with multi-cluster routing support
+pub async fn start_grpc_server(
     address: String,
     node_manager: Arc<crate::nodemanager::NodeManager>,
     node_id: u64,
 ) -> Result<GrpcServerHandle, Box<dyn std::error::Error>> {
-    start_grpc_server_with_router_and_config(address, node_manager, node_id, None).await
+    start_grpc_server_with_config(address, node_manager, node_id, None).await
 }
 
-/// Start a gRPC server with multi-cluster routing and custom server configuration (Phase 2)
-pub async fn start_grpc_server_with_router_and_config(
+/// Start a gRPC server with multi-cluster routing and custom server configuration
+pub async fn start_grpc_server_with_config(
     address: String,
     node_manager: Arc<crate::nodemanager::NodeManager>,
     node_id: u64,
@@ -230,61 +230,6 @@ pub async fn start_grpc_server_with_router_and_config(
         address,
         cluster_router
     );
-    let runtime = node_manager.workflow_runtime();
-    let workflow_service = WorkflowManagementImpl::new(runtime);
-
-    // Create reflection service
-    let reflection_service = ReflectionBuilder::configure()
-        .register_encoded_file_descriptor_set(raft_proto::FILE_DESCRIPTOR_SET)
-        .build_v1()?;
-
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-
-    tokio::spawn(async move {
-        let mut server = Server::builder();
-
-        // Apply custom configuration if provided
-        if let Some(config_fn) = server_config {
-            server = config_fn(server);
-        }
-
-        server
-            .add_service(RaftServiceServer::new(raft_service))
-            .add_service(WorkflowManagementServer::new(workflow_service))
-            .add_service(reflection_service)
-            .serve_with_shutdown(addr, async {
-                shutdown_rx.await.ok();
-            })
-            .await
-            .expect("gRPC server failed");
-    });
-
-    Ok(GrpcServerHandle { shutdown_tx })
-}
-
-/// Start a gRPC server for a Raft node with graceful shutdown
-/// Phase 3: Transport is now type-parameter-free!
-pub async fn start_grpc_server(
-    address: String,
-    transport: Arc<GrpcClusterTransport>,
-    node_manager: Arc<crate::nodemanager::NodeManager>,
-    node_id: u64,
-) -> Result<GrpcServerHandle, Box<dyn std::error::Error>> {
-    start_grpc_server_with_config(address, transport, node_manager, node_id, None).await
-}
-
-/// Start a gRPC server with custom server configuration
-/// Phase 3: Transport is now type-parameter-free!
-pub async fn start_grpc_server_with_config(
-    address: String,
-    transport: Arc<GrpcClusterTransport>,
-    node_manager: Arc<crate::nodemanager::NodeManager>,
-    node_id: u64,
-    server_config: Option<ServerConfigurator>,
-) -> Result<GrpcServerHandle, Box<dyn std::error::Error>> {
-    let addr = address.parse()?;
-    let cluster = node_manager.workflow_cluster.clone();
-    let raft_service = RaftServiceImpl::new(transport, cluster, node_id, address);
     let runtime = node_manager.workflow_runtime();
     let workflow_service = WorkflowManagementImpl::new(runtime);
 

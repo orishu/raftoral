@@ -39,7 +39,6 @@ async fn test_three_node_grpc_cluster_bootstrap() {
 
     let server1 = start_grpc_server(
         addr1.clone(),
-        transport1.clone(),
         node_manager1.clone(),
         1,
     ).await.expect("Should start server 1");
@@ -86,7 +85,6 @@ async fn test_three_node_grpc_cluster_bootstrap() {
 
     let server2 = start_grpc_server(
         addr2.clone(),
-        transport2.clone(),
         node_manager2.clone(),
         2,
     ).await.expect("Should start server 2");
@@ -144,7 +142,6 @@ async fn test_three_node_grpc_cluster_bootstrap() {
 
     let server3 = start_grpc_server(
         addr3.clone(),
-        transport3.clone(),
         node_manager3.clone(),
         3,
     ).await.expect("Should start server 3");

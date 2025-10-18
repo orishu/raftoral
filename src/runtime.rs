@@ -244,7 +244,7 @@ impl RaftoralGrpcRuntime {
         // Start gRPC server - gets ClusterRouter from NodeManager internally
         // Server must be started BEFORE add_node so it can receive Raft messages
         let server_handle = if let Some(server_config) = config.server_configurator {
-            crate::grpc::start_grpc_server_with_router_and_config(
+            crate::grpc::start_grpc_server_with_config(
                 config.listen_address.clone(),
                 node_manager.clone(),
                 node_id,
@@ -252,7 +252,7 @@ impl RaftoralGrpcRuntime {
             )
             .await?
         } else {
-            crate::grpc::start_grpc_server_with_router(
+            crate::grpc::start_grpc_server(
                 config.listen_address.clone(),
                 node_manager.clone(),
                 node_id,

@@ -104,7 +104,6 @@ async fn test_discovery_rpc() {
     // Start gRPC server
     let _server = start_grpc_server(
         address.clone(),
-        transport.clone(),
         node_manager,
         1,
     ).await.expect("Should start server");

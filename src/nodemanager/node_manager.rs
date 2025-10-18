@@ -44,20 +44,10 @@ impl NodeManager {
         // Set the runtime reference in the executor so it can spawn workflows
         workflow_cluster.executor.set_runtime(workflow_runtime.clone());
 
-        // TODO: Create management cluster once we implement unified transport with routing
-        // For now, create a placeholder that won't be used
-        // Phase 3: Transport is now type-parameter-free!
-        let management_nodes = vec![crate::raft::generic::grpc_transport::NodeConfig {
-            node_id,
-            address: "127.0.0.1:0".to_string(),
-        }];
-        let management_transport = Arc::new(GrpcClusterTransport::new(management_nodes));
-        management_transport.start().await?;
-
-        // Create management cluster (cluster_id = 0)
-        // RaftCluster::new creates its own mailbox internally
+        // Create management cluster (cluster_id = 0) using the same transport
+        // Phase 3: Transport is now type-parameter-free and can be shared!
         let management_executor = ManagementCommandExecutor::default();
-        let management_transport_ref: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<ManagementCommand>>> = management_transport.clone();
+        let management_transport_ref: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<ManagementCommand>>> = transport.clone();
         let management_cluster = Arc::new(RaftCluster::new(node_id, 0, management_transport_ref, management_executor).await?);
 
         // Create ClusterRouter and register both clusters
