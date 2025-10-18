@@ -425,6 +425,9 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                                                 "node_id" => node_id, "address" => &meta.address, "error" => %e);
                                 }
                             }
+
+                            // Notify the executor so it can handle dynamic cluster construction
+                            self.executor.on_node_added(node_id, &meta.address, &self.logger);
                         }
                     }
                 },

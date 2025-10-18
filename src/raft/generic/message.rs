@@ -22,6 +22,13 @@ pub trait CommandExecutor: Send + Sync + 'static {
         // WorkflowCommandExecutor overrides this
     }
 
+    /// Notify when a node is added to the cluster
+    /// This allows the executor to react to cluster membership changes
+    fn on_node_added(&self, _added_node_id: u64, _address: &str, _logger: &slog::Logger) {
+        // Default implementation does nothing
+        // ManagementCommandExecutor overrides this for dynamic execution cluster construction
+    }
+
     /// Notify when a node is removed from the cluster
     /// This allows the executor to react to node failures (e.g., reassign workflows)
     fn on_node_removed(&self, _removed_node_id: u64, _logger: &slog::Logger) {
