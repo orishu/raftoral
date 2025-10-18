@@ -17,7 +17,7 @@ use raft_proto::{
     workflow_management_server::{WorkflowManagement, WorkflowManagementServer},
     GenericMessage, MessageResponse,
     DiscoveryRequest, DiscoveryResponse, RaftRole as ProtoRaftRole,
-    RunWorkflowRequest, RunWorkflowResponse,
+    RunWorkflowRequest, RunWorkflowResponse, RunWorkflowAsyncResponse,
 };
 
 use crate::raft::generic::message::CommandExecutor;
@@ -121,11 +121,16 @@ impl<E: CommandExecutor + Default + 'static> RaftService for RaftServiceImpl<E> 
 /// gRPC service implementation for Workflow Management
 pub struct WorkflowManagementImpl {
     runtime: Arc<crate::workflow::WorkflowRuntime>,
+    node_manager: Option<Arc<crate::nodemanager::NodeManager>>,
 }
 
 impl WorkflowManagementImpl {
     pub fn new(runtime: Arc<crate::workflow::WorkflowRuntime>) -> Self {
-        Self { runtime }
+        Self { runtime, node_manager: None }
+    }
+
+    pub fn with_node_manager(runtime: Arc<crate::workflow::WorkflowRuntime>, node_manager: Arc<crate::nodemanager::NodeManager>) -> Self {
+        Self { runtime, node_manager: Some(node_manager) }
     }
 }
 
@@ -175,6 +180,50 @@ impl WorkflowManagement for WorkflowManagementImpl {
                 }))
             }
         }
+    }
+
+    async fn run_workflow_async(
+        &self,
+        request: Request<RunWorkflowRequest>,
+    ) -> Result<Response<RunWorkflowAsyncResponse>, Status> {
+        let req = request.into_inner();
+
+        // We need the node_manager to propose to the management cluster
+        let node_manager = self.node_manager.as_ref()
+            .ok_or_else(|| Status::failed_precondition("NodeManager not configured for async workflows"))?;
+
+        // Generate a new workflow ID
+        use uuid::Uuid;
+        let workflow_id = Uuid::new_v4();
+
+        // Choose an execution cluster (for now, we only have one: cluster_id=1)
+        let cluster_id = Uuid::from_u128(1); // DEFAULT_EXECUTION_CLUSTER_ID
+
+        // Create the ScheduleWorkflowStart command
+        use crate::nodemanager::*;
+        let schedule_command = ManagementCommand::ScheduleWorkflowStart(ScheduleWorkflowData {
+            workflow_id,
+            cluster_id,
+            workflow_type: req.workflow_type,
+            version: req.version,
+            input_json: req.input_json,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        });
+
+        // Propose the ScheduleWorkflowStart command to the management cluster
+        // This will be applied by all management nodes, but only the leader of the
+        // execution cluster will actually propose the WorkflowStart command
+        node_manager.propose_management_command(schedule_command).await
+            .map_err(|e| Status::internal(format!("Failed to schedule workflow: {}", e)))?;
+
+        Ok(Response::new(RunWorkflowAsyncResponse {
+            success: true,
+            workflow_id: workflow_id.to_string(),
+            error: String::new(),
+        }))
     }
 }
 
@@ -231,7 +280,7 @@ pub async fn start_grpc_server_with_config(
         cluster_router
     );
     let runtime = node_manager.workflow_runtime();
-    let workflow_service = WorkflowManagementImpl::new(runtime);
+    let workflow_service = WorkflowManagementImpl::with_node_manager(runtime, node_manager.clone());
 
     // Create reflection service
     let reflection_service = ReflectionBuilder::configure()

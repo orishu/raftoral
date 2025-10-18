@@ -7,7 +7,7 @@ mod node_manager;
 pub use management_command::{
     ManagementCommand, ExecutionClusterId,
     CreateExecutionClusterData, AssociateNodeData, DisassociateNodeData,
-    WorkflowLifecycleData, ChangeNodeRoleData,
+    ScheduleWorkflowData, WorkflowLifecycleData, ChangeNodeRoleData,
 };
 pub use management_executor::{ManagementCommandExecutor, ManagementState, ExecutionClusterInfo};
 pub use node_manager::NodeManager;

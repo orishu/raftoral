@@ -251,8 +251,93 @@ impl CommandExecutor for ManagementCommandExecutor {
                 }
             }
 
+            ManagementCommand::ScheduleWorkflowStart(data) => {
+                slog::info!(self.logger, "Scheduling workflow start";
+                    "workflow_id" => %data.workflow_id,
+                    "cluster_id" => %data.cluster_id,
+                    "workflow_type" => &data.workflow_type,
+                    "version" => data.version
+                );
+
+                // Add workflow to cluster's active set
+                if let Some(cluster_info) = state.execution_clusters.get_mut(&data.cluster_id) {
+                    cluster_info.active_workflows.insert(data.workflow_id);
+                } else {
+                    slog::warn!(self.logger, "Workflow scheduled on unknown cluster";
+                        "cluster_id" => %data.cluster_id,
+                        "workflow_id" => %data.workflow_id
+                    );
+                }
+
+                // Track workflow location
+                state.workflow_locations.insert(data.workflow_id, data.cluster_id);
+
+                // Drop the state lock before async operations
+                drop(state);
+
+                // Option 1: Only nodes that are leaders of the execution cluster propose WorkflowStart
+                // LIMITATION: If the leader just went offline, no node will start the workflow
+                // TODO: Consider implementing Option 2 (all execution cluster members propose)
+                //       with duplicate detection in WorkflowCommandExecutor
+
+                // Check if this node is part of the target execution cluster
+                let workflow_cluster = self.workflow_cluster.lock().unwrap().clone();
+                if let Some(cluster) = workflow_cluster {
+                    // Only proceed if we're the leader of the execution cluster
+                    // This uses cluster_id matching - we assume workflow_cluster is cluster_id=1
+                    // In the future with multiple execution clusters, we'll need to look up the right cluster
+                    if data.cluster_id == Uuid::from_u128(DEFAULT_EXECUTION_CLUSTER_ID) {
+                        let logger_clone = self.logger.clone();
+                        let workflow_id_clone = data.workflow_id;
+                        let workflow_type_clone = data.workflow_type.clone();
+                        let version = data.version;
+                        let input_json = data.input_json.clone();
+
+                        tokio::spawn(async move {
+                            // Check if we're the leader before proposing
+                            if !cluster.is_leader().await {
+                                slog::debug!(logger_clone, "Not leader of execution cluster, skipping WorkflowStart proposal";
+                                    "workflow_id" => %workflow_id_clone);
+                                return;
+                            }
+
+                            slog::info!(logger_clone, "Proposing WorkflowStart to execution cluster";
+                                "workflow_id" => %workflow_id_clone,
+                                "workflow_type" => &workflow_type_clone);
+
+                            // Propose WorkflowStart command to the execution cluster
+                            use crate::workflow::commands::*;
+
+                            // Deserialize input from JSON
+                            let input_bytes: Vec<u8> = input_json.into_bytes();
+
+                            let workflow_command = WorkflowCommand::WorkflowStart(WorkflowStartData {
+                                workflow_id: workflow_id_clone.to_string(),
+                                workflow_type: workflow_type_clone.clone(),
+                                version,
+                                input: input_bytes,
+                                owner_node_id: cluster.node_id(),  // This node becomes the owner
+                            });
+
+                            match cluster.propose_and_sync(workflow_command).await {
+                                Ok(_) => {
+                                    slog::info!(logger_clone, "Successfully proposed WorkflowStart";
+                                        "workflow_id" => %workflow_id_clone);
+                                },
+                                Err(e) => {
+                                    slog::error!(logger_clone, "Failed to propose WorkflowStart";
+                                        "workflow_id" => %workflow_id_clone,
+                                        "error" => %e);
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+
             ManagementCommand::ReportWorkflowStarted(data) => {
-                slog::info!(self.logger, "Workflow started";
+                // Keep this for backward compatibility with tests
+                slog::info!(self.logger, "Workflow started (legacy)";
                     "workflow_id" => %data.workflow_id,
                     "cluster_id" => %data.cluster_id,
                     "workflow_type" => &data.workflow_type,

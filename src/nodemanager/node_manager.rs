@@ -102,4 +102,11 @@ impl NodeManager {
     pub fn cluster_size(&self) -> usize {
         self.workflow_cluster.node_count()
     }
+
+    /// Propose a management command to the management cluster
+    /// Used for scheduling workflows, creating clusters, etc.
+    pub async fn propose_management_command(&self, command: super::ManagementCommand) -> Result<(), String> {
+        self.management_cluster.propose_and_sync(command).await
+            .map_err(|e| format!("Failed to propose management command: {}", e))
+    }
 }

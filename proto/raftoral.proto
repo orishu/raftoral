@@ -78,6 +78,9 @@ message DiscoveryResponse {
 
 // Workflow Management Service
 service WorkflowManagement {
+    // Asynchronously start a workflow and return immediately with workflow ID
+    rpc RunWorkflowAsync(RunWorkflowRequest) returns (RunWorkflowAsyncResponse);
+
     // Synchronously run a workflow and wait for result
     rpc RunWorkflowSync(RunWorkflowRequest) returns (RunWorkflowResponse);
 }
@@ -86,6 +89,12 @@ message RunWorkflowRequest {
     string workflow_type = 1;
     uint32 version = 2;
     string input_json = 3;  // JSON-serialized input
+}
+
+message RunWorkflowAsyncResponse {
+    bool success = 1;
+    string workflow_id = 2;  // UUID of the started workflow
+    string error = 3;        // Error message if success=false
 }
 
 message RunWorkflowResponse {
