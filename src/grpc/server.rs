@@ -27,6 +27,7 @@ use crate::raft::generic::cluster::RaftCluster;
 /// Now uses ClusterRouter for multi-cluster support
 /// Phase 3: Transport is now type-parameter-free!
 pub struct RaftServiceImpl<E: CommandExecutor> {
+    #[allow(dead_code)]
     transport: Arc<GrpcClusterTransport>,
     cluster: Arc<RaftCluster<E>>,
     node_id: u64,

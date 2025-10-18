@@ -1,5 +1,5 @@
 use clap::Parser;
-use log::{info, error};
+use log::info;
 use raftoral::runtime::{RaftoralConfig, RaftoralGrpcRuntime};
 use raftoral::workflow::{WorkflowContext, WorkflowError};
 use tokio::signal;
@@ -78,32 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Registered ping_pong workflow (v1)");
 
     info!("Press Ctrl+C to shutdown gracefully");
-
-    // Example: Execute ping/pong workflow to test the system
-    // Note: This works from any node - start_workflow automatically routes to the leader
-    info!("Testing ping/pong workflow...");
-
-    match runtime
-        .workflow_runtime()
-        .start_workflow::<String, String>("ping_pong", 1, "ping".to_string())
-        .await
-    {
-        Ok(workflow_run) => {
-            info!("Started ping/pong workflow: {}", workflow_run.workflow_id());
-
-            match workflow_run.wait_for_completion().await {
-                Ok(output) => {
-                    info!("Workflow completed: got '{}'", output);
-                }
-                Err(e) => {
-                    error!("Workflow failed: {}", e);
-                }
-            }
-        }
-        Err(e) => {
-            error!("Failed to start workflow: {}", e);
-        }
-    }
+    info!("Use gRPC calls to run workflows (see scripts/run_ping_pong.sh)");
 
     // Wait for shutdown signal
     signal::ctrl_c().await?;

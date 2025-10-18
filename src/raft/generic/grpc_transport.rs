@@ -24,6 +24,7 @@ struct Destination
     grpc_client: Option<Arc<tokio::sync::Mutex<RaftClient>>>,
 
     /// Forwarder task handle (None for local node)
+    #[allow(dead_code)]
     forwarder_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
