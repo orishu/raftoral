@@ -85,6 +85,11 @@ impl NodeManager {
         self.workflow_runtime.clone()
     }
 
+    /// Get the management cluster executor for querying workflow state
+    pub fn management_executor(&self) -> &ManagementCommandExecutor {
+        &self.management_cluster.executor
+    }
+
     /// Add a node to the management cluster
     /// The workflow cluster will be updated automatically via the management executor's
     /// on_node_added callback when the ConfChange is applied

@@ -147,6 +147,24 @@ impl ManagementCommandExecutor {
             .map(|cluster| cluster.cluster_id)
     }
 
+    /// Get completed workflow result from TTL cache
+    /// Returns None if workflow not found or still running
+    pub fn get_completed_workflow_result(&self, workflow_id: &Uuid) -> Option<String> {
+        self.state.lock().unwrap()
+            .completed_workflows
+            .lock()
+            .unwrap()
+            .get(workflow_id)
+            .cloned()
+    }
+
+    /// Check if workflow is still active (not yet completed)
+    pub fn is_workflow_active(&self, workflow_id: &Uuid) -> bool {
+        self.state.lock().unwrap()
+            .workflow_locations
+            .contains_key(workflow_id)
+    }
+
     /// Find an execution cluster that includes the given node
     pub fn find_cluster_with_node(&self, node_id: u64) -> Option<Uuid> {
         let state = self.state.lock().unwrap();

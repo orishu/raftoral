@@ -17,7 +17,7 @@ use raft_proto::{
     workflow_management_server::{WorkflowManagement, WorkflowManagementServer},
     GenericMessage, MessageResponse,
     DiscoveryRequest, DiscoveryResponse, RaftRole as ProtoRaftRole,
-    RunWorkflowRequest, RunWorkflowResponse, RunWorkflowAsyncResponse,
+    RunWorkflowRequest, RunWorkflowResponse, RunWorkflowAsyncResponse, WaitForWorkflowRequest,
 };
 
 use crate::raft::generic::message::CommandExecutor;
@@ -223,6 +223,62 @@ impl WorkflowManagement for WorkflowManagementImpl {
             success: true,
             workflow_id: workflow_id.to_string(),
             error: String::new(),
+        }))
+    }
+
+    async fn wait_for_workflow_completion(
+        &self,
+        request: Request<WaitForWorkflowRequest>,
+    ) -> Result<Response<RunWorkflowResponse>, Status> {
+        let req = request.into_inner();
+
+        // We need the node_manager to access the management cluster
+        let node_manager = self.node_manager.as_ref()
+            .ok_or_else(|| Status::failed_precondition("NodeManager not configured"))?;
+
+        // Parse workflow ID
+        use uuid::Uuid;
+        let workflow_id = Uuid::parse_str(&req.workflow_id)
+            .map_err(|e| Status::invalid_argument(format!("Invalid workflow_id: {}", e)))?;
+
+        // Determine timeout (default 60 seconds if 0 or not specified)
+        let timeout_seconds = if req.timeout_seconds == 0 { 60 } else { req.timeout_seconds };
+        let poll_interval = std::time::Duration::from_millis(100); // Poll every 100ms
+        let max_polls = (timeout_seconds as u64 * 1000) / poll_interval.as_millis() as u64;
+
+        // Get management cluster executor for querying state
+        let management_executor = node_manager.management_executor();
+
+        // Poll for workflow completion
+        for _ in 0..max_polls {
+            // Check if workflow result is in cache
+            if let Some(result_json) = management_executor.get_completed_workflow_result(&workflow_id) {
+                return Ok(Response::new(RunWorkflowResponse {
+                    success: true,
+                    result_json,
+                    error: String::new(),
+                }));
+            }
+
+            // Check if workflow is still active
+            if !management_executor.is_workflow_active(&workflow_id) {
+                // Workflow completed but no result in cache (expired or error)
+                return Ok(Response::new(RunWorkflowResponse {
+                    success: false,
+                    result_json: String::new(),
+                    error: "Workflow completed but result not available (may have expired from cache)".to_string(),
+                }));
+            }
+
+            // Still running, sleep and retry
+            tokio::time::sleep(poll_interval).await;
+        }
+
+        // Timeout reached
+        Ok(Response::new(RunWorkflowResponse {
+            success: false,
+            result_json: String::new(),
+            error: format!("Timeout waiting for workflow completion ({}s)", timeout_seconds),
         }))
     }
 }

@@ -370,11 +370,12 @@ impl CommandExecutor for WorkflowCommandExecutor {
                         // Try to parse workflow_id as UUID for reporting
                         // If it fails, we can't report (management cluster uses UUIDs)
                         if let Ok(workflow_uuid) = uuid::Uuid::parse_str(&workflow_id_clone) {
-                            // Serialize the result as JSON string
-                            let result_json = match serde_json::to_string(&result_clone) {
+                            // Convert result bytes to JSON string
+                            // The result is already serialized as JSON bytes, so we just convert to UTF-8
+                            let result_json = match String::from_utf8(result_clone.clone()) {
                                 Ok(json) => Some(json),
                                 Err(e) => {
-                                    slog::warn!(logger_clone, "Failed to serialize workflow result";
+                                    slog::warn!(logger_clone, "Failed to convert workflow result to UTF-8";
                                                "workflow_id" => &workflow_id_clone,
                                                "error" => e.to_string());
                                     None

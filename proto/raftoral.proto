@@ -83,6 +83,9 @@ service WorkflowManagement {
 
     // Synchronously run a workflow and wait for result
     rpc RunWorkflowSync(RunWorkflowRequest) returns (RunWorkflowResponse);
+
+    // Wait for a workflow to complete and return its result
+    rpc WaitForWorkflowCompletion(WaitForWorkflowRequest) returns (RunWorkflowResponse);
 }
 
 message RunWorkflowRequest {
@@ -101,4 +104,9 @@ message RunWorkflowResponse {
     bool success = 1;
     string result_json = 2;  // JSON-serialized result if success=true
     string error = 3;        // Error message if success=false
+}
+
+message WaitForWorkflowRequest {
+    string workflow_id = 1;  // UUID of the workflow to wait for
+    uint32 timeout_seconds = 2;  // Optional timeout (0 = use default)
 }

@@ -29,15 +29,16 @@ if ! command -v grpcurl &> /dev/null; then
     exit 1
 fi
 
-echo "=== Running ping_pong workflow via gRPC ==="
+echo "=== Running ping_pong workflow via gRPC (Async + Wait) ==="
 echo ""
 echo "Node address: $NODE_ADDRESS"
 echo "Workflow: ping_pong (v1)"
 echo "Input: \"ping\""
 echo ""
 
-# Run the workflow using grpcurl with reflection (no proto file needed!)
-grpcurl \
+# Step 1: Start the workflow asynchronously
+echo "Step 1: Starting workflow asynchronously..."
+RESPONSE=$(grpcurl \
     -plaintext \
     -d '{
         "workflow_type": "ping_pong",
@@ -45,7 +46,32 @@ grpcurl \
         "input_json": "\"ping\""
     }' \
     "$NODE_ADDRESS" \
-    raftoral.WorkflowManagement/RunWorkflowSync
+    raftoral.WorkflowManagement/RunWorkflowAsync)
+
+echo "$RESPONSE"
+
+# Extract workflow_id from response (note: JSON uses camelCase workflowId)
+WORKFLOW_ID=$(echo "$RESPONSE" | grep -o '"workflowId": *"[^"]*"' | cut -d'"' -f4)
+
+if [ -z "$WORKFLOW_ID" ]; then
+    echo "Error: Failed to get workflow_id from response"
+    exit 1
+fi
+
+echo ""
+echo "Step 2: Waiting for workflow completion..."
+echo "Workflow ID: $WORKFLOW_ID"
+echo ""
+
+# Step 2: Wait for workflow completion
+grpcurl \
+    -plaintext \
+    -d "{
+        \"workflow_id\": \"$WORKFLOW_ID\",
+        \"timeout_seconds\": 30
+    }" \
+    "$NODE_ADDRESS" \
+    raftoral.WorkflowManagement/WaitForWorkflowCompletion
 
 echo ""
 echo "Done!"
