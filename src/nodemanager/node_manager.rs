@@ -54,6 +54,9 @@ impl NodeManager {
         management_cluster.executor.set_workflow_cluster(workflow_cluster.clone());
         management_cluster.executor.set_management_cluster(management_cluster.clone());
 
+        // Set management cluster reference in workflow executor for workflow completion reporting
+        workflow_cluster.executor.set_management_cluster(management_cluster.clone());
+
         // Create ClusterRouter and register both clusters
         // This enables multi-cluster routing where:
         // - cluster_id = 0 routes to management cluster

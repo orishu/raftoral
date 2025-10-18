@@ -56,6 +56,8 @@ pub struct WorkflowCommandExecutor {
     pub ownership_map: crate::workflow::ownership::WorkflowOwnershipMap,
     /// This node's ID for ownership checks
     pub node_id: Arc<Mutex<Option<u64>>>,
+    /// Reference to management cluster for reporting workflow completion
+    management_cluster: Mutex<Option<Arc<crate::raft::RaftCluster<crate::nodemanager::ManagementCommandExecutor>>>>,
     /// Logger for this executor
     logger: slog::Logger,
 }
@@ -72,6 +74,7 @@ impl Default for WorkflowCommandExecutor {
             runtime: Arc::new(Mutex::new(None)),
             ownership_map: crate::workflow::ownership::WorkflowOwnershipMap::new(),
             node_id: Arc::new(Mutex::new(None)),
+            management_cluster: Mutex::new(None),
             logger,
         }
     }
@@ -92,6 +95,7 @@ impl WorkflowCommandExecutor {
             runtime: Arc::new(Mutex::new(None)),
             ownership_map: crate::workflow::ownership::WorkflowOwnershipMap::new(),
             node_id: Arc::new(Mutex::new(None)),
+            management_cluster: Mutex::new(None),
             logger,
         }
     }
@@ -100,6 +104,11 @@ impl WorkflowCommandExecutor {
     pub fn set_runtime(&self, runtime: Arc<crate::workflow::runtime::WorkflowRuntime>) {
         let mut rt = self.runtime.lock().unwrap();
         *rt = Some(runtime);
+    }
+
+    /// Set the management cluster reference (called after construction)
+    pub fn set_management_cluster(&self, cluster: Arc<crate::raft::RaftCluster<crate::nodemanager::ManagementCommandExecutor>>) {
+        *self.management_cluster.lock().unwrap() = Some(cluster);
     }
 
     /// Set this node's ID for ownership checks
@@ -347,6 +356,58 @@ impl CommandExecutor for WorkflowCommandExecutor {
                     .retain(|key, _| !key.starts_with(&prefix));
 
                 self.emit_completed_event(&data.workflow_id, data.result.clone());
+
+                // Report workflow completion to management cluster
+                // All execution nodes report completion (management cluster will handle duplicates)
+                let management_cluster_opt = self.management_cluster.lock().unwrap().clone();
+                if let Some(management_cluster) = management_cluster_opt {
+                    let workflow_id_clone = data.workflow_id.clone();
+                    let result_clone = data.result.clone();
+                    let logger_clone = self.logger.clone();
+
+                    // Spawn async task to report to management cluster
+                    tokio::spawn(async move {
+                        // Try to parse workflow_id as UUID for reporting
+                        // If it fails, we can't report (management cluster uses UUIDs)
+                        if let Ok(workflow_uuid) = uuid::Uuid::parse_str(&workflow_id_clone) {
+                            // Serialize the result as JSON string
+                            let result_json = match serde_json::to_string(&result_clone) {
+                                Ok(json) => Some(json),
+                                Err(e) => {
+                                    slog::warn!(logger_clone, "Failed to serialize workflow result";
+                                               "workflow_id" => &workflow_id_clone,
+                                               "error" => e.to_string());
+                                    None
+                                }
+                            };
+
+                            // Create ReportWorkflowEnded command
+                            let report_command = crate::nodemanager::ManagementCommand::ReportWorkflowEnded(
+                                crate::nodemanager::WorkflowLifecycleData {
+                                    workflow_id: workflow_uuid,
+                                    cluster_id: uuid::Uuid::from_u128(1), // DEFAULT_EXECUTION_CLUSTER_ID
+                                    workflow_type: String::new(), // Not available here, but not needed for completion
+                                    version: 0, // Not available here, but not needed for completion
+                                    timestamp: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap()
+                                        .as_secs(),
+                                    result_json,
+                                }
+                            );
+
+                            // Propose to management cluster
+                            if let Err(e) = management_cluster.propose_and_sync(report_command).await {
+                                slog::warn!(logger_clone, "Failed to report workflow completion to management cluster";
+                                           "workflow_id" => &workflow_id_clone,
+                                           "error" => e.to_string());
+                            } else {
+                                slog::debug!(logger_clone, "Reported workflow completion to management cluster";
+                                            "workflow_id" => &workflow_id_clone);
+                            }
+                        }
+                    });
+                }
             },
             WorkflowCommand::SetCheckpoint(data) => {
                 slog::info!(self.logger, "Set checkpoint";

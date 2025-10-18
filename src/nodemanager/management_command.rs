@@ -70,6 +70,9 @@ pub struct WorkflowLifecycleData {
     pub workflow_type: String,
     pub version: u32,
     pub timestamp: u64,
+    /// JSON-serialized result (for ReportWorkflowEnded)
+    /// This is a Result<T, E> serialized as JSON
+    pub result_json: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

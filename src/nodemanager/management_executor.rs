@@ -2,8 +2,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use ttl_cache::TtlCache;
 
 use crate::raft::generic::message::CommandExecutor;
 use crate::raft::RaftCluster;
@@ -14,7 +16,8 @@ use super::management_command::{ManagementCommand, AssociateNodeData, Disassocia
 const DEFAULT_EXECUTION_CLUSTER_ID: u128 = 1;
 
 /// State maintained by the management cluster
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+/// Note: completed_workflows is not serialized (it's a TTL cache for runtime use only)
+#[derive(Clone)]
 pub struct ManagementState {
     /// All execution clusters
     pub execution_clusters: HashMap<Uuid, ExecutionClusterInfo>,
@@ -24,6 +27,35 @@ pub struct ManagementState {
 
     /// Workflow registry: workflow_id → cluster_id
     pub workflow_locations: HashMap<Uuid, Uuid>,
+
+    /// Completed workflow results (TTL cache, 10 minute default)
+    /// Maps workflow_id → JSON-serialized Result<T, E>
+    /// Not serialized for snapshots (runtime cache only)
+    pub completed_workflows: Arc<Mutex<TtlCache<Uuid, String>>>,
+}
+
+impl std::fmt::Debug for ManagementState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManagementState")
+            .field("execution_clusters", &self.execution_clusters)
+            .field("node_memberships", &self.node_memberships)
+            .field("workflow_locations", &self.workflow_locations)
+            .field("completed_workflows", &"<TTL Cache>")
+            .finish()
+    }
+}
+
+impl Default for ManagementState {
+    fn default() -> Self {
+        // Create TTL cache with 10 minute TTL and capacity of 10000 entries
+        let ttl_cache = TtlCache::new(10000);
+        Self {
+            execution_clusters: HashMap::new(),
+            node_memberships: HashMap::new(),
+            workflow_locations: HashMap::new(),
+            completed_workflows: Arc::new(Mutex::new(ttl_cache)),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -364,6 +396,17 @@ impl CommandExecutor for ManagementCommandExecutor {
                     "cluster_id" => %data.cluster_id
                 );
 
+                // Check if workflow is active (ignore duplicates)
+                let is_active = state.workflow_locations.contains_key(&data.workflow_id);
+
+                if !is_active {
+                    // Workflow already completed or never existed - ignore duplicate report
+                    slog::debug!(self.logger, "Ignoring duplicate workflow completion report";
+                        "workflow_id" => %data.workflow_id
+                    );
+                    return Ok(());
+                }
+
                 // Remove workflow from cluster's active set
                 if let Some(cluster_info) = state.execution_clusters.get_mut(&data.cluster_id) {
                     cluster_info.active_workflows.remove(&data.workflow_id);
@@ -371,6 +414,16 @@ impl CommandExecutor for ManagementCommandExecutor {
 
                 // Remove workflow location tracking
                 state.workflow_locations.remove(&data.workflow_id);
+
+                // Store result in TTL cache (10 minute TTL)
+                if let Some(ref result_json) = data.result_json {
+                    let mut cache = state.completed_workflows.lock().unwrap();
+                    cache.insert(data.workflow_id, result_json.clone(), Duration::from_secs(600));
+                    slog::debug!(self.logger, "Stored workflow result in cache";
+                        "workflow_id" => %data.workflow_id,
+                        "ttl_seconds" => 600
+                    );
+                }
             }
 
             ManagementCommand::ChangeNodeRole(data) => {
@@ -617,6 +670,7 @@ mod tests {
                 workflow_type: "test_workflow".to_string(),
                 version: 1,
                 timestamp: 12345,
+                result_json: None,
             }
         )).unwrap();
 
@@ -634,6 +688,7 @@ mod tests {
                 workflow_type: "test_workflow".to_string(),
                 version: 1,
                 timestamp: 12346,
+                result_json: Some("{\"status\":\"success\"}".to_string()),
             }
         )).unwrap();
 
@@ -667,6 +722,7 @@ mod tests {
                 workflow_type: "test".to_string(),
                 version: 1,
                 timestamp: 0,
+                result_json: None,
             }
         )).unwrap();
 
@@ -683,6 +739,7 @@ mod tests {
                 workflow_type: "test".to_string(),
                 version: 1,
                 timestamp: 1,
+                result_json: None,
             }
         )).unwrap();
 
@@ -726,6 +783,7 @@ mod tests {
                 workflow_type: "test".to_string(),
                 version: 1,
                 timestamp: 0,
+                result_json: None,
             }
         )).unwrap();
 
