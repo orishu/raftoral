@@ -540,7 +540,7 @@ mod tests {
     impl CommandExecutor for TestExecutor {
         type Command = TestCommand;
 
-        fn apply_with_index(&self, command: &Self::Command, _logger: &slog::Logger, _log_index: u64) -> Result<(), Box<dyn std::error::Error>> {
+        fn apply_with_index(&self, command: &Self::Command, _log_index: u64) -> Result<(), Box<dyn std::error::Error>> {
             if matches!(command, TestCommand::TestMessage(_)) {
                 self.message_received.store(true, Ordering::SeqCst);
             }

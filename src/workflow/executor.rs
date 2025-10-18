@@ -56,10 +56,34 @@ pub struct WorkflowCommandExecutor {
     pub ownership_map: crate::workflow::ownership::WorkflowOwnershipMap,
     /// This node's ID for ownership checks
     pub node_id: Arc<Mutex<Option<u64>>>,
+    /// Logger for this executor
+    logger: slog::Logger,
 }
 
 impl Default for WorkflowCommandExecutor {
     fn default() -> Self {
+        let (event_tx, _) = broadcast::channel(1000);
+        // Create a default logger with discard drain
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+        Self {
+            state: Arc::new(Mutex::new(WorkflowState::default())),
+            event_tx,
+            registry: Arc::new(Mutex::new(WorkflowRegistry::new())),
+            runtime: Arc::new(Mutex::new(None)),
+            ownership_map: crate::workflow::ownership::WorkflowOwnershipMap::new(),
+            node_id: Arc::new(Mutex::new(None)),
+            logger,
+        }
+    }
+}
+
+impl WorkflowCommandExecutor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create a new executor with a specific logger
+    pub fn with_logger(logger: slog::Logger) -> Self {
         let (event_tx, _) = broadcast::channel(1000);
         Self {
             state: Arc::new(Mutex::new(WorkflowState::default())),
@@ -68,13 +92,8 @@ impl Default for WorkflowCommandExecutor {
             runtime: Arc::new(Mutex::new(None)),
             ownership_map: crate::workflow::ownership::WorkflowOwnershipMap::new(),
             node_id: Arc::new(Mutex::new(None)),
+            logger,
         }
-    }
-}
-
-impl WorkflowCommandExecutor {
-    pub fn new() -> Self {
-        Self::default()
     }
 
     /// Set the workflow runtime reference (called after runtime construction)
@@ -218,10 +237,10 @@ impl WorkflowCommandExecutor {
 impl CommandExecutor for WorkflowCommandExecutor {
     type Command = WorkflowCommand;
 
-    fn apply_with_index(&self, command: &Self::Command, logger: &slog::Logger, log_index: u64) -> Result<(), Box<dyn std::error::Error>> {
+    fn apply_with_index(&self, command: &Self::Command, log_index: u64) -> Result<(), Box<dyn std::error::Error>> {
         match command {
             WorkflowCommand::WorkflowStart(data) => {
-                slog::info!(logger, "Started workflow";
+                slog::info!(self.logger, "Started workflow";
                            "workflow_id" => &data.workflow_id,
                            "workflow_type" => &data.workflow_type,
                            "version" => data.version,
@@ -308,7 +327,7 @@ impl CommandExecutor for WorkflowCommandExecutor {
                 }
             },
             WorkflowCommand::WorkflowEnd(data) => {
-                slog::info!(logger, "Ended workflow"; "workflow_id" => &data.workflow_id);
+                slog::info!(self.logger, "Ended workflow"; "workflow_id" => &data.workflow_id);
 
                 // Remove ownership (workflow completed)
                 self.ownership_map.remove_owner(&data.workflow_id);
@@ -330,7 +349,7 @@ impl CommandExecutor for WorkflowCommandExecutor {
                 self.emit_completed_event(&data.workflow_id, data.result.clone());
             },
             WorkflowCommand::SetCheckpoint(data) => {
-                slog::info!(logger, "Set checkpoint";
+                slog::info!(self.logger, "Set checkpoint";
                            "workflow_id" => &data.workflow_id,
                            "key" => &data.key,
                            "value_size" => data.value.len());
@@ -367,7 +386,7 @@ impl CommandExecutor for WorkflowCommandExecutor {
                 self.emit_checkpoint_event(&data.workflow_id, &data.key, data.value.clone());
             },
             WorkflowCommand::OwnerChange(data) => {
-                slog::info!(logger, "Owner change";
+                slog::info!(self.logger, "Owner change";
                            "workflow_id" => &data.workflow_id,
                            "old_owner" => data.old_owner_node_id,
                            "new_owner" => data.new_owner_node_id,
@@ -394,20 +413,20 @@ impl CommandExecutor for WorkflowCommandExecutor {
     }
 
     /// Handle node removal - reassign workflows if this node is the leader
-    fn on_node_removed(&self, removed_node_id: u64, _is_leader: bool, logger: &slog::Logger) {
-        slog::info!(logger, "Node removed from cluster";
+    fn on_node_removed(&self, removed_node_id: u64, _is_leader: bool) {
+        slog::info!(self.logger, "Node removed from cluster";
                    "removed_node_id" => removed_node_id);
 
         // Get the list of workflows owned by the removed node
         let orphaned_workflows = self.ownership_map.get_workflows_owned_by(removed_node_id);
 
         if orphaned_workflows.is_empty() {
-            slog::info!(logger, "No workflows owned by removed node";
+            slog::info!(self.logger, "No workflows owned by removed node";
                        "removed_node_id" => removed_node_id);
             return;
         }
 
-        slog::info!(logger, "Found orphaned workflows";
+        slog::info!(self.logger, "Found orphaned workflows";
                    "removed_node_id" => removed_node_id,
                    "count" => orphaned_workflows.len());
 

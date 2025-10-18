@@ -382,7 +382,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
 
     fn apply_command(&mut self, command: &E::Command, log_index: u64) -> Result<(), Box<dyn std::error::Error>> {
         // Use the executor to apply the command with log index
-        self.executor.apply_with_index(command, &self.logger, log_index)
+        self.executor.apply_with_index(command, log_index)
     }
 
 
@@ -428,7 +428,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
 
                             // Notify the executor so it can handle dynamic cluster construction
                             let is_leader = self.is_leader();
-                            self.executor.on_node_added(node_id, &meta.address, is_leader, &self.logger);
+                            self.executor.on_node_added(node_id, &meta.address, is_leader);
                         }
                     }
                 },
@@ -436,7 +436,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                     slog::info!(self.logger, "Removing node from cluster (v2)"; "node_id" => node_id);
                     // Notify the executor so it can handle ownership reassignment
                     let is_leader = self.is_leader();
-                    self.executor.on_node_removed(node_id, is_leader, &self.logger);
+                    self.executor.on_node_removed(node_id, is_leader);
 
                     // Update transport to remove peer
                     match self.transport.remove_peer(node_id) {

@@ -39,14 +39,28 @@ pub struct ManagementCommandExecutor {
     state: Arc<Mutex<ManagementState>>,
     workflow_cluster: Mutex<Option<Arc<RaftCluster<WorkflowCommandExecutor>>>>,
     management_cluster: Mutex<Option<Arc<RaftCluster<ManagementCommandExecutor>>>>,
+    logger: slog::Logger,
 }
 
 impl ManagementCommandExecutor {
     pub fn new() -> Self {
+        // Create a default logger with discard drain
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
         Self {
             state: Arc::new(Mutex::new(ManagementState::default())),
             workflow_cluster: Mutex::new(None),
             management_cluster: Mutex::new(None),
+            logger,
+        }
+    }
+
+    /// Create a new executor with a specific logger
+    pub fn with_logger(logger: slog::Logger) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ManagementState::default())),
+            workflow_cluster: Mutex::new(None),
+            management_cluster: Mutex::new(None),
+            logger,
         }
     }
 
@@ -122,12 +136,12 @@ impl ManagementCommandExecutor {
 impl CommandExecutor for ManagementCommandExecutor {
     type Command = ManagementCommand;
 
-    fn apply(&self, command: &Self::Command, logger: &slog::Logger) -> Result<(), Box<dyn std::error::Error>> {
+    fn apply(&self, command: &Self::Command) -> Result<(), Box<dyn std::error::Error>> {
         let mut state = self.state.lock().unwrap();
 
         match command {
             ManagementCommand::CreateExecutionCluster(data) => {
-                slog::info!(logger, "Creating execution cluster";
+                slog::info!(self.logger, "Creating execution cluster";
                     "cluster_id" => %data.cluster_id,
                     "initial_nodes" => ?data.initial_node_ids
                 );
@@ -155,7 +169,7 @@ impl CommandExecutor for ManagementCommandExecutor {
             }
 
             ManagementCommand::DestroyExecutionCluster(cluster_id) => {
-                slog::info!(logger, "Destroying execution cluster"; "cluster_id" => %cluster_id);
+                slog::info!(self.logger, "Destroying execution cluster"; "cluster_id" => %cluster_id);
 
                 // Clone node_ids before borrowing state mutably
                 let node_ids = if let Some(cluster_info) = state.execution_clusters.get(cluster_id) {
@@ -169,7 +183,7 @@ impl CommandExecutor for ManagementCommandExecutor {
                     }
                     cluster_info.node_ids.clone()
                 } else {
-                    slog::warn!(logger, "Attempt to destroy non-existent cluster"; "cluster_id" => %cluster_id);
+                    slog::warn!(self.logger, "Attempt to destroy non-existent cluster"; "cluster_id" => %cluster_id);
                     return Ok(());
                 };
 
@@ -192,7 +206,7 @@ impl CommandExecutor for ManagementCommandExecutor {
             }
 
             ManagementCommand::AssociateNode(data) => {
-                slog::info!(logger, "Associating node with cluster";
+                slog::info!(self.logger, "Associating node with cluster";
                     "node_id" => data.node_id,
                     "cluster_id" => %data.cluster_id
                 );
@@ -214,7 +228,7 @@ impl CommandExecutor for ManagementCommandExecutor {
             }
 
             ManagementCommand::DisassociateNode(data) => {
-                slog::info!(logger, "Disassociating node from cluster";
+                slog::info!(self.logger, "Disassociating node from cluster";
                     "node_id" => data.node_id,
                     "cluster_id" => %data.cluster_id
                 );
@@ -238,7 +252,7 @@ impl CommandExecutor for ManagementCommandExecutor {
             }
 
             ManagementCommand::ReportWorkflowStarted(data) => {
-                slog::info!(logger, "Workflow started";
+                slog::info!(self.logger, "Workflow started";
                     "workflow_id" => %data.workflow_id,
                     "cluster_id" => %data.cluster_id,
                     "workflow_type" => &data.workflow_type,
@@ -249,7 +263,7 @@ impl CommandExecutor for ManagementCommandExecutor {
                 if let Some(cluster_info) = state.execution_clusters.get_mut(&data.cluster_id) {
                     cluster_info.active_workflows.insert(data.workflow_id);
                 } else {
-                    slog::warn!(logger, "Workflow started on unknown cluster";
+                    slog::warn!(self.logger, "Workflow started on unknown cluster";
                         "cluster_id" => %data.cluster_id,
                         "workflow_id" => %data.workflow_id
                     );
@@ -260,7 +274,7 @@ impl CommandExecutor for ManagementCommandExecutor {
             }
 
             ManagementCommand::ReportWorkflowEnded(data) => {
-                slog::info!(logger, "Workflow ended";
+                slog::info!(self.logger, "Workflow ended";
                     "workflow_id" => %data.workflow_id,
                     "cluster_id" => %data.cluster_id
                 );
@@ -275,7 +289,7 @@ impl CommandExecutor for ManagementCommandExecutor {
             }
 
             ManagementCommand::ChangeNodeRole(data) => {
-                slog::info!(logger, "Changing node role";
+                slog::info!(self.logger, "Changing node role";
                     "node_id" => data.node_id,
                     "is_voter" => data.is_voter
                 );
@@ -288,18 +302,18 @@ impl CommandExecutor for ManagementCommandExecutor {
         Ok(())
     }
 
-    fn apply_with_index(&self, command: &Self::Command, logger: &slog::Logger, _log_index: u64) -> Result<(), Box<dyn std::error::Error>> {
+    fn apply_with_index(&self, command: &Self::Command, _log_index: u64) -> Result<(), Box<dyn std::error::Error>> {
         // For now, just delegate to apply (ignoring the index)
-        self.apply(command, logger)
+        self.apply(command)
     }
 
-    fn on_node_added(&self, added_node_id: u64, address: &str, is_leader: bool, logger: &slog::Logger) {
-        slog::info!(logger, "Management cluster detected node addition";
+    fn on_node_added(&self, added_node_id: u64, address: &str, is_leader: bool) {
+        slog::info!(self.logger, "Management cluster detected node addition";
                    "node_id" => added_node_id, "address" => address, "is_leader" => is_leader);
 
         // Only the leader should modify the execution cluster and propose state changes
         if !is_leader {
-            slog::debug!(logger, "Not leader, skipping execution cluster modification");
+            slog::debug!(self.logger, "Not leader, skipping execution cluster modification");
             return;
         }
 
@@ -312,7 +326,7 @@ impl CommandExecutor for ManagementCommandExecutor {
                 node_id: added_node_id,
             });
 
-            let logger_clone = logger.clone();
+            let logger_clone = self.logger.clone();
             let mgmt_cluster_clone = mgmt_cluster.clone();
             tokio::spawn(async move {
                 match mgmt_cluster_clone.propose_and_sync(command).await {
@@ -332,7 +346,7 @@ impl CommandExecutor for ManagementCommandExecutor {
         let workflow_cluster = self.workflow_cluster.lock().unwrap().clone();
         if let Some(cluster) = workflow_cluster {
             let address_clone = address.to_string();
-            let logger_clone = logger.clone();
+            let logger_clone = self.logger.clone();
             tokio::spawn(async move {
                 match cluster.add_node(added_node_id, address_clone.clone()).await {
                     Ok(_) => {
@@ -346,17 +360,17 @@ impl CommandExecutor for ManagementCommandExecutor {
                 }
             });
         } else {
-            slog::warn!(logger, "Workflow cluster reference not set");
+            slog::warn!(self.logger, "Workflow cluster reference not set");
         }
     }
 
-    fn on_node_removed(&self, removed_node_id: u64, is_leader: bool, logger: &slog::Logger) {
-        slog::info!(logger, "Management cluster detected node removal";
+    fn on_node_removed(&self, removed_node_id: u64, is_leader: bool) {
+        slog::info!(self.logger, "Management cluster detected node removal";
                    "node_id" => removed_node_id, "is_leader" => is_leader);
 
         // Only the leader should modify the execution cluster and propose state changes
         if !is_leader {
-            slog::debug!(logger, "Not leader, skipping execution cluster modification");
+            slog::debug!(self.logger, "Not leader, skipping execution cluster modification");
             return;
         }
 
@@ -369,7 +383,7 @@ impl CommandExecutor for ManagementCommandExecutor {
                 node_id: removed_node_id,
             });
 
-            let logger_clone = logger.clone();
+            let logger_clone = self.logger.clone();
             let mgmt_cluster_clone = mgmt_cluster.clone();
             tokio::spawn(async move {
                 match mgmt_cluster_clone.propose_and_sync(command).await {
@@ -388,7 +402,7 @@ impl CommandExecutor for ManagementCommandExecutor {
         // 2. Remove node from workflow (execution) cluster
         let workflow_cluster = self.workflow_cluster.lock().unwrap().clone();
         if let Some(cluster) = workflow_cluster {
-            let logger_clone = logger.clone();
+            let logger_clone = self.logger.clone();
             tokio::spawn(async move {
                 match cluster.remove_node(removed_node_id).await {
                     Ok(_) => {
@@ -402,7 +416,7 @@ impl CommandExecutor for ManagementCommandExecutor {
                 }
             });
         } else {
-            slog::warn!(logger, "Workflow cluster reference not set");
+            slog::warn!(self.logger, "Workflow cluster reference not set");
         }
     }
 }
@@ -432,7 +446,7 @@ mod tests {
     #[test]
     fn test_create_execution_cluster() {
         let executor = ManagementCommandExecutor::new();
-        let logger = create_test_logger();
+        let _logger = create_test_logger();
 
         let cluster_id = Uuid::new_v4();
         let command = ManagementCommand::CreateExecutionCluster(CreateExecutionClusterData {
@@ -440,7 +454,7 @@ mod tests {
             initial_node_ids: vec![1, 2, 3],
         });
 
-        executor.apply(&command, &logger).unwrap();
+        executor.apply(&command).unwrap();
 
         // Verify cluster was created
         let cluster_info = executor.get_cluster_info(&cluster_id).unwrap();
@@ -457,7 +471,7 @@ mod tests {
     #[test]
     fn test_associate_and_disassociate_node() {
         let executor = ManagementCommandExecutor::new();
-        let logger = create_test_logger();
+        let _logger = create_test_logger();
 
         let cluster_id = Uuid::new_v4();
 
@@ -467,7 +481,7 @@ mod tests {
                 cluster_id,
                 initial_node_ids: vec![1, 2],
             }
-        ), &logger).unwrap();
+        )).unwrap();
 
         // Associate node 3
         executor.apply(&ManagementCommand::AssociateNode(
@@ -475,7 +489,7 @@ mod tests {
                 cluster_id,
                 node_id: 3,
             }
-        ), &logger).unwrap();
+        )).unwrap();
 
         let cluster_info = executor.get_cluster_info(&cluster_id).unwrap();
         assert!(cluster_info.node_ids.contains(&3));
@@ -487,7 +501,7 @@ mod tests {
                 cluster_id,
                 node_id: 3,
             }
-        ), &logger).unwrap();
+        )).unwrap();
 
         let cluster_info = executor.get_cluster_info(&cluster_id).unwrap();
         assert!(!cluster_info.node_ids.contains(&3));
@@ -497,7 +511,7 @@ mod tests {
     #[test]
     fn test_workflow_lifecycle() {
         let executor = ManagementCommandExecutor::new();
-        let logger = create_test_logger();
+        let _logger = create_test_logger();
 
         let cluster_id = Uuid::new_v4();
         let workflow_id = Uuid::new_v4();
@@ -508,7 +522,7 @@ mod tests {
                 cluster_id,
                 initial_node_ids: vec![1],
             }
-        ), &logger).unwrap();
+        )).unwrap();
 
         // Start workflow
         executor.apply(&ManagementCommand::ReportWorkflowStarted(
@@ -519,7 +533,7 @@ mod tests {
                 version: 1,
                 timestamp: 12345,
             }
-        ), &logger).unwrap();
+        )).unwrap();
 
         // Verify workflow tracked
         assert_eq!(executor.get_workflow_location(&workflow_id), Some(cluster_id));
@@ -536,7 +550,7 @@ mod tests {
                 version: 1,
                 timestamp: 12346,
             }
-        ), &logger).unwrap();
+        )).unwrap();
 
         // Verify workflow removed
         assert_eq!(executor.get_workflow_location(&workflow_id), None);
@@ -548,7 +562,7 @@ mod tests {
     #[test]
     fn test_destroy_cluster_with_workflows_fails() {
         let executor = ManagementCommandExecutor::new();
-        let logger = create_test_logger();
+        let _logger = create_test_logger();
 
         let cluster_id = Uuid::new_v4();
         let workflow_id = Uuid::new_v4();
@@ -559,7 +573,7 @@ mod tests {
                 cluster_id,
                 initial_node_ids: vec![1],
             }
-        ), &logger).unwrap();
+        )).unwrap();
 
         executor.apply(&ManagementCommand::ReportWorkflowStarted(
             WorkflowLifecycleData {
@@ -569,10 +583,10 @@ mod tests {
                 version: 1,
                 timestamp: 0,
             }
-        ), &logger).unwrap();
+        )).unwrap();
 
         // Try to destroy cluster - should fail
-        let result = executor.apply(&ManagementCommand::DestroyExecutionCluster(cluster_id), &logger);
+        let result = executor.apply(&ManagementCommand::DestroyExecutionCluster(cluster_id));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("active workflows"));
 
@@ -585,17 +599,17 @@ mod tests {
                 version: 1,
                 timestamp: 1,
             }
-        ), &logger).unwrap();
+        )).unwrap();
 
         // Now destroy should succeed
-        executor.apply(&ManagementCommand::DestroyExecutionCluster(cluster_id), &logger).unwrap();
+        executor.apply(&ManagementCommand::DestroyExecutionCluster(cluster_id)).unwrap();
         assert!(executor.get_cluster_info(&cluster_id).is_none());
     }
 
     #[test]
     fn test_find_least_loaded_cluster() {
         let executor = ManagementCommandExecutor::new();
-        let logger = create_test_logger();
+        let _logger = create_test_logger();
 
         let cluster1 = Uuid::new_v4();
         let cluster2 = Uuid::new_v4();
@@ -606,14 +620,14 @@ mod tests {
                 cluster_id: cluster1,
                 initial_node_ids: vec![1],
             }
-        ), &logger).unwrap();
+        )).unwrap();
 
         executor.apply(&ManagementCommand::CreateExecutionCluster(
             CreateExecutionClusterData {
                 cluster_id: cluster2,
                 initial_node_ids: vec![2],
             }
-        ), &logger).unwrap();
+        )).unwrap();
 
         // Both empty - either is fine
         let least_loaded = executor.find_least_loaded_cluster();
@@ -628,7 +642,7 @@ mod tests {
                 version: 1,
                 timestamp: 0,
             }
-        ), &logger).unwrap();
+        )).unwrap();
 
         // cluster2 should be least loaded
         assert_eq!(executor.find_least_loaded_cluster(), Some(cluster2));
