@@ -97,7 +97,8 @@ message RunWorkflowRequest {
 message RunWorkflowAsyncResponse {
     bool success = 1;
     string workflow_id = 2;  // UUID of the started workflow
-    string error = 3;        // Error message if success=false
+    string execution_cluster_id = 3;  // UUID of the execution cluster running this workflow
+    string error = 4;        // Error message if success=false
 }
 
 message RunWorkflowResponse {
@@ -108,5 +109,6 @@ message RunWorkflowResponse {
 
 message WaitForWorkflowRequest {
     string workflow_id = 1;  // UUID of the workflow to wait for
-    uint32 timeout_seconds = 2;  // Optional timeout (0 = use default)
+    string execution_cluster_id = 2;  // UUID of the execution cluster where workflow is running
+    uint32 timeout_seconds = 3;  // Optional timeout (0 = use default)
 }

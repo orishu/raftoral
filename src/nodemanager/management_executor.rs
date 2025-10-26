@@ -2,10 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use ttl_cache::TtlCache;
 
 use crate::raft::generic::message::CommandExecutor;
 use crate::raft::RaftCluster;
@@ -16,7 +14,7 @@ use super::management_command::{ManagementCommand, AssociateNodeData, Disassocia
 const DEFAULT_EXECUTION_CLUSTER_ID: u128 = 1;
 
 /// Serializable snapshot of management state
-/// Used for Raft snapshots (excludes runtime-only data like TTL cache)
+/// Used for Raft snapshots
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ManagementStateSnapshot {
     /// All execution clusters
@@ -24,69 +22,39 @@ pub struct ManagementStateSnapshot {
 
     /// Node membership: node_id → set of execution cluster IDs
     pub node_memberships: HashMap<u64, HashSet<Uuid>>,
-
-    /// Workflow registry: workflow_id → cluster_id
-    pub workflow_locations: HashMap<Uuid, Uuid>,
 }
 
 /// State maintained by the management cluster
-/// Note: completed_workflows is not serialized (it's a TTL cache for runtime use only)
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ManagementState {
     /// All execution clusters
     pub execution_clusters: HashMap<Uuid, ExecutionClusterInfo>,
 
     /// Node membership: node_id → set of execution cluster IDs
     pub node_memberships: HashMap<u64, HashSet<Uuid>>,
-
-    /// Workflow registry: workflow_id → cluster_id
-    pub workflow_locations: HashMap<Uuid, Uuid>,
-
-    /// Completed workflow results (TTL cache, 10 minute default)
-    /// Maps workflow_id → JSON-serialized Result<T, E>
-    /// Not serialized for snapshots (runtime cache only)
-    pub completed_workflows: Arc<Mutex<TtlCache<Uuid, String>>>,
 }
 
 impl ManagementState {
-    /// Create a snapshot of the state (excluding runtime cache)
+    /// Create a snapshot of the state
     pub fn create_snapshot(&self) -> ManagementStateSnapshot {
         ManagementStateSnapshot {
             execution_clusters: self.execution_clusters.clone(),
             node_memberships: self.node_memberships.clone(),
-            workflow_locations: self.workflow_locations.clone(),
         }
     }
 
-    /// Restore state from a snapshot (preserving existing TTL cache)
+    /// Restore state from a snapshot
     pub fn restore_from_snapshot(&mut self, snapshot: ManagementStateSnapshot) {
         self.execution_clusters = snapshot.execution_clusters;
         self.node_memberships = snapshot.node_memberships;
-        self.workflow_locations = snapshot.workflow_locations;
-        // Keep existing completed_workflows cache (don't reset it)
-    }
-}
-
-impl std::fmt::Debug for ManagementState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ManagementState")
-            .field("execution_clusters", &self.execution_clusters)
-            .field("node_memberships", &self.node_memberships)
-            .field("workflow_locations", &self.workflow_locations)
-            .field("completed_workflows", &"<TTL Cache>")
-            .finish()
     }
 }
 
 impl Default for ManagementState {
     fn default() -> Self {
-        // Create TTL cache with 10 minute TTL and capacity of 10000 entries
-        let ttl_cache = TtlCache::new(10000);
         Self {
             execution_clusters: HashMap::new(),
             node_memberships: HashMap::new(),
-            workflow_locations: HashMap::new(),
-            completed_workflows: Arc::new(Mutex::new(ttl_cache)),
         }
     }
 }
@@ -95,7 +63,6 @@ impl Default for ManagementState {
 pub struct ExecutionClusterInfo {
     pub cluster_id: Uuid,
     pub node_ids: Vec<u64>,
-    pub active_workflows: HashSet<Uuid>,
     pub created_at: u64,
 }
 
@@ -157,11 +124,6 @@ impl ManagementCommandExecutor {
             .collect()
     }
 
-    /// Find which cluster a workflow is running on
-    pub fn get_workflow_location(&self, workflow_id: &Uuid) -> Option<Uuid> {
-        self.state.lock().unwrap().workflow_locations.get(workflow_id).copied()
-    }
-
     /// Get all execution clusters that a node is a member of
     pub fn get_node_clusters(&self, node_id: u64) -> Vec<Uuid> {
         self.state.lock().unwrap()
@@ -171,48 +133,12 @@ impl ManagementCommandExecutor {
             .unwrap_or_default()
     }
 
-    /// Find the least loaded execution cluster (fewest active workflows)
-    pub fn find_least_loaded_cluster(&self) -> Option<Uuid> {
-        self.state.lock().unwrap()
-            .execution_clusters
-            .values()
-            .min_by_key(|cluster| cluster.active_workflows.len())
-            .map(|cluster| cluster.cluster_id)
-    }
-
-    /// Get completed workflow result from TTL cache
-    /// Returns None if workflow not found or still running
-    pub fn get_completed_workflow_result(&self, workflow_id: &Uuid) -> Option<String> {
-        self.state.lock().unwrap()
-            .completed_workflows
-            .lock()
-            .unwrap()
-            .get(workflow_id)
-            .cloned()
-    }
-
-    /// Check if workflow is still active (not yet completed)
-    pub fn is_workflow_active(&self, workflow_id: &Uuid) -> bool {
-        self.state.lock().unwrap()
-            .workflow_locations
-            .contains_key(workflow_id)
-    }
-
     /// Find an execution cluster that includes the given node
     pub fn find_cluster_with_node(&self, node_id: u64) -> Option<Uuid> {
         let state = self.state.lock().unwrap();
         state.node_memberships
             .get(&node_id)
             .and_then(|clusters| clusters.iter().next().copied())
-    }
-
-    /// Get count of active workflows across all clusters
-    pub fn get_total_active_workflows(&self) -> usize {
-        self.state.lock().unwrap()
-            .execution_clusters
-            .values()
-            .map(|cluster| cluster.active_workflows.len())
-            .sum()
     }
 }
 
@@ -233,7 +159,6 @@ impl CommandExecutor for ManagementCommandExecutor {
                 let cluster_info = ExecutionClusterInfo {
                     cluster_id: data.cluster_id,
                     node_ids: data.initial_node_ids.clone(),
-                    active_workflows: HashSet::new(),
                     created_at: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
@@ -256,14 +181,6 @@ impl CommandExecutor for ManagementCommandExecutor {
 
                 // Clone node_ids before borrowing state mutably
                 let node_ids = if let Some(cluster_info) = state.execution_clusters.get(cluster_id) {
-                    // Check that cluster has no active workflows
-                    if !cluster_info.active_workflows.is_empty() {
-                        return Err(format!(
-                            "Cannot destroy cluster {} with {} active workflows",
-                            cluster_id,
-                            cluster_info.active_workflows.len()
-                        ).into());
-                    }
                     cluster_info.node_ids.clone()
                 } else {
                     slog::warn!(self.logger, "Attempt to destroy non-existent cluster"; "cluster_id" => %cluster_id);
@@ -342,27 +259,10 @@ impl CommandExecutor for ManagementCommandExecutor {
                     "version" => data.version
                 );
 
-                // Add workflow to cluster's active set
-                if let Some(cluster_info) = state.execution_clusters.get_mut(&data.cluster_id) {
-                    cluster_info.active_workflows.insert(data.workflow_id);
-                } else {
-                    slog::warn!(self.logger, "Workflow scheduled on unknown cluster";
-                        "cluster_id" => %data.cluster_id,
-                        "workflow_id" => %data.workflow_id
-                    );
-                }
-
-                // Track workflow location
-                state.workflow_locations.insert(data.workflow_id, data.cluster_id);
-
                 // Drop the state lock before async operations
                 drop(state);
 
-                // Option 1: Only nodes that are leaders of the execution cluster propose WorkflowStart
-                // LIMITATION: If the leader just went offline, no node will start the workflow
-                // TODO: Consider implementing Option 2 (all execution cluster members propose)
-                //       with duplicate detection in WorkflowCommandExecutor
-
+                // Only nodes that are leaders of the execution cluster propose WorkflowStart
                 // Check if this node is part of the target execution cluster
                 let workflow_cluster = self.workflow_cluster.lock().unwrap().clone();
                 if let Some(cluster) = workflow_cluster {
@@ -415,65 +315,6 @@ impl CommandExecutor for ManagementCommandExecutor {
                             }
                         });
                     }
-                }
-            }
-
-            ManagementCommand::ReportWorkflowStarted(data) => {
-                // Keep this for backward compatibility with tests
-                slog::info!(self.logger, "Workflow started (legacy)";
-                    "workflow_id" => %data.workflow_id,
-                    "cluster_id" => %data.cluster_id,
-                    "workflow_type" => &data.workflow_type,
-                    "version" => data.version
-                );
-
-                // Add workflow to cluster's active set
-                if let Some(cluster_info) = state.execution_clusters.get_mut(&data.cluster_id) {
-                    cluster_info.active_workflows.insert(data.workflow_id);
-                } else {
-                    slog::warn!(self.logger, "Workflow started on unknown cluster";
-                        "cluster_id" => %data.cluster_id,
-                        "workflow_id" => %data.workflow_id
-                    );
-                }
-
-                // Track workflow location
-                state.workflow_locations.insert(data.workflow_id, data.cluster_id);
-            }
-
-            ManagementCommand::ReportWorkflowEnded(data) => {
-                slog::info!(self.logger, "Workflow ended";
-                    "workflow_id" => %data.workflow_id,
-                    "cluster_id" => %data.cluster_id
-                );
-
-                // Check if workflow is active (ignore duplicates)
-                let is_active = state.workflow_locations.contains_key(&data.workflow_id);
-
-                if !is_active {
-                    // Workflow already completed or never existed - ignore duplicate report
-                    slog::debug!(self.logger, "Ignoring duplicate workflow completion report";
-                        "workflow_id" => %data.workflow_id
-                    );
-                    return Ok(());
-                }
-
-                // Remove workflow from cluster's active set
-                if let Some(cluster_info) = state.execution_clusters.get_mut(&data.cluster_id) {
-                    cluster_info.active_workflows.remove(&data.workflow_id);
-                }
-
-                // Remove workflow location tracking
-                state.workflow_locations.remove(&data.workflow_id);
-
-                // Store result in TTL cache (10 minute TTL)
-                if let Some(ref result_json) = data.result_json {
-                    let mut cache = state.completed_workflows.lock().unwrap();
-                    cache.insert(data.workflow_id, result_json.clone(), Duration::from_secs(600));
-                    slog::debug!(self.logger, "Stored workflow result in cache";
-                        "workflow_id" => %data.workflow_id,
-                        "ttl_seconds" => 600
-                    );
                 }
             }
 
@@ -622,8 +463,7 @@ impl CommandExecutor for ManagementCommandExecutor {
                    "index" => snapshot_index,
                    "size_bytes" => snapshot_bytes.len(),
                    "execution_clusters" => snapshot.execution_clusters.len(),
-                   "node_memberships" => snapshot.node_memberships.len(),
-                   "workflow_locations" => snapshot.workflow_locations.len()
+                   "node_memberships" => snapshot.node_memberships.len()
         );
 
         Ok(snapshot_bytes)
@@ -641,8 +481,7 @@ impl CommandExecutor for ManagementCommandExecutor {
 
         slog::info!(self.logger, "Restored management state from snapshot";
                    "execution_clusters" => state.execution_clusters.len(),
-                   "node_memberships" => state.node_memberships.len(),
-                   "workflow_locations" => state.workflow_locations.len()
+                   "node_memberships" => state.node_memberships.len()
         );
 
         Ok(())
@@ -665,7 +504,6 @@ mod tests {
     use super::*;
     use super::super::management_command::{
         CreateExecutionClusterData, AssociateNodeData, DisassociateNodeData,
-        WorkflowLifecycleData,
     };
     use slog::Drain;
 
@@ -693,7 +531,6 @@ mod tests {
         let cluster_info = executor.get_cluster_info(&cluster_id).unwrap();
         assert_eq!(cluster_info.cluster_id, cluster_id);
         assert_eq!(cluster_info.node_ids, vec![1, 2, 3]);
-        assert_eq!(cluster_info.active_workflows.len(), 0);
 
         // Verify node memberships
         assert_eq!(executor.get_node_clusters(1), vec![cluster_id]);
@@ -741,253 +578,9 @@ mod tests {
         assert_eq!(executor.get_node_clusters(3).len(), 0);
     }
 
-    #[test]
-    fn test_workflow_lifecycle() {
-        let executor = ManagementCommandExecutor::new();
-        let _logger = create_test_logger();
 
-        let cluster_id = Uuid::new_v4();
-        let workflow_id = Uuid::new_v4();
 
-        // Create cluster
-        executor.apply(&ManagementCommand::CreateExecutionCluster(
-            CreateExecutionClusterData {
-                cluster_id,
-                initial_node_ids: vec![1],
-            }
-        )).unwrap();
 
-        // Start workflow
-        executor.apply(&ManagementCommand::ReportWorkflowStarted(
-            WorkflowLifecycleData {
-                workflow_id,
-                cluster_id,
-                workflow_type: "test_workflow".to_string(),
-                version: 1,
-                timestamp: 12345,
-                result_json: None,
-            }
-        )).unwrap();
-
-        // Verify workflow tracked
-        assert_eq!(executor.get_workflow_location(&workflow_id), Some(cluster_id));
-        let cluster_info = executor.get_cluster_info(&cluster_id).unwrap();
-        assert!(cluster_info.active_workflows.contains(&workflow_id));
-        assert_eq!(executor.get_total_active_workflows(), 1);
-
-        // End workflow
-        executor.apply(&ManagementCommand::ReportWorkflowEnded(
-            WorkflowLifecycleData {
-                workflow_id,
-                cluster_id,
-                workflow_type: "test_workflow".to_string(),
-                version: 1,
-                timestamp: 12346,
-                result_json: Some("{\"status\":\"success\"}".to_string()),
-            }
-        )).unwrap();
-
-        // Verify workflow removed
-        assert_eq!(executor.get_workflow_location(&workflow_id), None);
-        let cluster_info = executor.get_cluster_info(&cluster_id).unwrap();
-        assert!(!cluster_info.active_workflows.contains(&workflow_id));
-        assert_eq!(executor.get_total_active_workflows(), 0);
-    }
-
-    #[test]
-    fn test_destroy_cluster_with_workflows_fails() {
-        let executor = ManagementCommandExecutor::new();
-        let _logger = create_test_logger();
-
-        let cluster_id = Uuid::new_v4();
-        let workflow_id = Uuid::new_v4();
-
-        // Create cluster and start workflow
-        executor.apply(&ManagementCommand::CreateExecutionCluster(
-            CreateExecutionClusterData {
-                cluster_id,
-                initial_node_ids: vec![1],
-            }
-        )).unwrap();
-
-        executor.apply(&ManagementCommand::ReportWorkflowStarted(
-            WorkflowLifecycleData {
-                workflow_id,
-                cluster_id,
-                workflow_type: "test".to_string(),
-                version: 1,
-                timestamp: 0,
-                result_json: None,
-            }
-        )).unwrap();
-
-        // Try to destroy cluster - should fail
-        let result = executor.apply(&ManagementCommand::DestroyExecutionCluster(cluster_id));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("active workflows"));
-
-        // End workflow
-        executor.apply(&ManagementCommand::ReportWorkflowEnded(
-            WorkflowLifecycleData {
-                workflow_id,
-                cluster_id,
-                workflow_type: "test".to_string(),
-                version: 1,
-                timestamp: 1,
-                result_json: None,
-            }
-        )).unwrap();
-
-        // Now destroy should succeed
-        executor.apply(&ManagementCommand::DestroyExecutionCluster(cluster_id)).unwrap();
-        assert!(executor.get_cluster_info(&cluster_id).is_none());
-    }
-
-    #[test]
-    fn test_find_least_loaded_cluster() {
-        let executor = ManagementCommandExecutor::new();
-        let _logger = create_test_logger();
-
-        let cluster1 = Uuid::new_v4();
-        let cluster2 = Uuid::new_v4();
-
-        // Create two clusters
-        executor.apply(&ManagementCommand::CreateExecutionCluster(
-            CreateExecutionClusterData {
-                cluster_id: cluster1,
-                initial_node_ids: vec![1],
-            }
-        )).unwrap();
-
-        executor.apply(&ManagementCommand::CreateExecutionCluster(
-            CreateExecutionClusterData {
-                cluster_id: cluster2,
-                initial_node_ids: vec![2],
-            }
-        )).unwrap();
-
-        // Both empty - either is fine
-        let least_loaded = executor.find_least_loaded_cluster();
-        assert!(least_loaded.is_some());
-
-        // Add workflow to cluster1
-        executor.apply(&ManagementCommand::ReportWorkflowStarted(
-            WorkflowLifecycleData {
-                workflow_id: Uuid::new_v4(),
-                cluster_id: cluster1,
-                workflow_type: "test".to_string(),
-                version: 1,
-                timestamp: 0,
-                result_json: None,
-            }
-        )).unwrap();
-
-        // cluster2 should be least loaded
-        assert_eq!(executor.find_least_loaded_cluster(), Some(cluster2));
-    }
-
-    #[test]
-    fn test_snapshot_create_and_restore() {
-        let logger = create_test_logger();
-        let executor = ManagementCommandExecutor::with_logger(logger);
-
-        let cluster1 = Uuid::new_v4();
-        let cluster2 = Uuid::new_v4();
-        let workflow1 = Uuid::new_v4();
-        let workflow2 = Uuid::new_v4();
-
-        // Create some state
-        executor.apply(&ManagementCommand::CreateExecutionCluster(
-            CreateExecutionClusterData {
-                cluster_id: cluster1,
-                initial_node_ids: vec![1, 2],
-            }
-        )).unwrap();
-
-        executor.apply(&ManagementCommand::CreateExecutionCluster(
-            CreateExecutionClusterData {
-                cluster_id: cluster2,
-                initial_node_ids: vec![3],
-            }
-        )).unwrap();
-
-        executor.apply(&ManagementCommand::ReportWorkflowStarted(
-            WorkflowLifecycleData {
-                workflow_id: workflow1,
-                cluster_id: cluster1,
-                workflow_type: "test1".to_string(),
-                version: 1,
-                timestamp: 100,
-                result_json: None,
-            }
-        )).unwrap();
-
-        executor.apply(&ManagementCommand::ReportWorkflowStarted(
-            WorkflowLifecycleData {
-                workflow_id: workflow2,
-                cluster_id: cluster2,
-                workflow_type: "test2".to_string(),
-                version: 1,
-                timestamp: 200,
-                result_json: None,
-            }
-        )).unwrap();
-
-        // Verify state before snapshot
-        assert_eq!(executor.get_all_clusters().len(), 2);
-        assert_eq!(executor.get_total_active_workflows(), 2);
-        assert_eq!(executor.get_workflow_location(&workflow1), Some(cluster1));
-        assert_eq!(executor.get_workflow_location(&workflow2), Some(cluster2));
-        assert_eq!(executor.get_node_clusters(1), vec![cluster1]);
-        assert_eq!(executor.get_node_clusters(2), vec![cluster1]);
-        assert_eq!(executor.get_node_clusters(3), vec![cluster2]);
-
-        // Create snapshot
-        let snapshot_bytes = executor.create_snapshot(42).unwrap();
-        assert!(!snapshot_bytes.is_empty());
-
-        // Create a fresh executor
-        let logger2 = create_test_logger();
-        let executor2 = ManagementCommandExecutor::with_logger(logger2);
-
-        // Verify it's initially empty
-        assert_eq!(executor2.get_all_clusters().len(), 0);
-        assert_eq!(executor2.get_total_active_workflows(), 0);
-
-        // Restore from snapshot
-        executor2.restore_from_snapshot(&snapshot_bytes).unwrap();
-
-        // Verify state was restored
-        assert_eq!(executor2.get_all_clusters().len(), 2);
-        assert_eq!(executor2.get_total_active_workflows(), 2);
-        assert_eq!(executor2.get_workflow_location(&workflow1), Some(cluster1));
-        assert_eq!(executor2.get_workflow_location(&workflow2), Some(cluster2));
-
-        let node1_clusters = executor2.get_node_clusters(1);
-        assert_eq!(node1_clusters.len(), 1);
-        assert!(node1_clusters.contains(&cluster1));
-
-        let node2_clusters = executor2.get_node_clusters(2);
-        assert_eq!(node2_clusters.len(), 1);
-        assert!(node2_clusters.contains(&cluster1));
-
-        let node3_clusters = executor2.get_node_clusters(3);
-        assert_eq!(node3_clusters.len(), 1);
-        assert!(node3_clusters.contains(&cluster2));
-
-        // Verify cluster info details
-        let cluster1_info = executor2.get_cluster_info(&cluster1).unwrap();
-        assert_eq!(cluster1_info.node_ids.len(), 2);
-        assert!(cluster1_info.node_ids.contains(&1));
-        assert!(cluster1_info.node_ids.contains(&2));
-        assert_eq!(cluster1_info.active_workflows.len(), 1);
-        assert!(cluster1_info.active_workflows.contains(&workflow1));
-
-        let cluster2_info = executor2.get_cluster_info(&cluster2).unwrap();
-        assert_eq!(cluster2_info.node_ids, vec![3]);
-        assert_eq!(cluster2_info.active_workflows.len(), 1);
-        assert!(cluster2_info.active_workflows.contains(&workflow2));
-    }
 
     #[test]
     fn test_snapshot_interval() {
@@ -1007,59 +600,4 @@ mod tests {
         assert!(!executor.should_create_snapshot(501, 500));
     }
 
-    #[test]
-    fn test_snapshot_preserves_ttl_cache() {
-        let logger = create_test_logger();
-        let executor = ManagementCommandExecutor::with_logger(logger);
-
-        let cluster_id = Uuid::new_v4();
-        let workflow_id = Uuid::new_v4();
-
-        // Create cluster and complete a workflow with result in cache
-        executor.apply(&ManagementCommand::CreateExecutionCluster(
-            CreateExecutionClusterData {
-                cluster_id,
-                initial_node_ids: vec![1],
-            }
-        )).unwrap();
-
-        executor.apply(&ManagementCommand::ReportWorkflowStarted(
-            WorkflowLifecycleData {
-                workflow_id,
-                cluster_id,
-                workflow_type: "test".to_string(),
-                version: 1,
-                timestamp: 100,
-                result_json: None,
-            }
-        )).unwrap();
-
-        executor.apply(&ManagementCommand::ReportWorkflowEnded(
-            WorkflowLifecycleData {
-                workflow_id,
-                cluster_id,
-                workflow_type: "test".to_string(),
-                version: 1,
-                timestamp: 200,
-                result_json: Some("{\"result\":\"success\"}".to_string()),
-            }
-        )).unwrap();
-
-        // Verify result is in cache
-        assert_eq!(
-            executor.get_completed_workflow_result(&workflow_id),
-            Some("{\"result\":\"success\"}".to_string())
-        );
-
-        // Create and restore snapshot
-        let snapshot_bytes = executor.create_snapshot(1).unwrap();
-        executor.restore_from_snapshot(&snapshot_bytes).unwrap();
-
-        // TTL cache should still exist (not reset) - this preserves runtime state
-        // but the completed workflow should not be in workflow_locations
-        assert_eq!(executor.get_workflow_location(&workflow_id), None);
-
-        // Note: The cache entry will still be there since we preserve the cache
-        // This is intentional - we don't lose cache data on snapshot restore
-    }
 }

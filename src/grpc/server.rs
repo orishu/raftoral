@@ -223,6 +223,7 @@ impl WorkflowManagement for WorkflowManagementImpl {
         Ok(Response::new(RunWorkflowAsyncResponse {
             success: true,
             workflow_id: workflow_id.to_string(),
+            execution_cluster_id: cluster_id.to_string(),
             error: String::new(),
         }))
     }
@@ -237,23 +238,40 @@ impl WorkflowManagement for WorkflowManagementImpl {
         let node_manager = self.node_manager.as_ref()
             .ok_or_else(|| Status::failed_precondition("NodeManager not configured"))?;
 
-        // Parse workflow ID
+        // Parse workflow ID (validation only, not used in this implementation)
         use uuid::Uuid;
-        let workflow_id = Uuid::parse_str(&req.workflow_id)
+        let _workflow_id_uuid = Uuid::parse_str(&req.workflow_id)
             .map_err(|e| Status::invalid_argument(format!("Invalid workflow_id: {}", e)))?;
+
+        // Parse execution cluster ID (for future routing to correct cluster)
+        let _execution_cluster_id = if !req.execution_cluster_id.is_empty() {
+            Some(Uuid::parse_str(&req.execution_cluster_id)
+                .map_err(|e| Status::invalid_argument(format!("Invalid execution_cluster_id: {}", e)))?)
+        } else {
+            None
+        };
+
+        // TODO Phase 4: Use execution_cluster_id to route to correct cluster
+        // For now, we only have one execution cluster (workflow_cluster)
 
         // Determine timeout (default 60 seconds if 0 or not specified)
         let timeout_seconds = if req.timeout_seconds == 0 { 60 } else { req.timeout_seconds };
         let poll_interval = std::time::Duration::from_millis(100); // Poll every 100ms
         let max_polls = (timeout_seconds as u64 * 1000) / poll_interval.as_millis() as u64;
 
-        // Get management cluster executor for querying state
-        let management_executor = node_manager.management_executor();
+        // Get workflow cluster executor for querying state
+        let workflow_executor = node_manager.workflow_executor();
 
         // Poll for workflow completion
         for _ in 0..max_polls {
-            // Check if workflow result is in cache
-            if let Some(result_json) = management_executor.get_completed_workflow_result(&workflow_id) {
+            // Check if workflow result is available in execution cluster state
+            let result_opt = workflow_executor.get_result(&req.workflow_id);
+
+            if let Some(result_bytes) = result_opt {
+                // Convert result bytes to JSON string
+                let result_json = String::from_utf8(result_bytes)
+                    .map_err(|e| Status::internal(format!("Failed to decode workflow result: {}", e)))?;
+
                 return Ok(Response::new(RunWorkflowResponse {
                     success: true,
                     result_json,
@@ -261,17 +279,7 @@ impl WorkflowManagement for WorkflowManagementImpl {
                 }));
             }
 
-            // Check if workflow is still active
-            if !management_executor.is_workflow_active(&workflow_id) {
-                // Workflow completed but no result in cache (expired or error)
-                return Ok(Response::new(RunWorkflowResponse {
-                    success: false,
-                    result_json: String::new(),
-                    error: "Workflow completed but result not available (may have expired from cache)".to_string(),
-                }));
-            }
-
-            // Still running, sleep and retry
+            // Still running or not yet completed, sleep and retry
             tokio::time::sleep(poll_interval).await;
         }
 

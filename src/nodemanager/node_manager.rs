@@ -52,10 +52,6 @@ impl NodeManager {
 
         // Set cluster references in management executor for dynamic cluster construction
         management_cluster.executor.set_workflow_cluster(workflow_cluster.clone());
-        management_cluster.executor.set_management_cluster(management_cluster.clone());
-
-        // Set management cluster reference in workflow executor for workflow completion reporting
-        workflow_cluster.executor.set_management_cluster(management_cluster.clone());
 
         // Create ClusterRouter and register both clusters
         // This enables multi-cluster routing where:
@@ -85,9 +81,14 @@ impl NodeManager {
         self.workflow_runtime.clone()
     }
 
-    /// Get the management cluster executor for querying workflow state
+    /// Get the management cluster executor for querying cluster state
     pub fn management_executor(&self) -> &ManagementCommandExecutor {
         &self.management_cluster.executor
+    }
+
+    /// Get the workflow cluster executor for querying workflow results
+    pub fn workflow_executor(&self) -> &WorkflowCommandExecutor {
+        &self.workflow_cluster.executor
     }
 
     /// Add a node to the management cluster
