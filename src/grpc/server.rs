@@ -197,8 +197,8 @@ impl WorkflowManagement for WorkflowManagementImpl {
         use uuid::Uuid;
         let workflow_id = Uuid::new_v4();
 
-        // Choose an execution cluster (for now, we only have one: cluster_id=1)
-        let cluster_id = Uuid::from_u128(1); // DEFAULT_EXECUTION_CLUSTER_ID
+        // Choose an execution cluster using round-robin selection
+        let (cluster_id, _selected_cluster) = node_manager.select_execution_cluster_round_robin();
 
         // Create the ScheduleWorkflowStart command
         use crate::nodemanager::*;
@@ -243,24 +243,23 @@ impl WorkflowManagement for WorkflowManagementImpl {
         let _workflow_id_uuid = Uuid::parse_str(&req.workflow_id)
             .map_err(|e| Status::invalid_argument(format!("Invalid workflow_id: {}", e)))?;
 
-        // Parse execution cluster ID (for future routing to correct cluster)
-        let _execution_cluster_id = if !req.execution_cluster_id.is_empty() {
-            Some(Uuid::parse_str(&req.execution_cluster_id)
-                .map_err(|e| Status::invalid_argument(format!("Invalid execution_cluster_id: {}", e)))?)
+        // Parse execution cluster ID and route to correct cluster
+        let execution_cluster_id = if !req.execution_cluster_id.is_empty() {
+            Uuid::parse_str(&req.execution_cluster_id)
+                .map_err(|e| Status::invalid_argument(format!("Invalid execution_cluster_id: {}", e)))?
         } else {
-            None
+            // If no cluster_id provided, use default cluster (for backward compatibility)
+            return Err(Status::invalid_argument("execution_cluster_id is required"));
         };
-
-        // TODO Phase 4: Use execution_cluster_id to route to correct cluster
-        // For now, we only have one execution cluster (workflow_cluster)
 
         // Determine timeout (default 60 seconds if 0 or not specified)
         let timeout_seconds = if req.timeout_seconds == 0 { 60 } else { req.timeout_seconds };
         let poll_interval = std::time::Duration::from_millis(100); // Poll every 100ms
         let max_polls = (timeout_seconds as u64 * 1000) / poll_interval.as_millis() as u64;
 
-        // Get workflow cluster executor for querying state
-        let workflow_executor = node_manager.workflow_executor();
+        // Get the execution cluster executor for querying workflow results
+        let workflow_executor = node_manager.get_execution_cluster_executor(&execution_cluster_id)
+            .ok_or_else(|| Status::not_found(format!("Execution cluster {} not found", execution_cluster_id)))?;
 
         // Poll for workflow completion
         for _ in 0..max_polls {
@@ -336,7 +335,8 @@ pub async fn start_grpc_server_with_config(
     }];
     let transport = Arc::new(GrpcClusterTransport::new(nodes));
 
-    let cluster = node_manager.workflow_cluster.clone();
+    // Use the default execution cluster for the RaftService
+    let cluster = node_manager.get_default_execution_cluster();
     let raft_service = RaftServiceImpl::with_cluster_router(
         transport,
         cluster,

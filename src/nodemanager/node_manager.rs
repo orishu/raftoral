@@ -1,20 +1,31 @@
 ///! NodeManager - owns both management and workflow execution clusters
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::HashMap;
+use uuid::Uuid;
 use crate::raft::RaftCluster;
 use crate::raft::generic::grpc_transport::GrpcClusterTransport;
 use crate::raft::generic::message::Message;
 use crate::workflow::{WorkflowCommand, WorkflowCommandExecutor, WorkflowRuntime};
 use super::{ManagementCommand, ManagementCommandExecutor};
 
+// The default execution cluster ID (for single-cluster deployments)
+const DEFAULT_EXECUTION_CLUSTER_ID: u128 = 1;
+
 /// NodeManager owns both the management cluster and workflow execution cluster(s)
-/// In future milestones, the workflow cluster will become a HashMap for multiple execution clusters
 pub struct NodeManager {
     /// Management cluster - tracks execution cluster membership and workflow lifecycle
     management_cluster: Arc<RaftCluster<ManagementCommandExecutor>>,
 
-    /// Workflow execution cluster (will become a HashMap in future milestones)
-    pub workflow_cluster: Arc<RaftCluster<WorkflowCommandExecutor>>,
+    /// Workflow execution clusters (cluster_id -> cluster)
+    execution_clusters: HashMap<Uuid, Arc<RaftCluster<WorkflowCommandExecutor>>>,
+
+    /// Default execution cluster ID (for backward compatibility)
+    default_execution_cluster_id: Uuid,
+
+    /// Round-robin index for cluster selection
+    round_robin_index: AtomicUsize,
 
     /// Workflow runtime (public API for starting workflows)
     workflow_runtime: Arc<WorkflowRuntime>,
@@ -63,9 +74,16 @@ impl NodeManager {
         router.register_execution_cluster(1, workflow_cluster.local_sender.clone())?;
         let cluster_router = Arc::new(router);
 
+        // Initialize execution clusters HashMap with default cluster
+        let default_cluster_id = Uuid::from_u128(DEFAULT_EXECUTION_CLUSTER_ID);
+        let mut execution_clusters = HashMap::new();
+        execution_clusters.insert(default_cluster_id, workflow_cluster);
+
         Ok(Self {
             management_cluster,
-            workflow_cluster,
+            execution_clusters,
+            default_execution_cluster_id: default_cluster_id,
+            round_robin_index: AtomicUsize::new(0),
             workflow_runtime,
             cluster_router,
         })
@@ -86,9 +104,53 @@ impl NodeManager {
         &self.management_cluster.executor
     }
 
-    /// Get the workflow cluster executor for querying workflow results
+    /// Get the default workflow cluster executor for querying workflow results
+    /// (for backward compatibility - uses default execution cluster)
     pub fn workflow_executor(&self) -> &WorkflowCommandExecutor {
-        &self.workflow_cluster.executor
+        &self.execution_clusters
+            .get(&self.default_execution_cluster_id)
+            .expect("Default execution cluster should always exist")
+            .executor
+    }
+
+    /// Get a specific execution cluster by ID
+    pub fn get_execution_cluster(&self, cluster_id: &Uuid) -> Option<Arc<RaftCluster<WorkflowCommandExecutor>>> {
+        self.execution_clusters.get(cluster_id).cloned()
+    }
+
+    /// Get the default execution cluster
+    pub fn get_default_execution_cluster(&self) -> Arc<RaftCluster<WorkflowCommandExecutor>> {
+        self.execution_clusters
+            .get(&self.default_execution_cluster_id)
+            .expect("Default execution cluster should always exist")
+            .clone()
+    }
+
+    /// Select an execution cluster using round-robin strategy
+    /// Returns (cluster_id, cluster) for the selected cluster
+    pub fn select_execution_cluster_round_robin(&self) -> (Uuid, Arc<RaftCluster<WorkflowCommandExecutor>>) {
+        // Get list of cluster IDs (sorted for deterministic round-robin)
+        let mut cluster_ids: Vec<_> = self.execution_clusters.keys().copied().collect();
+        cluster_ids.sort(); // Ensure consistent ordering
+
+        if cluster_ids.is_empty() {
+            panic!("No execution clusters available");
+        }
+
+        // Round-robin selection
+        let index = self.round_robin_index.fetch_add(1, Ordering::Relaxed);
+        let selected_id = cluster_ids[index % cluster_ids.len()];
+        let selected_cluster = self.execution_clusters
+            .get(&selected_id)
+            .expect("Cluster should exist")
+            .clone();
+
+        (selected_id, selected_cluster)
+    }
+
+    /// Get an execution cluster executor by ID
+    pub fn get_execution_cluster_executor(&self, cluster_id: &Uuid) -> Option<&WorkflowCommandExecutor> {
+        self.execution_clusters.get(cluster_id).map(|cluster| &*cluster.executor)
     }
 
     /// Add a node to the management cluster
@@ -107,9 +169,14 @@ impl NodeManager {
             .map_err(|e| format!("Failed to remove node from management cluster: {}", e))
     }
 
-    /// Get cluster size (workflow cluster for now)
+    /// Get cluster size (default execution cluster for backward compatibility)
     pub fn cluster_size(&self) -> usize {
-        self.workflow_cluster.node_count()
+        self.get_default_execution_cluster().node_count()
+    }
+
+    /// Get all execution cluster IDs
+    pub fn get_execution_cluster_ids(&self) -> Vec<Uuid> {
+        self.execution_clusters.keys().copied().collect()
     }
 
     /// Propose a management command to the management cluster
