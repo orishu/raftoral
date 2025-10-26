@@ -276,7 +276,7 @@ impl RaftoralGrpcRuntime {
         }
 
         info!("Node {} is running", node_id);
-        info!("Cluster size: {} nodes", node_manager.cluster_size());
+        info!("Cluster size: {} nodes", node_manager.total_execution_cluster_nodes());
         info!("Ready to accept workflow registrations");
 
         // Give the cluster a moment to stabilize (especially important for joining nodes)
@@ -309,9 +309,9 @@ impl RaftoralGrpcRuntime {
         &self.advertise_address
     }
 
-    /// Get the current cluster size.
+    /// Get the current cluster size (number of nodes in execution clusters).
     pub fn cluster_size(&self) -> usize {
-        self.node_manager.cluster_size()
+        self.node_manager.total_execution_cluster_nodes()
     }
 
     /// Gracefully shutdown the node.

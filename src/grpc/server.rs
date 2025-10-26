@@ -123,15 +123,25 @@ impl<E: CommandExecutor + Default + 'static> RaftService for RaftServiceImpl<E> 
 pub struct WorkflowManagementImpl {
     runtime: Arc<crate::workflow::WorkflowRuntime>,
     node_manager: Option<Arc<crate::nodemanager::NodeManager>>,
+    /// Request forwarder for proxying requests to other nodes
+    forwarder: Arc<crate::grpc::RequestForwarder>,
 }
 
 impl WorkflowManagementImpl {
     pub fn new(runtime: Arc<crate::workflow::WorkflowRuntime>) -> Self {
-        Self { runtime, node_manager: None }
+        Self {
+            runtime,
+            node_manager: None,
+            forwarder: Arc::new(crate::grpc::RequestForwarder::new()),
+        }
     }
 
     pub fn with_node_manager(runtime: Arc<crate::workflow::WorkflowRuntime>, node_manager: Arc<crate::nodemanager::NodeManager>) -> Self {
-        Self { runtime, node_manager: Some(node_manager) }
+        Self {
+            runtime,
+            node_manager: Some(node_manager),
+            forwarder: Arc::new(crate::grpc::RequestForwarder::new()),
+        }
     }
 }
 
@@ -257,9 +267,54 @@ impl WorkflowManagement for WorkflowManagementImpl {
         let poll_interval = std::time::Duration::from_millis(100); // Poll every 100ms
         let max_polls = (timeout_seconds as u64 * 1000) / poll_interval.as_millis() as u64;
 
-        // Get the execution cluster executor for querying workflow results
-        let workflow_executor = node_manager.get_execution_cluster_executor(&execution_cluster_id)
-            .ok_or_else(|| Status::not_found(format!("Execution cluster {} not found", execution_cluster_id)))?;
+        // Try to get the execution cluster executor locally
+        let workflow_executor = match node_manager.get_execution_cluster_executor(&execution_cluster_id) {
+            Some(executor) => executor,
+            None => {
+                // This node doesn't have the execution cluster
+                // Automatically forward the request to a node that does
+
+                // Query management state to find nodes that have this cluster
+                let management_executor = node_manager.management_executor();
+                let cluster_info = management_executor.get_cluster_info(&execution_cluster_id)
+                    .ok_or_else(|| Status::not_found(format!("Execution cluster {} not found in management state", execution_cluster_id)))?;
+
+                if cluster_info.node_ids.is_empty() {
+                    return Err(Status::not_found(format!("No nodes available for execution cluster {}", execution_cluster_id)));
+                }
+
+                // Get addresses for nodes that have this cluster
+                let node_addresses = node_manager.get_node_addresses(&cluster_info.node_ids);
+
+                if node_addresses.is_empty() {
+                    return Err(Status::internal(format!(
+                        "Found nodes {:?} for cluster {} but no addresses available",
+                        cluster_info.node_ids, execution_cluster_id
+                    )));
+                }
+
+                // Forward request to one of the nodes that has this cluster
+                log::info!(
+                    "Forwarding wait_for_workflow_completion request to nodes with cluster {}: {:?}",
+                    execution_cluster_id, node_addresses
+                );
+
+                return self.forwarder.forward_to_any(
+                    &node_addresses,
+                    |addr| {
+                        let forwarder = self.forwarder.clone();
+                        let req_clone = WaitForWorkflowRequest {
+                            workflow_id: req.workflow_id.clone(),
+                            execution_cluster_id: req.execution_cluster_id.clone(),
+                            timeout_seconds: req.timeout_seconds,
+                        };
+                        async move {
+                            forwarder.forward_wait_for_workflow_completion(&addr, req_clone).await
+                        }
+                    }
+                ).await;
+            }
+        };
 
         // Poll for workflow completion
         for _ in 0..max_polls {
@@ -335,8 +390,11 @@ pub async fn start_grpc_server_with_config(
     }];
     let transport = Arc::new(GrpcClusterTransport::new(nodes));
 
-    // Use the default execution cluster for the RaftService
-    let cluster = node_manager.get_default_execution_cluster();
+    // Use the first available execution cluster for the RaftService
+    // (This is primarily for backward compatibility with single-cluster tests)
+    let initial_cluster_id = uuid::Uuid::from_u128(1); // INITIAL_EXECUTION_CLUSTER_ID
+    let cluster = node_manager.get_execution_cluster(&initial_cluster_id)
+        .expect("Initial execution cluster should exist");
     let raft_service = RaftServiceImpl::with_cluster_router(
         transport,
         cluster,

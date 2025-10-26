@@ -10,8 +10,8 @@ use crate::raft::generic::message::Message;
 use crate::workflow::{WorkflowCommand, WorkflowCommandExecutor, WorkflowRuntime};
 use super::{ManagementCommand, ManagementCommandExecutor};
 
-// The default execution cluster ID (for single-cluster deployments)
-const DEFAULT_EXECUTION_CLUSTER_ID: u128 = 1;
+/// Initial execution cluster ID (cluster_id = 1)
+const INITIAL_EXECUTION_CLUSTER_ID: u128 = 1;
 
 /// NodeManager owns both the management cluster and workflow execution cluster(s)
 pub struct NodeManager {
@@ -21,9 +21,6 @@ pub struct NodeManager {
     /// Workflow execution clusters (cluster_id -> cluster)
     execution_clusters: HashMap<Uuid, Arc<RaftCluster<WorkflowCommandExecutor>>>,
 
-    /// Default execution cluster ID (for backward compatibility)
-    default_execution_cluster_id: Uuid,
-
     /// Round-robin index for cluster selection
     round_robin_index: AtomicUsize,
 
@@ -32,6 +29,9 @@ pub struct NodeManager {
 
     /// ClusterRouter for routing incoming gRPC messages to appropriate clusters
     cluster_router: Arc<crate::grpc::ClusterRouter>,
+
+    /// Transport for accessing node addresses
+    transport: Arc<GrpcClusterTransport>,
 }
 
 impl NodeManager {
@@ -67,25 +67,25 @@ impl NodeManager {
         // Create ClusterRouter and register both clusters
         // This enables multi-cluster routing where:
         // - cluster_id = 0 routes to management cluster
-        // - cluster_id = 1 (default) routes to workflow execution cluster
+        // - cluster_id = 1 routes to initial workflow execution cluster
         use crate::raft::generic::ClusterRouter;
         let mut router = ClusterRouter::new();
         router.register_management_cluster(management_cluster.local_sender.clone());
         router.register_execution_cluster(1, workflow_cluster.local_sender.clone())?;
         let cluster_router = Arc::new(router);
 
-        // Initialize execution clusters HashMap with default cluster
-        let default_cluster_id = Uuid::from_u128(DEFAULT_EXECUTION_CLUSTER_ID);
+        // Initialize execution clusters HashMap with initial cluster
+        let initial_cluster_id = Uuid::from_u128(INITIAL_EXECUTION_CLUSTER_ID);
         let mut execution_clusters = HashMap::new();
-        execution_clusters.insert(default_cluster_id, workflow_cluster);
+        execution_clusters.insert(initial_cluster_id, workflow_cluster);
 
         Ok(Self {
             management_cluster,
             execution_clusters,
-            default_execution_cluster_id: default_cluster_id,
             round_robin_index: AtomicUsize::new(0),
             workflow_runtime,
             cluster_router,
+            transport,
         })
     }
 
@@ -104,26 +104,9 @@ impl NodeManager {
         &self.management_cluster.executor
     }
 
-    /// Get the default workflow cluster executor for querying workflow results
-    /// (for backward compatibility - uses default execution cluster)
-    pub fn workflow_executor(&self) -> &WorkflowCommandExecutor {
-        &self.execution_clusters
-            .get(&self.default_execution_cluster_id)
-            .expect("Default execution cluster should always exist")
-            .executor
-    }
-
     /// Get a specific execution cluster by ID
     pub fn get_execution_cluster(&self, cluster_id: &Uuid) -> Option<Arc<RaftCluster<WorkflowCommandExecutor>>> {
         self.execution_clusters.get(cluster_id).cloned()
-    }
-
-    /// Get the default execution cluster
-    pub fn get_default_execution_cluster(&self) -> Arc<RaftCluster<WorkflowCommandExecutor>> {
-        self.execution_clusters
-            .get(&self.default_execution_cluster_id)
-            .expect("Default execution cluster should always exist")
-            .clone()
     }
 
     /// Select an execution cluster using round-robin strategy
@@ -169,14 +152,26 @@ impl NodeManager {
             .map_err(|e| format!("Failed to remove node from management cluster: {}", e))
     }
 
-    /// Get cluster size (default execution cluster for backward compatibility)
-    pub fn cluster_size(&self) -> usize {
-        self.get_default_execution_cluster().node_count()
+    /// Get the total number of nodes across all execution clusters
+    /// Note: A node may belong to multiple execution clusters
+    pub fn total_execution_cluster_nodes(&self) -> usize {
+        // Return size of first execution cluster, or 0 if none exist
+        // (For initial cluster, this gives us the cluster size)
+        self.execution_clusters
+            .values()
+            .next()
+            .map(|cluster| cluster.node_count())
+            .unwrap_or(0)
     }
 
     /// Get all execution cluster IDs
     pub fn get_execution_cluster_ids(&self) -> Vec<Uuid> {
         self.execution_clusters.keys().copied().collect()
+    }
+
+    /// Get node addresses for a list of node IDs
+    pub fn get_node_addresses(&self, node_ids: &[u64]) -> Vec<String> {
+        self.transport.get_node_addresses_sync(node_ids)
     }
 
     /// Propose a management command to the management cluster

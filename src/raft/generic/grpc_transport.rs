@@ -259,6 +259,14 @@ impl GrpcClusterTransport
     pub fn get_discovered_voters(&self) -> Vec<u64> {
         self.discovered_voters.read().unwrap().clone()
     }
+
+    /// Get addresses for multiple nodes (synchronous version for convenience)
+    pub fn get_node_addresses_sync(&self, node_ids: &[u64]) -> Vec<String> {
+        let nodes = self.nodes.read().unwrap();
+        node_ids.iter()
+            .filter_map(|id| nodes.get(id).map(|config| config.address.clone()))
+            .collect()
+    }
 }
 
 // Phase 3: All methods now work with GenericMessage
