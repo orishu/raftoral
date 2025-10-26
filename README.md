@@ -82,6 +82,51 @@ Raftoral uses Raft consensus to coordinate workflow execution across a cluster o
 - **Fault Tolerance**: Any node can complete a workflow if the leader fails
 - **No External Dependencies**: Everything runs in your application process
 
+### Multi-Cluster Scalability
+
+For large deployments (20+ nodes), Raftoral uses a **two-tier architecture** to prevent checkpoint replication from overwhelming the cluster:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│         Management Cluster (cluster_id = 0)              │
+│   Tracks topology & coordinates multiple exec clusters   │
+│         Voters: 3-5 nodes  |  Learners: N nodes          │
+└─────────────────────────────────────────────────────────┘
+                          │
+         ┌────────────────┼────────────────┐
+         │                │                │
+┌─────────────┐   ┌─────────────┐   ┌─────────────┐
+│ Exec Cluster│   │ Exec Cluster│   │ Exec Cluster│
+│   (ID: 1)   │   │   (ID: 2)   │   │   (ID: 3)   │
+│  5 nodes    │   │  5 nodes    │   │  5 nodes    │
+│ ┌─────────┐ │   │ ┌─────────┐ │   │ ┌─────────┐ │
+│ │Workflows│ │   │ │Workflows│ │   │ │Workflows│ │
+│ │ + Chkpts│ │   │ │ + Chkpts│ │   │ │ + Chkpts│ │
+│ └─────────┘ │   │ └─────────┘ │   │ └─────────┘ │
+└─────────────┘   └─────────────┘   └─────────────┘
+```
+
+**How It Works:**
+- **Management Cluster**: Tracks which nodes belong to which execution clusters (O(N×C) state)
+- **Execution Clusters**: Small clusters (3-5 nodes) that execute workflows independently
+- **Round-Robin Selection**: Workflows distributed across execution clusters for load balancing
+- **No Global Workflow Tracking**: Execution clusters own their workflows (no O(W) state in management)
+- **Request Forwarding**: Automatic forwarding of queries to nodes with the target execution cluster
+
+**Scalability Benefits:**
+```
+Single 50-node cluster:
+  - Checkpoint replication: 50x per checkpoint
+  - State: O(W) workflows tracked globally
+
+Multi-cluster (10 exec clusters × 5 nodes):
+  - Checkpoint replication: 5x per checkpoint  (10x reduction!)
+  - State: O(C×N) clusters×nodes  (massive reduction for high workflow count)
+  - Each node in ~2-3 execution clusters
+```
+
+**See [docs/SCALABILITY_ARCHITECTURE.md](docs/SCALABILITY_ARCHITECTURE.md) for detailed architecture.**
+
 ### Checkpoints & Replicated Variables vs. Temporal "Activities"
 
 If you're familiar with Temporal, Raftoral's **checkpoints** serve a similar purpose to **Activities**, but with a different philosophy:
@@ -534,31 +579,41 @@ let result = run.wait_for_completion().await?;
 ```
 src/
 ├── raft/generic/
-│   ├── cluster.rs        # RaftCluster coordination
-│   ├── node.rs           # RaftNode raft-rs integration
-│   ├── transport.rs      # Transport abstraction
-│   ├── grpc_transport.rs # gRPC implementation
-│   └── message.rs        # Message types
+│   ├── cluster.rs         # RaftCluster coordination
+│   ├── node.rs            # RaftNode raft-rs integration
+│   ├── transport.rs       # Transport abstraction
+│   ├── grpc_transport.rs  # gRPC implementation
+│   ├── message.rs         # Message types
+│   └── cluster_router.rs  # Multi-cluster message routing
 ├── workflow/
-│   ├── commands.rs       # WorkflowCommand definitions
-│   ├── executor.rs       # Command application
-│   ├── runtime.rs        # WorkflowRuntime API
-│   ├── context.rs        # WorkflowContext helpers
-│   ├── registry.rs       # Type-safe workflow storage
-│   ├── replicated_var.rs # Checkpoint variables
-│   └── snapshot.rs       # Snapshot structures
+│   ├── commands.rs        # WorkflowCommand definitions
+│   ├── executor.rs        # Command application
+│   ├── runtime.rs         # WorkflowRuntime API
+│   ├── context.rs         # WorkflowContext helpers
+│   ├── registry.rs        # Type-safe workflow storage
+│   ├── replicated_var.rs  # Checkpoint variables
+│   └── snapshot.rs        # Snapshot structures
+├── nodemanager/
+│   ├── node_manager.rs       # Owns management + execution clusters
+│   ├── management_command.rs # Management cluster commands
+│   └── management_executor.rs# Management state & execution
 ├── runtime/
-│   └── grpc.rs           # RaftoralGrpcRuntime high-level API
+│   └── grpc.rs            # RaftoralGrpcRuntime high-level API
 ├── grpc/
-│   ├── server.rs         # gRPC service implementation
-│   ├── client.rs         # gRPC client helpers
-│   └── bootstrap.rs      # Peer discovery
-└── lib.rs                # Public API exports
+│   ├── server.rs          # gRPC service implementation
+│   ├── client.rs          # gRPC client helpers
+│   ├── bootstrap.rs       # Peer discovery
+│   └── forwarding.rs      # Request forwarding to other nodes
+└── lib.rs                 # Public API exports
 
 examples/
 ├── checkpoint_macro_demo.rs  # Demonstrates checkpoint! and checkpoint_compute!
 ├── simple_runtime.rs         # Production-style gRPC usage
 └── grpc_workflow_client.rs   # External client example
+
+docs/
+├── SCALABILITY_ARCHITECTURE.md  # Multi-cluster architecture details
+└── COMPARISON.md                # Raftoral vs Temporal vs DBOS
 ```
 
 ## Contributing
