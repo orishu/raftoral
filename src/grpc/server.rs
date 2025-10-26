@@ -199,7 +199,7 @@ impl WorkflowManagement for WorkflowManagementImpl {
     ) -> Result<Response<RunWorkflowAsyncResponse>, Status> {
         let req = request.into_inner();
 
-        // We need the node_manager to propose to the management cluster
+        // We need the node_manager to select an execution cluster
         let node_manager = self.node_manager.as_ref()
             .ok_or_else(|| Status::failed_precondition("NodeManager not configured for async workflows"))?;
 
@@ -208,27 +208,25 @@ impl WorkflowManagement for WorkflowManagementImpl {
         let workflow_id = Uuid::new_v4();
 
         // Choose an execution cluster using round-robin selection
-        let (cluster_id, _selected_cluster) = node_manager.select_execution_cluster_round_robin();
+        let (cluster_id, selected_cluster) = node_manager.select_execution_cluster_round_robin();
 
-        // Create the ScheduleWorkflowStart command
-        use crate::nodemanager::*;
-        let schedule_command = ManagementCommand::ScheduleWorkflowStart(ScheduleWorkflowData {
-            workflow_id,
-            cluster_id,
+        // Propose WorkflowStart directly to the execution cluster
+        use crate::workflow::commands::*;
+
+        // Convert JSON input to bytes
+        let input_bytes: Vec<u8> = req.input_json.into_bytes();
+
+        let workflow_command = WorkflowCommand::WorkflowStart(WorkflowStartData {
+            workflow_id: workflow_id.to_string(),
             workflow_type: req.workflow_type,
             version: req.version,
-            input_json: req.input_json,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+            input: input_bytes,
+            owner_node_id: selected_cluster.node_id(),
         });
 
-        // Propose the ScheduleWorkflowStart command to the management cluster
-        // This will be applied by all management nodes, but only the leader of the
-        // execution cluster will actually propose the WorkflowStart command
-        node_manager.propose_management_command(schedule_command).await
-            .map_err(|e| Status::internal(format!("Failed to schedule workflow: {}", e)))?;
+        // Propose directly to the execution cluster (no management consensus needed)
+        selected_cluster.propose_and_sync(workflow_command).await
+            .map_err(|e| Status::internal(format!("Failed to start workflow: {}", e)))?;
 
         Ok(Response::new(RunWorkflowAsyncResponse {
             success: true,

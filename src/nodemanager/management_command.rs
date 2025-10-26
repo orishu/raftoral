@@ -19,10 +19,6 @@ pub enum ManagementCommand {
     /// Disassociate a node from an execution cluster
     DisassociateNode(DisassociateNodeData),
 
-    /// Schedule a workflow to start on an execution cluster
-    /// Management nodes that are part of the execution cluster will propose WorkflowStart
-    ScheduleWorkflowStart(ScheduleWorkflowData),
-
     /// Change a node's role (voter/learner) in the management cluster
     ChangeNodeRole(ChangeNodeRoleData),
 }
@@ -45,16 +41,6 @@ pub struct AssociateNodeData {
 pub struct DisassociateNodeData {
     pub cluster_id: Uuid,
     pub node_id: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ScheduleWorkflowData {
-    pub workflow_id: Uuid,
-    pub cluster_id: Uuid,
-    pub workflow_type: String,
-    pub version: u32,
-    pub input_json: String,  // JSON-serialized input for the workflow
-    pub timestamp: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

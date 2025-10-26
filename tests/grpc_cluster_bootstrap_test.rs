@@ -5,6 +5,10 @@ use raftoral::nodemanager::NodeManager;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+// Initial execution cluster ID (matches INITIAL_EXECUTION_CLUSTER_ID in NodeManager)
+const INITIAL_EXECUTION_CLUSTER_ID: u128 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ConcatInput {
@@ -34,7 +38,8 @@ async fn test_three_node_grpc_cluster_bootstrap() {
 
     // Phase 3: Use NodeManager
     let node_manager1 = Arc::new(NodeManager::new(transport1.clone(), 1).await.expect("Should create node manager 1"));
-    let cluster1 = node_manager1.workflow_cluster.clone();
+    let cluster1 = node_manager1.get_execution_cluster(&Uuid::from_u128(INITIAL_EXECUTION_CLUSTER_ID))
+        .expect("Should have initial execution cluster");
     let runtime1 = node_manager1.workflow_runtime();
 
     let server1 = start_grpc_server(
@@ -80,7 +85,8 @@ async fn test_three_node_grpc_cluster_bootstrap() {
 
     // Phase 3: Use NodeManager
     let node_manager2 = Arc::new(NodeManager::new(transport2.clone(), 2).await.expect("Should create node manager 2"));
-    let cluster2 = node_manager2.workflow_cluster.clone();
+    let cluster2 = node_manager2.get_execution_cluster(&Uuid::from_u128(INITIAL_EXECUTION_CLUSTER_ID))
+        .expect("Should have initial execution cluster");
     let runtime2 = node_manager2.workflow_runtime();
 
     let server2 = start_grpc_server(
@@ -137,7 +143,8 @@ async fn test_three_node_grpc_cluster_bootstrap() {
 
     // Phase 3: Use NodeManager
     let node_manager3 = Arc::new(NodeManager::new(transport3.clone(), 3).await.expect("Should create node manager 3"));
-    let cluster3 = node_manager3.workflow_cluster.clone();
+    let cluster3 = node_manager3.get_execution_cluster(&Uuid::from_u128(INITIAL_EXECUTION_CLUSTER_ID))
+        .expect("Should have initial execution cluster");
     let runtime3 = node_manager3.workflow_runtime();
 
     let server3 = start_grpc_server(

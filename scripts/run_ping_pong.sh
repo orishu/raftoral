@@ -50,17 +50,24 @@ RESPONSE=$(grpcurl \
 
 echo "$RESPONSE"
 
-# Extract workflow_id from response (note: JSON uses camelCase workflowId)
+# Extract workflow_id and execution_cluster_id from response (note: JSON uses camelCase)
 WORKFLOW_ID=$(echo "$RESPONSE" | grep -o '"workflowId": *"[^"]*"' | cut -d'"' -f4)
+EXECUTION_CLUSTER_ID=$(echo "$RESPONSE" | grep -o '"executionClusterId": *"[^"]*"' | cut -d'"' -f4)
 
 if [ -z "$WORKFLOW_ID" ]; then
     echo "Error: Failed to get workflow_id from response"
     exit 1
 fi
 
+if [ -z "$EXECUTION_CLUSTER_ID" ]; then
+    echo "Error: Failed to get execution_cluster_id from response"
+    exit 1
+fi
+
 echo ""
 echo "Step 2: Waiting for workflow completion..."
 echo "Workflow ID: $WORKFLOW_ID"
+echo "Execution Cluster ID: $EXECUTION_CLUSTER_ID"
 echo ""
 
 # Step 2: Wait for workflow completion
@@ -68,6 +75,7 @@ grpcurl \
     -plaintext \
     -d "{
         \"workflow_id\": \"$WORKFLOW_ID\",
+        \"execution_cluster_id\": \"$EXECUTION_CLUSTER_ID\",
         \"timeout_seconds\": 30
     }" \
     "$NODE_ADDRESS" \

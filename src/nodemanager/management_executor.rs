@@ -7,11 +7,7 @@ use uuid::Uuid;
 
 use crate::raft::generic::message::CommandExecutor;
 use crate::raft::RaftCluster;
-use crate::workflow::WorkflowCommandExecutor;
-use super::management_command::{ManagementCommand, AssociateNodeData, DisassociateNodeData};
-
-// The default execution cluster ID (for the single execution cluster that mirrors management cluster)
-const DEFAULT_EXECUTION_CLUSTER_ID: u128 = 1;
+use super::management_command::ManagementCommand;
 
 /// Serializable snapshot of management state
 /// Used for Raft snapshots
@@ -69,7 +65,6 @@ pub struct ExecutionClusterInfo {
 /// Executor for management cluster commands
 pub struct ManagementCommandExecutor {
     state: Arc<Mutex<ManagementState>>,
-    workflow_cluster: Mutex<Option<Arc<RaftCluster<WorkflowCommandExecutor>>>>,
     management_cluster: Mutex<Option<Arc<RaftCluster<ManagementCommandExecutor>>>>,
     logger: slog::Logger,
 }
@@ -80,7 +75,6 @@ impl ManagementCommandExecutor {
         let logger = slog::Logger::root(slog::Discard, slog::o!());
         Self {
             state: Arc::new(Mutex::new(ManagementState::default())),
-            workflow_cluster: Mutex::new(None),
             management_cluster: Mutex::new(None),
             logger,
         }
@@ -90,15 +84,9 @@ impl ManagementCommandExecutor {
     pub fn with_logger(logger: slog::Logger) -> Self {
         Self {
             state: Arc::new(Mutex::new(ManagementState::default())),
-            workflow_cluster: Mutex::new(None),
             management_cluster: Mutex::new(None),
             logger,
         }
-    }
-
-    /// Set the workflow cluster reference (called after construction)
-    pub fn set_workflow_cluster(&self, cluster: Arc<RaftCluster<WorkflowCommandExecutor>>) {
-        *self.workflow_cluster.lock().unwrap() = Some(cluster);
     }
 
     /// Set the management cluster reference (called after construction)
@@ -251,73 +239,6 @@ impl CommandExecutor for ManagementCommandExecutor {
                 }
             }
 
-            ManagementCommand::ScheduleWorkflowStart(data) => {
-                slog::info!(self.logger, "Scheduling workflow start";
-                    "workflow_id" => %data.workflow_id,
-                    "cluster_id" => %data.cluster_id,
-                    "workflow_type" => &data.workflow_type,
-                    "version" => data.version
-                );
-
-                // Drop the state lock before async operations
-                drop(state);
-
-                // Only nodes that are leaders of the execution cluster propose WorkflowStart
-                // Check if this node is part of the target execution cluster
-                let workflow_cluster = self.workflow_cluster.lock().unwrap().clone();
-                if let Some(cluster) = workflow_cluster {
-                    // Only proceed if we're the leader of the execution cluster
-                    // This uses cluster_id matching - we assume workflow_cluster is cluster_id=1
-                    // In the future with multiple execution clusters, we'll need to look up the right cluster
-                    if data.cluster_id == Uuid::from_u128(DEFAULT_EXECUTION_CLUSTER_ID) {
-                        let logger_clone = self.logger.clone();
-                        let workflow_id_clone = data.workflow_id;
-                        let workflow_type_clone = data.workflow_type.clone();
-                        let version = data.version;
-                        let input_json = data.input_json.clone();
-
-                        tokio::spawn(async move {
-                            // Check if we're the leader before proposing
-                            if !cluster.is_leader().await {
-                                slog::debug!(logger_clone, "Not leader of execution cluster, skipping WorkflowStart proposal";
-                                    "workflow_id" => %workflow_id_clone);
-                                return;
-                            }
-
-                            slog::info!(logger_clone, "Proposing WorkflowStart to execution cluster";
-                                "workflow_id" => %workflow_id_clone,
-                                "workflow_type" => &workflow_type_clone);
-
-                            // Propose WorkflowStart command to the execution cluster
-                            use crate::workflow::commands::*;
-
-                            // Deserialize input from JSON
-                            let input_bytes: Vec<u8> = input_json.into_bytes();
-
-                            let workflow_command = WorkflowCommand::WorkflowStart(WorkflowStartData {
-                                workflow_id: workflow_id_clone.to_string(),
-                                workflow_type: workflow_type_clone.clone(),
-                                version,
-                                input: input_bytes,
-                                owner_node_id: cluster.node_id(),  // This node becomes the owner
-                            });
-
-                            match cluster.propose_and_sync(workflow_command).await {
-                                Ok(_) => {
-                                    slog::info!(logger_clone, "Successfully proposed WorkflowStart";
-                                        "workflow_id" => %workflow_id_clone);
-                                },
-                                Err(e) => {
-                                    slog::error!(logger_clone, "Failed to propose WorkflowStart";
-                                        "workflow_id" => %workflow_id_clone,
-                                        "error" => %e);
-                                }
-                            }
-                        });
-                    }
-                }
-            }
-
             ManagementCommand::ChangeNodeRole(data) => {
                 slog::info!(self.logger, "Changing node role";
                     "node_id" => data.node_id,
@@ -341,113 +262,20 @@ impl CommandExecutor for ManagementCommandExecutor {
         slog::info!(self.logger, "Management cluster detected node addition";
                    "node_id" => added_node_id, "address" => address, "is_leader" => is_leader);
 
-        // Only the leader should modify the execution cluster and propose state changes
-        if !is_leader {
-            slog::debug!(self.logger, "Not leader, skipping execution cluster modification");
-            return;
-        }
-
-        // 1. Propose AssociateNode command to management cluster (for state tracking)
-        let management_cluster = self.management_cluster.lock().unwrap().clone();
-        if let Some(mgmt_cluster) = management_cluster {
-            let cluster_id = Uuid::from_u128(DEFAULT_EXECUTION_CLUSTER_ID);
-            let command = ManagementCommand::AssociateNode(AssociateNodeData {
-                cluster_id,
-                node_id: added_node_id,
-            });
-
-            let logger_clone = self.logger.clone();
-            let mgmt_cluster_clone = mgmt_cluster.clone();
-            tokio::spawn(async move {
-                match mgmt_cluster_clone.propose_and_sync(command).await {
-                    Ok(_) => {
-                        slog::info!(logger_clone, "Proposed AssociateNode to management cluster";
-                                   "node_id" => added_node_id, "cluster_id" => %cluster_id);
-                    }
-                    Err(e) => {
-                        slog::error!(logger_clone, "Failed to propose AssociateNode";
-                                    "node_id" => added_node_id, "error" => %e);
-                    }
-                }
-            });
-        }
-
-        // 2. Add node to workflow (execution) cluster
-        let workflow_cluster = self.workflow_cluster.lock().unwrap().clone();
-        if let Some(cluster) = workflow_cluster {
-            let address_clone = address.to_string();
-            let logger_clone = self.logger.clone();
-            tokio::spawn(async move {
-                match cluster.add_node(added_node_id, address_clone.clone()).await {
-                    Ok(_) => {
-                        slog::info!(logger_clone, "Successfully added node to workflow cluster";
-                                   "node_id" => added_node_id, "address" => &address_clone);
-                    }
-                    Err(e) => {
-                        slog::error!(logger_clone, "Failed to add node to workflow cluster";
-                                    "node_id" => added_node_id, "error" => %e);
-                    }
-                }
-            });
-        } else {
-            slog::warn!(self.logger, "Workflow cluster reference not set");
-        }
+        // Note: With multiple execution clusters, we no longer automatically sync
+        // execution cluster membership with management cluster membership.
+        // Execution clusters are managed explicitly through CreateExecutionCluster
+        // and AssociateNode/DisassociateNode commands.
     }
 
     fn on_node_removed(&self, removed_node_id: u64, is_leader: bool) {
         slog::info!(self.logger, "Management cluster detected node removal";
                    "node_id" => removed_node_id, "is_leader" => is_leader);
 
-        // Only the leader should modify the execution cluster and propose state changes
-        if !is_leader {
-            slog::debug!(self.logger, "Not leader, skipping execution cluster modification");
-            return;
-        }
-
-        // 1. Propose DisassociateNode command to management cluster (for state tracking)
-        let management_cluster = self.management_cluster.lock().unwrap().clone();
-        if let Some(mgmt_cluster) = management_cluster {
-            let cluster_id = Uuid::from_u128(DEFAULT_EXECUTION_CLUSTER_ID);
-            let command = ManagementCommand::DisassociateNode(DisassociateNodeData {
-                cluster_id,
-                node_id: removed_node_id,
-            });
-
-            let logger_clone = self.logger.clone();
-            let mgmt_cluster_clone = mgmt_cluster.clone();
-            tokio::spawn(async move {
-                match mgmt_cluster_clone.propose_and_sync(command).await {
-                    Ok(_) => {
-                        slog::info!(logger_clone, "Proposed DisassociateNode to management cluster";
-                                   "node_id" => removed_node_id, "cluster_id" => %cluster_id);
-                    }
-                    Err(e) => {
-                        slog::error!(logger_clone, "Failed to propose DisassociateNode";
-                                    "node_id" => removed_node_id, "error" => %e);
-                    }
-                }
-            });
-        }
-
-        // 2. Remove node from workflow (execution) cluster
-        let workflow_cluster = self.workflow_cluster.lock().unwrap().clone();
-        if let Some(cluster) = workflow_cluster {
-            let logger_clone = self.logger.clone();
-            tokio::spawn(async move {
-                match cluster.remove_node(removed_node_id).await {
-                    Ok(_) => {
-                        slog::info!(logger_clone, "Successfully removed node from workflow cluster";
-                                   "node_id" => removed_node_id);
-                    }
-                    Err(e) => {
-                        slog::error!(logger_clone, "Failed to remove node from workflow cluster";
-                                    "node_id" => removed_node_id, "error" => %e);
-                    }
-                }
-            });
-        } else {
-            slog::warn!(self.logger, "Workflow cluster reference not set");
-        }
+        // Note: With multiple execution clusters, we no longer automatically sync
+        // execution cluster membership with management cluster membership.
+        // Execution clusters are managed explicitly through CreateExecutionCluster
+        // and AssociateNode/DisassociateNode commands.
     }
 
     fn create_snapshot(&self, snapshot_index: u64) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
