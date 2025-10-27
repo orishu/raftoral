@@ -410,7 +410,7 @@ where
         &self,
         target_node_id: u64,
         message: Message<C>,
-        cluster_id: u64,
+        cluster_id: u32,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Phase 3: Serialize Message<C> → GenericMessage at the transport boundary
         // Include cluster_id for proper routing on the receiving end

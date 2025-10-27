@@ -3,7 +3,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::raft::generic::message::{CommandExecutor, Message};
 use crate::raft::generic::transport::TransportInteraction;
@@ -16,20 +15,20 @@ use super::management_command::ManagementCommand;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ManagementStateSnapshot {
     /// All execution clusters
-    pub execution_clusters: HashMap<Uuid, ExecutionClusterInfo>,
+    pub execution_clusters: HashMap<u32, ExecutionClusterInfo>,
 
     /// Node membership: node_id → set of execution cluster IDs
-    pub node_memberships: HashMap<u64, HashSet<Uuid>>,
+    pub node_memberships: HashMap<u64, HashSet<u32>>,
 }
 
 /// State maintained by the management cluster
 #[derive(Clone, Debug)]
 pub struct ManagementState {
     /// All execution clusters
-    pub execution_clusters: HashMap<Uuid, ExecutionClusterInfo>,
+    pub execution_clusters: HashMap<u32, ExecutionClusterInfo>,
 
     /// Node membership: node_id → set of execution cluster IDs
-    pub node_memberships: HashMap<u64, HashSet<Uuid>>,
+    pub node_memberships: HashMap<u64, HashSet<u32>>,
 }
 
 impl ManagementState {
@@ -59,7 +58,7 @@ impl Default for ManagementState {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecutionClusterInfo {
-    pub cluster_id: Uuid,
+    pub cluster_id: u32,
     pub node_ids: Vec<u64>,
     pub created_at: u64,
 }
@@ -72,7 +71,7 @@ pub struct ManagementCommandExecutor {
 
     // Shared state for creating execution clusters dynamically
     // This Arc is shared with NodeManager so both can access the same HashMap
-    execution_clusters: Mutex<Option<Arc<Mutex<HashMap<Uuid, Arc<RaftCluster<WorkflowCommandExecutor>>>>>>>,
+    execution_clusters: Mutex<Option<Arc<Mutex<HashMap<u32, Arc<RaftCluster<WorkflowCommandExecutor>>>>>>>,
     transport: Mutex<Option<Arc<crate::raft::generic::grpc_transport::GrpcClusterTransport>>>,
     cluster_router: Mutex<Option<Arc<crate::grpc::ClusterRouter>>>,
     node_id: Mutex<Option<u64>>,
@@ -115,7 +114,7 @@ impl ManagementCommandExecutor {
     /// The execution_clusters HashMap passed here is shared with NodeManager
     pub fn set_dependencies(
         &self,
-        execution_clusters: Arc<Mutex<HashMap<Uuid, Arc<RaftCluster<WorkflowCommandExecutor>>>>>,
+        execution_clusters: Arc<Mutex<HashMap<u32, Arc<RaftCluster<WorkflowCommandExecutor>>>>>,
         transport: Arc<crate::raft::generic::grpc_transport::GrpcClusterTransport>,
         cluster_router: Arc<crate::grpc::ClusterRouter>,
         node_id: u64,
@@ -131,7 +130,7 @@ impl ManagementCommandExecutor {
     }
 
     /// Get information about a specific execution cluster
-    pub fn get_cluster_info(&self, cluster_id: &Uuid) -> Option<ExecutionClusterInfo> {
+    pub fn get_cluster_info(&self, cluster_id: &u32) -> Option<ExecutionClusterInfo> {
         self.state.lock().unwrap().execution_clusters.get(cluster_id).cloned()
     }
 
@@ -145,7 +144,7 @@ impl ManagementCommandExecutor {
     }
 
     /// Get all execution clusters that a node is a member of
-    pub fn get_node_clusters(&self, node_id: u64) -> Vec<Uuid> {
+    pub fn get_node_clusters(&self, node_id: u64) -> Vec<u32> {
         self.state.lock().unwrap()
             .node_memberships
             .get(&node_id)
@@ -154,7 +153,7 @@ impl ManagementCommandExecutor {
     }
 
     /// Find an execution cluster that includes the given node
-    pub fn find_cluster_with_node(&self, node_id: u64) -> Option<Uuid> {
+    pub fn find_cluster_with_node(&self, node_id: u64) -> Option<u32> {
         let state = self.state.lock().unwrap();
         state.node_memberships
             .get(&node_id)
@@ -231,13 +230,12 @@ impl CommandExecutor for ManagementCommandExecutor {
                 // Spawn async task to create the actual RaftCluster
                 // This avoids blocking the apply() method
                 tokio::spawn(async move {
-                    let cluster_id_u64 = cluster_id.as_u128() as u64;
                     let executor = WorkflowCommandExecutor::default();
 
                     // Create transport reference
                     let transport_ref: Arc<dyn crate::raft::generic::transport::TransportInteraction<crate::raft::generic::message::Message<crate::workflow::WorkflowCommand>>> = transport.clone();
 
-                    match RaftCluster::new(node_id, cluster_id_u64, transport_ref, executor).await {
+                    match RaftCluster::new(node_id, cluster_id, transport_ref, executor).await {
                         Ok(cluster) => {
                             let cluster = Arc::new(cluster);
 
@@ -246,7 +244,7 @@ impl CommandExecutor for ManagementCommandExecutor {
                             cluster.executor.set_runtime(workflow_runtime);
 
                             // Register cluster in ClusterRouter
-                            if let Err(e) = cluster_router.register_execution_cluster(cluster_id_u64, cluster.local_sender.clone()) {
+                            if let Err(e) = cluster_router.register_execution_cluster(cluster_id, cluster.local_sender.clone()) {
                                 slog::error!(logger, "Failed to register execution cluster in router"; "error" => %e);
                                 return;
                             }
@@ -434,7 +432,7 @@ impl CommandExecutor for ManagementCommandExecutor {
         };
 
         // Default execution cluster ID
-        let default_cluster_id = uuid::Uuid::from_u128(1);
+        let default_cluster_id = 1u32;
 
         // Check if default execution cluster exists
         let cluster_exists = {

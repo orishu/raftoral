@@ -20,7 +20,7 @@ pub struct ClusterRouter {
     management_sender: Option<mpsc::UnboundedSender<Message<ManagementCommand>>>,
 
     /// Execution cluster senders (cluster_id != 0)
-    execution_senders: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<Message<WorkflowCommand>>>>>,
+    execution_senders: Arc<RwLock<HashMap<u32, mpsc::UnboundedSender<Message<WorkflowCommand>>>>>,
 }
 
 impl ClusterRouter {
@@ -43,7 +43,7 @@ impl ClusterRouter {
     /// Register an execution cluster sender with a specific cluster_id
     pub fn register_execution_cluster(
         &self,
-        cluster_id: u64,
+        cluster_id: u32,
         sender: mpsc::UnboundedSender<Message<WorkflowCommand>>,
     ) -> Result<(), String> {
         if cluster_id == 0 {
@@ -60,7 +60,7 @@ impl ClusterRouter {
     }
 
     /// Unregister an execution cluster
-    pub fn unregister_execution_cluster(&self, cluster_id: u64) -> Result<(), String> {
+    pub fn unregister_execution_cluster(&self, cluster_id: u32) -> Result<(), String> {
         if cluster_id == 0 {
             return Err("Cannot unregister management cluster through this method".to_string());
         }
@@ -121,7 +121,7 @@ impl ClusterRouter {
     }
 
     /// Get list of registered execution cluster IDs
-    pub fn execution_cluster_ids(&self) -> Vec<u64> {
+    pub fn execution_cluster_ids(&self) -> Vec<u32> {
         self.execution_senders.read().unwrap().keys().copied().collect()
     }
 }

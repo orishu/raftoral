@@ -269,7 +269,7 @@ impl WorkflowManagement for WorkflowManagementImpl {
 
         // Parse execution cluster ID and route to correct cluster
         let execution_cluster_id = if !req.execution_cluster_id.is_empty() {
-            Uuid::parse_str(&req.execution_cluster_id)
+            req.execution_cluster_id.parse::<u32>()
                 .map_err(|e| Status::invalid_argument(format!("Invalid execution_cluster_id: {}", e)))?
         } else {
             // If no cluster_id provided, use default cluster (for backward compatibility)

@@ -2,7 +2,6 @@
 ///! and tracking workflow lifecycle across the deployment.
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 /// Commands for the management cluster
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -23,23 +22,23 @@ pub enum ManagementCommand {
     ChangeNodeRole(ChangeNodeRoleData),
 }
 
-pub type ExecutionClusterId = Uuid;
+pub type ExecutionClusterId = u32;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CreateExecutionClusterData {
-    pub cluster_id: Uuid,
+    pub cluster_id: u32,
     pub initial_node_ids: Vec<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AssociateNodeData {
-    pub cluster_id: Uuid,
+    pub cluster_id: u32,
     pub node_id: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DisassociateNodeData {
-    pub cluster_id: Uuid,
+    pub cluster_id: u32,
     pub node_id: u64,
 }
 

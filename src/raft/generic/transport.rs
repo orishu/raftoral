@@ -27,7 +27,7 @@ where
         &self,
         target_node_id: u64,
         message: M,
-        cluster_id: u64,
+        cluster_id: u32,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
     /// Get list of all known node IDs
@@ -140,7 +140,7 @@ where
         &self,
         target_node_id: u64,
         message: M,
-        _cluster_id: u64,  // In-memory transport doesn't use cluster_id (single process)
+        _cluster_id: u32,  // In-memory transport doesn't use cluster_id (single process)
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let senders = self.node_senders.read().unwrap();
         let sender = senders.get(&target_node_id)

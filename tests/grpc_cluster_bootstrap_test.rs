@@ -5,10 +5,9 @@ use raftoral::nodemanager::NodeManager;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 // Initial execution cluster ID (matches INITIAL_EXECUTION_CLUSTER_ID in NodeManager)
-const INITIAL_EXECUTION_CLUSTER_ID: u128 = 1;
+const INITIAL_EXECUTION_CLUSTER_ID: u32 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ConcatInput {
@@ -38,9 +37,13 @@ async fn test_three_node_grpc_cluster_bootstrap() {
 
     // Phase 3: Use NodeManager
     let node_manager1 = Arc::new(NodeManager::new(transport1.clone(), 1).await.expect("Should create node manager 1"));
-    let cluster1 = node_manager1.get_execution_cluster(&Uuid::from_u128(INITIAL_EXECUTION_CLUSTER_ID))
+
+    // Initialize the default execution cluster
+    node_manager1.initialize_default_cluster().await.expect("Should initialize default cluster");
+    sleep(Duration::from_millis(500)).await; // Wait for async cluster creation
+
+    let cluster1 = node_manager1.get_execution_cluster(&INITIAL_EXECUTION_CLUSTER_ID)
         .expect("Should have initial execution cluster");
-    let runtime1 = node_manager1.workflow_runtime();
 
     let server1 = start_grpc_server(
         addr1.clone(),
@@ -83,11 +86,8 @@ async fn test_three_node_grpc_cluster_bootstrap() {
     // Give time for gRPC client to be created
     sleep(Duration::from_millis(100)).await;
 
-    // Phase 3: Use NodeManager
+    // Phase 3: Use NodeManager (node 2 will join existing cluster, no need to initialize)
     let node_manager2 = Arc::new(NodeManager::new(transport2.clone(), 2).await.expect("Should create node manager 2"));
-    let cluster2 = node_manager2.get_execution_cluster(&Uuid::from_u128(INITIAL_EXECUTION_CLUSTER_ID))
-        .expect("Should have initial execution cluster");
-    let runtime2 = node_manager2.workflow_runtime();
 
     let server2 = start_grpc_server(
         addr2.clone(),
@@ -101,13 +101,17 @@ async fn test_three_node_grpc_cluster_bootstrap() {
     // Add node 2 to the cluster via node 1 (the leader)
     // Node 1 will propose the ConfChange and send it to node 2
     println!("  Adding node 2 to cluster as voter via ConfChange...");
-    cluster1.add_node(2, addr2.clone()).await
+    node_manager1.add_node(2, addr2.clone()).await
         .expect("Should add node 2 as voter");
 
     println!("✓ Node 2 added as voter\n");
 
     // Wait for node 2 to catch up
     sleep(Duration::from_millis(2000)).await;
+
+    // Get cluster2 after it's been created through the management cluster
+    let cluster2 = node_manager2.get_execution_cluster(&INITIAL_EXECUTION_CLUSTER_ID)
+        .expect("Should have execution cluster after being added");
 
     // Step 3: Add third node
     println!("Step 3: Adding third node (node 3)");
@@ -141,11 +145,8 @@ async fn test_three_node_grpc_cluster_bootstrap() {
     // Give time for gRPC clients to be created
     sleep(Duration::from_millis(100)).await;
 
-    // Phase 3: Use NodeManager
+    // Phase 3: Use NodeManager (node 3 will join existing cluster, no need to initialize)
     let node_manager3 = Arc::new(NodeManager::new(transport3.clone(), 3).await.expect("Should create node manager 3"));
-    let cluster3 = node_manager3.get_execution_cluster(&Uuid::from_u128(INITIAL_EXECUTION_CLUSTER_ID))
-        .expect("Should have initial execution cluster");
-    let runtime3 = node_manager3.workflow_runtime();
 
     let server3 = start_grpc_server(
         addr3.clone(),
@@ -159,13 +160,17 @@ async fn test_three_node_grpc_cluster_bootstrap() {
     // Add node 3 to the cluster via the existing cluster (node 1)
     // Note: add_node automatically routes to the leader
     println!("  Adding node 3 to cluster as voter via ConfChange...");
-    cluster1.add_node(3, addr3.clone()).await
+    node_manager1.add_node(3, addr3.clone()).await
         .expect("Should add node 3 as voter");
 
     println!("✓ Node 3 added as voter\n");
 
     // Wait for node 3 to catch up
     sleep(Duration::from_millis(5000)).await;
+
+    // Get cluster3 after it's been created through the management cluster
+    let cluster3 = node_manager3.get_execution_cluster(&INITIAL_EXECUTION_CLUSTER_ID)
+        .expect("Should have execution cluster after being added");
 
     // Step 4: Verify cluster membership
     println!("Step 4: Verifying cluster membership");
@@ -203,12 +208,15 @@ async fn test_three_node_grpc_cluster_bootstrap() {
         Ok::<ConcatOutput, raftoral::WorkflowError>(ConcatOutput { result })
     };
 
-    runtime1.register_workflow_closure("concat", 1, concat_fn.clone())
-        .expect("Should register workflow on runtime 1");
-    runtime2.register_workflow_closure("concat", 1, concat_fn.clone())
-        .expect("Should register workflow on runtime 2");
-    runtime3.register_workflow_closure("concat", 1, concat_fn)
-        .expect("Should register workflow on runtime 3");
+    cluster1.executor.registry().lock().unwrap()
+        .register_closure("concat", 1, concat_fn.clone())
+        .expect("Should register workflow on cluster 1");
+    cluster2.executor.registry().lock().unwrap()
+        .register_closure("concat", 1, concat_fn.clone())
+        .expect("Should register workflow on cluster 2");
+    cluster3.executor.registry().lock().unwrap()
+        .register_closure("concat", 1, concat_fn)
+        .expect("Should register workflow on cluster 3");
 
     println!("✓ Workflow registered on all 3 nodes\n");
 
@@ -219,7 +227,7 @@ async fn test_three_node_grpc_cluster_bootstrap() {
         strings: vec!["hello".to_string(), " world!".to_string()],
     };
 
-    let workflow_run = runtime2.start_workflow::<ConcatInput, ConcatOutput>(
+    let workflow_run = cluster2.executor.runtime().start_workflow::<ConcatInput, ConcatOutput>(
         "concat",
         1,
         input.clone()

@@ -3,7 +3,6 @@
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::HashMap;
-use uuid::Uuid;
 use crate::raft::RaftCluster;
 use crate::raft::generic::grpc_transport::GrpcClusterTransport;
 use crate::raft::generic::message::Message;
@@ -11,7 +10,7 @@ use crate::workflow::{WorkflowCommand, WorkflowCommandExecutor};
 use super::{ManagementCommand, ManagementCommandExecutor};
 
 /// Initial execution cluster ID (cluster_id = 1)
-const INITIAL_EXECUTION_CLUSTER_ID: u128 = 1;
+const INITIAL_EXECUTION_CLUSTER_ID: u32 = 1;
 
 /// NodeManager owns both the management cluster and workflow execution cluster(s)
 pub struct NodeManager {
@@ -20,7 +19,7 @@ pub struct NodeManager {
 
     /// Workflow execution clusters (cluster_id -> cluster)
     /// Shared with ManagementCommandExecutor for dynamic cluster creation
-    execution_clusters: Arc<Mutex<HashMap<Uuid, Arc<RaftCluster<WorkflowCommandExecutor>>>>>,
+    execution_clusters: Arc<Mutex<HashMap<u32, Arc<RaftCluster<WorkflowCommandExecutor>>>>>,
 
     /// Round-robin index for cluster selection
     round_robin_index: AtomicUsize,
@@ -83,7 +82,7 @@ impl NodeManager {
     /// Initialize the default execution cluster (cluster_id = 1)
     /// This should be called after NodeManager::new() when bootstrapping a cluster
     pub async fn initialize_default_cluster(&self) -> Result<(), String> {
-        let cluster_id = Uuid::from_u128(INITIAL_EXECUTION_CLUSTER_ID);
+        let cluster_id = INITIAL_EXECUTION_CLUSTER_ID;
 
         // Propose CreateExecutionCluster command
         let create_command = ManagementCommand::CreateExecutionCluster(
@@ -121,13 +120,13 @@ impl NodeManager {
     }
 
     /// Get a specific execution cluster by ID
-    pub fn get_execution_cluster(&self, cluster_id: &Uuid) -> Option<Arc<RaftCluster<WorkflowCommandExecutor>>> {
+    pub fn get_execution_cluster(&self, cluster_id: &u32) -> Option<Arc<RaftCluster<WorkflowCommandExecutor>>> {
         self.execution_clusters.lock().unwrap().get(cluster_id).cloned()
     }
 
     /// Select an execution cluster using round-robin strategy
     /// Returns (cluster_id, cluster) for the selected cluster
-    pub fn select_execution_cluster_round_robin(&self) -> (Uuid, Arc<RaftCluster<WorkflowCommandExecutor>>) {
+    pub fn select_execution_cluster_round_robin(&self) -> (u32, Arc<RaftCluster<WorkflowCommandExecutor>>) {
         let clusters = self.execution_clusters.lock().unwrap();
 
         // Get list of cluster IDs (sorted for deterministic round-robin)
@@ -150,7 +149,7 @@ impl NodeManager {
     }
 
     /// Get an execution cluster executor by ID (returns owned reference)
-    pub fn get_execution_cluster_executor(&self, cluster_id: &Uuid) -> Option<Arc<RaftCluster<WorkflowCommandExecutor>>> {
+    pub fn get_execution_cluster_executor(&self, cluster_id: &u32) -> Option<Arc<RaftCluster<WorkflowCommandExecutor>>> {
         self.execution_clusters.lock().unwrap().get(cluster_id).cloned()
     }
 
@@ -184,7 +183,7 @@ impl NodeManager {
     }
 
     /// Get all execution cluster IDs
-    pub fn get_execution_cluster_ids(&self) -> Vec<Uuid> {
+    pub fn get_execution_cluster_ids(&self) -> Vec<u32> {
         self.execution_clusters.lock().unwrap().keys().copied().collect()
     }
 

@@ -3,7 +3,6 @@ use log::info;
 use raftoral::runtime::{RaftoralConfig, RaftoralGrpcRuntime};
 use raftoral::workflow::{WorkflowContext, WorkflowError};
 use tokio::signal;
-use uuid::Uuid;
 
 #[derive(Parser, Debug)]
 #[command(name = "raftoral")]
@@ -62,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     // Get the default execution cluster (ID = 1)
-    let default_cluster_id = Uuid::from_u128(1);
+    let default_cluster_id = 1u32;
     let execution_cluster = runtime.node_manager().get_execution_cluster(&default_cluster_id)
         .expect("Default execution cluster should exist after initialization");
 

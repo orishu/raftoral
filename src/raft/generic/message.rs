@@ -37,7 +37,7 @@ where
     ///
     /// # Arguments
     /// * `cluster_id` - The cluster ID for routing (0 = management, 1+ = execution clusters)
-    pub fn to_protobuf(&self, cluster_id: u64) -> Result<raft_proto::GenericMessage, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn to_protobuf(&self, cluster_id: u32) -> Result<raft_proto::GenericMessage, Box<dyn std::error::Error + Send + Sync>> {
         use protobuf::Message as ProtobufMessage;
 
         let message = match self {

@@ -26,7 +26,7 @@ pub struct RaftCluster<E: CommandExecutor> {
     // The ID of this node
     node_id: u64,
     // The cluster ID for multi-cluster routing (0 = management, 1+ = execution)
-    cluster_id: u64,
+    cluster_id: u32,
     // Cached Raft configuration (shared with RaftNode for direct access)
     cached_config: Arc<RwLock<Vec<u64>>>,
     // Cached full configuration state (voters and learners separately)
@@ -57,7 +57,7 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
     /// ```
     pub async fn new(
         node_id: u64,
-        cluster_id: u64,
+        cluster_id: u32,
         transport: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<E::Command>>>,
         executor: E,
     ) -> Result<Self, Box<dyn std::error::Error>> {

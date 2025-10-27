@@ -43,7 +43,7 @@ pub struct RaftNode<E: CommandExecutor> {
     #[allow(dead_code)] // Reserved for future use
     storage: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     node_id: u64,
-    cluster_id: u64,  // Cluster ID for multi-cluster routing
+    cluster_id: u32,  // Cluster ID for multi-cluster routing
     logger: Logger,
 
     // For multi-node communication
@@ -79,7 +79,7 @@ pub struct RaftNode<E: CommandExecutor> {
 impl<E: CommandExecutor + 'static> RaftNode<E> {
     pub fn new(
         node_id: u64,
-        cluster_id: u64,
+        cluster_id: u32,
         mailbox: mpsc::UnboundedReceiver<Message<E::Command>>,
         transport: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<E::Command>>>,
         executor: Arc<E>,
