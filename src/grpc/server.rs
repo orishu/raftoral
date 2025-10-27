@@ -29,7 +29,7 @@ use crate::raft::generic::cluster::RaftCluster;
 pub struct RaftServiceImpl<E: CommandExecutor> {
     #[allow(dead_code)]
     transport: Arc<GrpcClusterTransport>,
-    cluster: Arc<RaftCluster<E>>,
+    cluster: Option<Arc<RaftCluster<E>>>,
     node_id: u64,
     address: String,
     /// Optional cluster router for multi-cluster routing (Phase 2)
@@ -44,18 +44,17 @@ impl<E: CommandExecutor> RaftServiceImpl<E> {
         node_id: u64,
         address: String,
     ) -> Self {
-        Self { transport, cluster, node_id, address, cluster_router: None }
+        Self { transport, cluster: Some(cluster), node_id, address, cluster_router: None }
     }
 
-    /// Create a new RaftServiceImpl with cluster routing support (Phase 2)
+    /// Create a new RaftServiceImpl with cluster routing support (multi-cluster mode)
     pub fn with_cluster_router(
         transport: Arc<GrpcClusterTransport>,
-        cluster: Arc<RaftCluster<E>>,
         node_id: u64,
         address: String,
         cluster_router: Arc<crate::grpc::ClusterRouter>,
     ) -> Self {
-        Self { transport, cluster, node_id, address, cluster_router: Some(cluster_router) }
+        Self { transport, cluster: None, node_id, address, cluster_router: Some(cluster_router) }
     }
 }
 
@@ -71,7 +70,7 @@ impl<E: CommandExecutor + Default + 'static> RaftService for RaftServiceImpl<E> 
         if let Some(router) = &self.cluster_router {
             // Multi-cluster mode: route based on cluster_id
             router.route_message(proto_msg).await?;
-        } else {
+        } else if let Some(cluster) = &self.cluster {
             // Single-cluster mode (backward compatibility)
             // Validate cluster_id is 0
             if proto_msg.cluster_id != 0 {
@@ -85,8 +84,10 @@ impl<E: CommandExecutor + Default + 'static> RaftService for RaftServiceImpl<E> 
             let message = Message::<E::Command>::from_protobuf(proto_msg)
                 .map_err(|e| Status::invalid_argument(format!("Failed to deserialize message: {}", e)))?;
 
-            self.cluster.local_sender.send(message)
+            cluster.local_sender.send(message)
                 .map_err(|e| Status::internal(format!("Failed to send message: {}", e)))?;
+        } else {
+            return Err(Status::internal("No cluster router or cluster configured"));
         }
 
         Ok(Response::new(MessageResponse {
@@ -99,29 +100,43 @@ impl<E: CommandExecutor + Default + 'static> RaftService for RaftServiceImpl<E> 
         &self,
         _request: Request<DiscoveryRequest>,
     ) -> Result<Response<DiscoveryResponse>, Status> {
-        // Get highest known node ID from Raft configuration (most accurate source)
-        let node_ids = self.cluster.get_node_ids();
-        let highest_known_node_id = node_ids.iter().copied().max().unwrap_or(self.node_id);
+        // In multi-cluster mode, discovery is not supported via this method
+        // Use the management cluster API instead
+        if let Some(cluster) = &self.cluster {
+            // Get highest known node ID from Raft configuration (most accurate source)
+            let node_ids = cluster.get_node_ids();
+            let highest_known_node_id = node_ids.iter().copied().max().unwrap_or(self.node_id);
 
-        // Get full configuration state (voters and learners)
-        let conf_state = self.cluster.get_conf_state();
-        let voters: Vec<u64> = conf_state.voters.into_iter().collect();
-        let learners: Vec<u64> = conf_state.learners.into_iter().collect();
+            // Get full configuration state (voters and learners)
+            let conf_state = cluster.get_conf_state();
+            let voters: Vec<u64> = conf_state.voters.into_iter().collect();
+            let learners: Vec<u64> = conf_state.learners.into_iter().collect();
 
-        Ok(Response::new(DiscoveryResponse {
-            node_id: self.node_id,
-            role: ProtoRaftRole::Follower as i32, // Role discovery requires cluster reference - simplified for now
-            highest_known_node_id,
-            address: self.address.clone(),
-            voters,
-            learners,
-        }))
+            Ok(Response::new(DiscoveryResponse {
+                node_id: self.node_id,
+                role: ProtoRaftRole::Follower as i32, // Role discovery requires cluster reference - simplified for now
+                highest_known_node_id,
+                address: self.address.clone(),
+                voters,
+                learners,
+            }))
+        } else {
+            // Multi-cluster mode: return basic node info
+            Ok(Response::new(DiscoveryResponse {
+                node_id: self.node_id,
+                role: ProtoRaftRole::Follower as i32,
+                highest_known_node_id: self.node_id,
+                address: self.address.clone(),
+                voters: vec![self.node_id],
+                learners: vec![],
+            }))
+        }
     }
 }
 
 /// gRPC service implementation for Workflow Management
 pub struct WorkflowManagementImpl {
-    runtime: Arc<crate::workflow::WorkflowRuntime>,
+    runtime: Option<Arc<crate::workflow::WorkflowRuntime>>,
     node_manager: Option<Arc<crate::nodemanager::NodeManager>>,
     /// Request forwarder for proxying requests to other nodes
     forwarder: Arc<crate::grpc::RequestForwarder>,
@@ -130,15 +145,15 @@ pub struct WorkflowManagementImpl {
 impl WorkflowManagementImpl {
     pub fn new(runtime: Arc<crate::workflow::WorkflowRuntime>) -> Self {
         Self {
-            runtime,
+            runtime: Some(runtime),
             node_manager: None,
             forwarder: Arc::new(crate::grpc::RequestForwarder::new()),
         }
     }
 
-    pub fn with_node_manager(runtime: Arc<crate::workflow::WorkflowRuntime>, node_manager: Arc<crate::nodemanager::NodeManager>) -> Self {
+    pub fn with_node_manager(node_manager: Arc<crate::nodemanager::NodeManager>) -> Self {
         Self {
-            runtime,
+            runtime: None,
             node_manager: Some(node_manager),
             forwarder: Arc::new(crate::grpc::RequestForwarder::new()),
         }
@@ -158,7 +173,8 @@ impl WorkflowManagement for WorkflowManagementImpl {
             .map_err(|e| Status::invalid_argument(format!("Invalid input JSON: {}", e)))?;
 
         // Start the workflow with generic JSON input
-        let workflow_run = self.runtime
+        let runtime = self.runtime.as_ref().ok_or_else(|| Status::internal("WorkflowRuntime not available"))?;
+        let workflow_run = runtime
             .start_workflow::<serde_json::Value, serde_json::Value>(
                 &req.workflow_type,
                 req.version,
@@ -317,7 +333,7 @@ impl WorkflowManagement for WorkflowManagementImpl {
         // Poll for workflow completion
         for _ in 0..max_polls {
             // Check if workflow result is available in execution cluster state
-            let result_opt = workflow_executor.get_result(&req.workflow_id);
+            let result_opt = workflow_executor.executor.get_result(&req.workflow_id);
 
             if let Some(result_bytes) = result_opt {
                 // Convert result bytes to JSON string
@@ -388,20 +404,15 @@ pub async fn start_grpc_server_with_config(
     }];
     let transport = Arc::new(GrpcClusterTransport::new(nodes));
 
-    // Use the first available execution cluster for the RaftService
-    // (This is primarily for backward compatibility with single-cluster tests)
-    let initial_cluster_id = uuid::Uuid::from_u128(1); // INITIAL_EXECUTION_CLUSTER_ID
-    let cluster = node_manager.get_execution_cluster(&initial_cluster_id)
-        .expect("Initial execution cluster should exist");
-    let raft_service = RaftServiceImpl::with_cluster_router(
+    // Create RaftService with cluster router for multi-cluster support
+    // Type annotation needed for generic inference
+    let raft_service: RaftServiceImpl<crate::workflow::WorkflowCommandExecutor> = RaftServiceImpl::with_cluster_router(
         transport,
-        cluster,
         node_id,
         address,
         cluster_router
     );
-    let runtime = node_manager.workflow_runtime();
-    let workflow_service = WorkflowManagementImpl::with_node_manager(runtime, node_manager.clone());
+    let workflow_service = WorkflowManagementImpl::with_node_manager(node_manager.clone());
 
     // Create reflection service
     let reflection_service = ReflectionBuilder::configure()

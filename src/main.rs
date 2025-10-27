@@ -3,6 +3,7 @@ use log::info;
 use raftoral::runtime::{RaftoralConfig, RaftoralGrpcRuntime};
 use raftoral::workflow::{WorkflowContext, WorkflowError};
 use tokio::signal;
+use uuid::Uuid;
 
 #[derive(Parser, Debug)]
 #[command(name = "raftoral")]
@@ -57,6 +58,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start the runtime
     let runtime = RaftoralGrpcRuntime::start(config).await?;
 
+    // Give the cluster creation task a moment to complete (it runs asynchronously)
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    // Get the default execution cluster (ID = 1)
+    let default_cluster_id = Uuid::from_u128(1);
+    let execution_cluster = runtime.node_manager().get_execution_cluster(&default_cluster_id)
+        .expect("Default execution cluster should exist after initialization");
+
     // Register ping/pong workflow
     // Input: "ping" -> Output: "pong"
     // Any other input returns an error
@@ -71,9 +80,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    runtime
-        .workflow_runtime()
-        .register_workflow_closure("ping_pong", 1, ping_pong_fn)
+    execution_cluster
+        .executor
+        .registry()
+        .lock()
+        .unwrap()
+        .register_closure("ping_pong", 1, ping_pong_fn)
         .expect("Failed to register ping_pong workflow");
     info!("Registered ping_pong workflow (v1)");
 

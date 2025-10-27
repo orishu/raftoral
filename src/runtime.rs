@@ -232,14 +232,14 @@ impl RaftoralGrpcRuntime {
         transport.start().await?;
         info!("Transport started");
 
-        // Create NodeManager (creates both management and workflow clusters internally)
+        // Create NodeManager (creates management cluster, execution clusters will be created dynamically)
         // ClusterRouter is created and configured inside NodeManager
         let node_manager = Arc::new(crate::nodemanager::NodeManager::new(
             transport.clone(),
             node_id,
         ).await?);
-        info!("NodeManager ready with management and workflow clusters");
-        info!("ClusterRouter configured for management (cluster_id=0) and workflow (cluster_id=1) clusters");
+        info!("NodeManager ready with management cluster");
+        info!("ClusterRouter configured for management (cluster_id=0)");
 
         // Start gRPC server - gets ClusterRouter from NodeManager internally
         // Server must be started BEFORE add_node so it can receive Raft messages
@@ -260,6 +260,13 @@ impl RaftoralGrpcRuntime {
             .await?
         };
         info!("gRPC server listening on {}", config.listen_address);
+
+        // If bootstrapping, initialize the default execution cluster
+        if config.bootstrap {
+            info!("Initializing default execution cluster (bootstrap mode)");
+            node_manager.initialize_default_cluster().await?;
+            info!("Default execution cluster (cluster_id=1) initialized");
+        }
 
         // If joining an existing cluster, add this node via ConfChange
         // This must happen AFTER the server is started so we can receive Raft messages
@@ -295,8 +302,16 @@ impl RaftoralGrpcRuntime {
     }
 
     /// Get a reference to the workflow runtime for registering and executing workflows.
+    /// Note: In multi-cluster mode, there is no single workflow runtime.
+    /// Use node_manager.get_execution_cluster() to access individual clusters.
+    #[deprecated(note = "Use node_manager.get_execution_cluster() for multi-cluster support")]
     pub fn workflow_runtime(&self) -> Arc<WorkflowRuntime> {
-        self.node_manager.workflow_runtime()
+        unimplemented!("workflow_runtime() is deprecated in multi-cluster mode. Use node_manager.get_execution_cluster() instead.")
+    }
+
+    /// Get a reference to the NodeManager for accessing execution clusters and management operations
+    pub fn node_manager(&self) -> &Arc<crate::nodemanager::NodeManager> {
+        &self.node_manager
     }
 
     /// Get the node ID of this runtime.
