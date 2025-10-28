@@ -117,29 +117,13 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             // Cache first entry info (will be set after first leader election creates index 1)
             // For now, leave as None - will be populated after the node becomes leader
         } else {
-            // Joining node: Initialize with discovered voter configuration from transport
-            // This solves the "empty configuration" problem that causes ConfChange apply failures
-            let discovered_voters = transport.get_discovered_voters();
-
-            if !discovered_voters.is_empty() {
-                // We have discovered configuration - use it!
-                let mut initial_state = ConfState::default();
-                initial_state.voters = discovered_voters.clone();
-                storage.wl().set_conf_state(initial_state.clone());
-                *cached_config.write().unwrap() = discovered_voters.clone();
-                *cached_conf_state.write().unwrap() = initial_state;
-                slog::info!(slog::Logger::root(slog::Discard, slog::o!()),
-                    "Initialized joining node with discovered voters";
-                    "voters" => ?discovered_voters);
-            } else{
-                // Fallback: Use transport peer list for cached_config only
-                // This maintains backward compatibility for tests that don't use discovery
-                let peer_ids: Vec<u64> = transport.list_nodes().into_iter()
-                    .filter(|&id| id != node_id)  // Don't include self
-                    .collect();
-                *cached_config.write().unwrap() = peer_ids;
-                // cached_conf_state stays empty - old behavior for backward compatibility
-            }
+            // Joining node: Initialize with peer list from transport
+            // Use cached_config for tracking known peers (excluding self)
+            let peer_ids: Vec<u64> = transport.list_nodes().into_iter()
+                .filter(|&id| id != node_id)  // Don't include self
+                .collect();
+            *cached_config.write().unwrap() = peer_ids;
+            // cached_conf_state stays empty - will be populated when ConfChange is applied
         }
 
         // Create logger for this node

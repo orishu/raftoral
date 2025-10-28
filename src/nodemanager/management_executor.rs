@@ -4,10 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
-use crate::raft::generic::message::{CommandExecutor, Message};
-use crate::raft::generic::transport::TransportInteraction;
+use crate::raft::generic::message::CommandExecutor;
 use crate::raft::RaftCluster;
-use crate::workflow::{WorkflowCommand, WorkflowCommandExecutor};
+use crate::workflow::WorkflowCommandExecutor;
 use super::management_command::ManagementCommand;
 
 /// Serializable snapshot of management state
@@ -224,6 +223,14 @@ impl CommandExecutor for ManagementCommandExecutor {
                     }
                 };
 
+                // Only create the RaftCluster if this node is in initial_node_ids
+                // Other nodes will create their cluster instance later when AssociateNode is applied
+                if !data.initial_node_ids.contains(&node_id) {
+                    slog::info!(self.logger, "This node not in initial_node_ids, skipping cluster creation";
+                        "node_id" => node_id, "initial_node_ids" => ?data.initial_node_ids);
+                    return Ok(());
+                }
+
                 let cluster_id = data.cluster_id;
                 let logger = self.logger.clone();
 
@@ -326,45 +333,117 @@ impl CommandExecutor for ManagementCommandExecutor {
                         return Ok(());
                     }
                 };
+                let cluster_router = match self.cluster_router.lock().unwrap().clone() {
+                    Some(r) => r,
+                    None => {
+                        slog::warn!(self.logger, "ClusterRouter not initialized, skipping actual node addition");
+                        return Ok(());
+                    }
+                };
+                let current_node_id = match *self.node_id.lock().unwrap() {
+                    Some(id) => id,
+                    None => {
+                        slog::warn!(self.logger, "Node ID not initialized, skipping actual node addition");
+                        return Ok(());
+                    }
+                };
 
                 let cluster_id = data.cluster_id;
-                let node_id = data.node_id;
+                let node_id_to_add = data.node_id;
                 let logger = self.logger.clone();
 
-                // Spawn async task to add node to execution cluster
+                // Spawn async task to handle node association
+                // Two paths:
+                // 1. If this is the node being associated and cluster doesn't exist, create it
+                // 2. If cluster exists and we're the leader, propose ConfChange to add the node
                 tokio::spawn(async move {
-                    // Get the node's address from transport
-                    let addresses = transport.get_node_addresses_sync(&[node_id]);
-                    let address = match addresses.first() {
-                        Some(addr) => addr.clone(),
-                        None => {
-                            slog::error!(logger, "Node address not found in transport"; "node_id" => node_id);
-                            return;
-                        }
+                    // Check if cluster exists locally
+                    let cluster_exists = {
+                        let clusters = execution_clusters_arc.lock().unwrap();
+                        clusters.contains_key(&cluster_id)
                     };
 
-                    // Get the execution cluster
-                    let cluster = {
-                        let clusters = execution_clusters_arc.lock().unwrap();
-                        match clusters.get(&cluster_id).cloned() {
-                            Some(c) => c,
-                            None => {
-                                slog::error!(logger, "Execution cluster not found"; "cluster_id" => %cluster_id);
-                                return;
+                    // Path 1: If this is the node being associated and cluster doesn't exist, create it
+                    if !cluster_exists && current_node_id == node_id_to_add {
+                        slog::info!(logger, "Creating execution cluster for joining node";
+                            "node_id" => node_id_to_add, "cluster_id" => %cluster_id);
+
+                        let executor = WorkflowCommandExecutor::default();
+                        let transport_ref: Arc<dyn crate::raft::generic::transport::TransportInteraction<crate::raft::generic::message::Message<crate::workflow::WorkflowCommand>>> = transport.clone();
+
+                        match RaftCluster::new(current_node_id, cluster_id, transport_ref, executor).await {
+                            Ok(cluster) => {
+                                let cluster = Arc::new(cluster);
+
+                                // Create WorkflowRuntime for this cluster
+                                let workflow_runtime = crate::workflow::runtime::WorkflowRuntime::new(cluster.clone());
+                                cluster.executor.set_runtime(workflow_runtime);
+
+                                // Register cluster in ClusterRouter
+                                if let Err(e) = cluster_router.register_execution_cluster(cluster_id, cluster.local_sender.clone()) {
+                                    slog::error!(logger, "Failed to register execution cluster in router"; "error" => %e);
+                                    return;
+                                }
+
+                                // Add to shared execution_clusters HashMap
+                                execution_clusters_arc.lock().unwrap().insert(cluster_id, cluster);
+
+                                slog::info!(logger, "Execution cluster created successfully for joining node";
+                                    "node_id" => node_id_to_add, "cluster_id" => %cluster_id);
+                            }
+                            Err(e) => {
+                                slog::error!(logger, "Failed to create execution cluster for joining node";
+                                    "cluster_id" => %cluster_id, "error" => %e);
                             }
                         }
-                    };
+                        return;
+                    }
 
-                    // Add node to execution cluster
-                    match cluster.add_node(node_id, address).await {
-                        Ok(_) => {
-                            slog::info!(logger, "Node added to execution cluster successfully";
-                                       "node_id" => node_id, "cluster_id" => %cluster_id);
+                    // Path 2: If cluster exists, check if we're the leader and add the node
+                    if cluster_exists {
+                        let cluster = {
+                            let clusters = execution_clusters_arc.lock().unwrap();
+                            clusters.get(&cluster_id).cloned()
+                        };
+
+                        if let Some(cluster) = cluster {
+                            // Only the leader should propose the ConfChange
+                            if !cluster.is_leader().await {
+                                slog::debug!(logger, "Not leader, skipping add_node ConfChange";
+                                    "node_id" => node_id_to_add, "cluster_id" => %cluster_id);
+                                return;
+                            }
+
+                            // Get the node's address from transport
+                            let addresses = transport.get_node_addresses_sync(&[node_id_to_add]);
+                            let address = match addresses.first() {
+                                Some(addr) => addr.clone(),
+                                None => {
+                                    slog::error!(logger, "Node address not found in transport"; "node_id" => node_id_to_add);
+                                    return;
+                                }
+                            };
+
+                            // Leader proposes ConfChange to add the node
+                            slog::info!(logger, "Leader adding node to execution cluster via ConfChange";
+                                "node_id" => node_id_to_add, "cluster_id" => %cluster_id);
+
+                            match cluster.add_node(node_id_to_add, address).await {
+                                Ok(_) => {
+                                    slog::info!(logger, "Node added to execution cluster successfully";
+                                               "node_id" => node_id_to_add, "cluster_id" => %cluster_id);
+                                }
+                                Err(e) => {
+                                    slog::error!(logger, "Failed to add node to execution cluster";
+                                                "node_id" => node_id_to_add, "cluster_id" => %cluster_id, "error" => %e);
+                                }
+                            }
+                        } else {
+                            slog::error!(logger, "Execution cluster not found"; "cluster_id" => %cluster_id);
                         }
-                        Err(e) => {
-                            slog::error!(logger, "Failed to add node to execution cluster";
-                                        "node_id" => node_id, "cluster_id" => %cluster_id, "error" => %e);
-                        }
+                    } else {
+                        slog::debug!(logger, "Cluster doesn't exist locally and this is not the node being associated";
+                            "current_node_id" => current_node_id, "node_id_to_add" => node_id_to_add);
                     }
                 });
             }
@@ -434,33 +513,15 @@ impl CommandExecutor for ManagementCommandExecutor {
         // Default execution cluster ID
         let default_cluster_id = 1u32;
 
-        // Check if default execution cluster exists
-        let cluster_exists = {
-            let state = self.state.lock().unwrap();
-            state.execution_clusters.contains_key(&default_cluster_id)
-        };
-
         // Clone logger for async block
         let logger = self.logger.clone();
 
-        // Spawn async task to propose commands
+        // Spawn async task to propose AssociateNode command
+        // NOTE: We do NOT create the execution cluster here. The execution cluster
+        // should already exist (created by initialize_default_cluster on bootstrap node).
+        // If it doesn't exist yet, the AssociateNode command will fail, which is expected.
+        // The execution cluster must be created explicitly before adding nodes to it.
         tokio::spawn(async move {
-            // If cluster doesn't exist, create it first
-            if !cluster_exists {
-                slog::info!(logger, "Creating default execution cluster"; "cluster_id" => %default_cluster_id);
-                let create_command = ManagementCommand::CreateExecutionCluster(
-                    super::management_command::CreateExecutionClusterData {
-                        cluster_id: default_cluster_id,
-                        initial_node_ids: vec![added_node_id],
-                    }
-                );
-
-                if let Err(e) = mgmt_cluster.propose_and_sync(create_command).await {
-                    slog::error!(logger, "Failed to create default execution cluster"; "error" => %e);
-                    return;
-                }
-            }
-
             // Associate the node with the default execution cluster
             slog::info!(logger, "Associating node with default execution cluster";
                        "node_id" => added_node_id, "cluster_id" => %default_cluster_id);

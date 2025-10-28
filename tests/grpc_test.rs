@@ -85,7 +85,7 @@ async fn test_grpc_transport_node_ids() {
 
 #[tokio::test]
 async fn test_discovery_rpc() {
-    use raftoral::grpc::bootstrap::{discover_peer, RaftRole};
+    use raftoral::grpc::bootstrap::discover_peer;
 
     let port = port_check::free_local_port().expect("Should find free port");
     let address = format!("127.0.0.1:{}", port);
@@ -117,12 +117,6 @@ async fn test_discovery_rpc() {
     assert_eq!(discovered.node_id, 1);
     assert_eq!(discovered.address, address);
     assert_eq!(discovered.highest_known_node_id, 1);
-    // Role should be either Follower or Leader
-    assert!(
-        discovered.role == RaftRole::Follower || discovered.role == RaftRole::Leader,
-        "Role should be Follower or Leader, got {:?}",
-        discovered.role
-    );
 
-    println!("✓ Successfully discovered peer: node_id={}, role={:?}", discovered.node_id, discovered.role);
+    println!("✓ Successfully discovered peer: node_id={}", discovered.node_id);
 }

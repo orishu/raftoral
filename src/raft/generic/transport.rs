@@ -48,10 +48,6 @@ where
         &self,
         node_id: u64
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
-
-    /// Get discovered voter configuration from peer discovery
-    /// Used to initialize joining nodes with proper Raft configuration
-    fn get_discovered_voters(&self) -> Vec<u64>;
 }
 
 /// Metadata about a node's transport address
@@ -165,12 +161,6 @@ where
     fn remove_peer(&self, _node_id: u64) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // In-memory transport - no-op
         Ok(())
-    }
-
-    fn get_discovered_voters(&self) -> Vec<u64> {
-        // In-memory transport: return all node IDs as voters
-        // This allows multi-node tests to bootstrap with proper voter configuration
-        self.node_senders.read().unwrap().keys().copied().collect()
     }
 }
 

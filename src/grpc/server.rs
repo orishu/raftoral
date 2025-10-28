@@ -16,7 +16,7 @@ use raft_proto::{
     raft_service_server::{RaftService, RaftServiceServer},
     workflow_management_server::{WorkflowManagement, WorkflowManagementServer},
     GenericMessage, MessageResponse,
-    DiscoveryRequest, DiscoveryResponse, RaftRole as ProtoRaftRole,
+    DiscoveryRequest, DiscoveryResponse,
     RunWorkflowRequest, RunWorkflowResponse, RunWorkflowAsyncResponse, WaitForWorkflowRequest,
 };
 
@@ -35,6 +35,8 @@ pub struct RaftServiceImpl<E: CommandExecutor> {
     /// Optional cluster router for multi-cluster routing (Phase 2)
     /// If None, falls back to single-cluster behavior (Phase 1)
     cluster_router: Option<Arc<crate::grpc::ClusterRouter>>,
+    /// Optional node manager for multi-cluster mode (access to management cluster)
+    node_manager: Option<Arc<crate::nodemanager::NodeManager>>,
 }
 
 impl<E: CommandExecutor> RaftServiceImpl<E> {
@@ -44,7 +46,7 @@ impl<E: CommandExecutor> RaftServiceImpl<E> {
         node_id: u64,
         address: String,
     ) -> Self {
-        Self { transport, cluster: Some(cluster), node_id, address, cluster_router: None }
+        Self { transport, cluster: Some(cluster), node_id, address, cluster_router: None, node_manager: None }
     }
 
     /// Create a new RaftServiceImpl with cluster routing support (multi-cluster mode)
@@ -53,8 +55,9 @@ impl<E: CommandExecutor> RaftServiceImpl<E> {
         node_id: u64,
         address: String,
         cluster_router: Arc<crate::grpc::ClusterRouter>,
+        node_manager: Arc<crate::nodemanager::NodeManager>,
     ) -> Self {
-        Self { transport, cluster: None, node_id, address, cluster_router: Some(cluster_router) }
+        Self { transport, cluster: None, node_id, address, cluster_router: Some(cluster_router), node_manager: Some(node_manager) }
     }
 }
 
@@ -100,35 +103,63 @@ impl<E: CommandExecutor + Default + 'static> RaftService for RaftServiceImpl<E> 
         &self,
         _request: Request<DiscoveryRequest>,
     ) -> Result<Response<DiscoveryResponse>, Status> {
-        // In multi-cluster mode, discovery is not supported via this method
-        // Use the management cluster API instead
+        // In multi-cluster mode (cluster_router is set), get management cluster info
+        if let Some(_router) = &self.cluster_router {
+            // Get the node_manager to access management cluster
+            if let Some(node_manager) = &self.node_manager {
+                let management = node_manager.management_executor();
+
+                // Get highest known node ID from management state
+                let all_clusters = management.get_all_clusters();
+                let mut highest_known_node_id = self.node_id;
+                for cluster_info in &all_clusters {
+                    for &node_id in &cluster_info.node_ids {
+                        if node_id > highest_known_node_id {
+                            highest_known_node_id = node_id;
+                        }
+                    }
+                }
+
+                // Get management cluster leader info
+                let management_cluster = node_manager.management_cluster();
+                let management_leader_node_id = management_cluster.get_leader_id();
+                let management_leader_address = if management_leader_node_id != 0 {
+                    node_manager.get_node_address(management_leader_node_id).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+
+                return Ok(Response::new(DiscoveryResponse {
+                    node_id: self.node_id,
+                    highest_known_node_id,
+                    address: self.address.clone(),
+                    management_leader_node_id,
+                    management_leader_address,
+                }));
+            }
+        }
+
+        // Fallback for old single-cluster mode
         if let Some(cluster) = &self.cluster {
             // Get highest known node ID from Raft configuration (most accurate source)
             let node_ids = cluster.get_node_ids();
             let highest_known_node_id = node_ids.iter().copied().max().unwrap_or(self.node_id);
 
-            // Get full configuration state (voters and learners)
-            let conf_state = cluster.get_conf_state();
-            let voters: Vec<u64> = conf_state.voters.into_iter().collect();
-            let learners: Vec<u64> = conf_state.learners.into_iter().collect();
-
             Ok(Response::new(DiscoveryResponse {
                 node_id: self.node_id,
-                role: ProtoRaftRole::Follower as i32, // Role discovery requires cluster reference - simplified for now
                 highest_known_node_id,
                 address: self.address.clone(),
-                voters,
-                learners,
+                management_leader_node_id: 0,  // No management cluster in single-cluster mode
+                management_leader_address: String::new(),
             }))
         } else {
-            // Multi-cluster mode: return basic node info
+            // No cluster info available
             Ok(Response::new(DiscoveryResponse {
                 node_id: self.node_id,
-                role: ProtoRaftRole::Follower as i32,
                 highest_known_node_id: self.node_id,
                 address: self.address.clone(),
-                voters: vec![self.node_id],
-                learners: vec![],
+                management_leader_node_id: 0,
+                management_leader_address: String::new(),
             }))
         }
     }
@@ -410,7 +441,8 @@ pub async fn start_grpc_server_with_config(
         transport,
         node_id,
         address,
-        cluster_router
+        cluster_router,
+        node_manager.clone()
     );
     let workflow_service = WorkflowManagementImpl::with_node_manager(node_manager.clone());
 

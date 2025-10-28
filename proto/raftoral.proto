@@ -60,20 +60,12 @@ message DiscoveryRequest {
     // Empty for now, could include requester info in the future
 }
 
-enum RaftRole {
-    FOLLOWER = 0;
-    CANDIDATE = 1;
-    LEADER = 2;
-    LEARNER = 3;
-}
-
 message DiscoveryResponse {
-    uint64 node_id = 1;
-    RaftRole role = 2;
-    uint64 highest_known_node_id = 3;
-    string address = 4;
-    repeated uint64 voters = 5;      // Current voting members
-    repeated uint64 learners = 6;    // Current learner members
+    uint64 node_id = 1;                      // ID of the responding node
+    uint64 highest_known_node_id = 2;        // Highest node ID known in the cluster
+    string address = 3;                      // Address of the responding node
+    uint64 management_leader_node_id = 4;    // Node ID of management cluster leader (0 = no leader)
+    string management_leader_address = 5;    // Address of management cluster leader (empty if no leader)
 }
 
 // Workflow Management Service

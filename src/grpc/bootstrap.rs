@@ -7,31 +7,9 @@ use crate::grpc::server::raft_proto::{
 pub struct DiscoveredPeer {
     pub node_id: u64,
     pub address: String,
-    pub role: RaftRole,
     pub highest_known_node_id: u64,
-    pub voters: Vec<u64>,
-    pub learners: Vec<u64>,
-}
-
-/// Raft role of a node
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RaftRole {
-    Follower,
-    Candidate,
-    Leader,
-    Learner,
-}
-
-impl From<i32> for RaftRole {
-    fn from(value: i32) -> Self {
-        match value {
-            0 => RaftRole::Follower,
-            1 => RaftRole::Candidate,
-            2 => RaftRole::Leader,
-            3 => RaftRole::Learner,
-            _ => RaftRole::Follower, // Default
-        }
-    }
+    pub management_leader_node_id: u64,
+    pub management_leader_address: String,
 }
 
 /// Discover information from a peer node
@@ -44,10 +22,9 @@ pub async fn discover_peer(address: &str) -> Result<DiscoveredPeer, Box<dyn std:
     Ok(DiscoveredPeer {
         node_id: discovery.node_id,
         address: discovery.address,
-        role: RaftRole::from(discovery.role),
         highest_known_node_id: discovery.highest_known_node_id,
-        voters: discovery.voters,
-        learners: discovery.learners,
+        management_leader_node_id: discovery.management_leader_node_id,
+        management_leader_address: discovery.management_leader_address,
     })
 }
 
@@ -59,8 +36,8 @@ pub async fn discover_peers(addresses: Vec<String>) -> Vec<DiscoveredPeer> {
     for address in addresses {
         match discover_peer(&address).await {
             Ok(peer) => {
-                println!("✓ Discovered peer at {}: node_id={}, role={:?}, highest_known={}",
-                    address, peer.node_id, peer.role, peer.highest_known_node_id);
+                println!("✓ Discovered peer at {}: node_id={}, highest_known={}, mgmt_leader={}",
+                    address, peer.node_id, peer.highest_known_node_id, peer.management_leader_node_id);
                 peers.push(peer);
             }
             Err(e) => {
@@ -98,10 +75,9 @@ mod tests {
             DiscoveredPeer {
                 node_id: 1,
                 address: "127.0.0.1:5001".to_string(),
-                role: RaftRole::Leader,
                 highest_known_node_id: 3,
-                voters: vec![1, 2, 3],
-                learners: vec![],
+                management_leader_node_id: 1,
+                management_leader_address: "127.0.0.1:5001".to_string(),
             }
         ];
         assert_eq!(next_node_id(&peers), 4);
@@ -113,26 +89,23 @@ mod tests {
             DiscoveredPeer {
                 node_id: 1,
                 address: "127.0.0.1:5001".to_string(),
-                role: RaftRole::Leader,
                 highest_known_node_id: 3,
-                voters: vec![1, 2, 3],
-                learners: vec![],
+                management_leader_node_id: 1,
+                management_leader_address: "127.0.0.1:5001".to_string(),
             },
             DiscoveredPeer {
                 node_id: 2,
                 address: "127.0.0.1:5002".to_string(),
-                role: RaftRole::Follower,
                 highest_known_node_id: 5,
-                voters: vec![1, 2, 3],
-                learners: vec![],
+                management_leader_node_id: 1,
+                management_leader_address: "127.0.0.1:5001".to_string(),
             },
             DiscoveredPeer {
                 node_id: 3,
                 address: "127.0.0.1:5003".to_string(),
-                role: RaftRole::Follower,
                 highest_known_node_id: 5,
-                voters: vec![1, 2, 3],
-                learners: vec![],
+                management_leader_node_id: 1,
+                management_leader_address: "127.0.0.1:5001".to_string(),
             }
         ];
         // Should pick max highest_known_node_id (5) and add 1

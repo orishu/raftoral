@@ -174,12 +174,12 @@ impl RaftoralGrpcRuntime {
             info!("Advertise address: {}", advertise_addr);
         }
 
-        // Determine node ID and mode
-        let node_id = if config.bootstrap {
+        // Determine node ID and mode, and store leader info for later use
+        let (node_id, leader_info) = if config.bootstrap {
             let node_id = config.node_id.unwrap_or(1);
             info!("Mode: Bootstrap (starting new cluster)");
             info!("Node ID: {}", node_id);
-            node_id
+            (node_id, None)
         } else {
             info!("Mode: Join existing cluster");
 
@@ -188,7 +188,7 @@ impl RaftoralGrpcRuntime {
             }
 
             debug!("Discovering peers: {:?}", config.peers);
-            let discovered = discover_peers(config.peers.clone()).await;
+            let mut discovered = discover_peers(config.peers.clone()).await;
 
             if discovered.is_empty() {
                 return Err("Could not discover any peers".into());
@@ -199,14 +199,43 @@ impl RaftoralGrpcRuntime {
                 debug!("Peer: Node {} at {}", peer.node_id, peer.address);
             }
 
-            if let Some(id) = config.node_id {
+            // Hop to management leader if different from initial peer
+            if let Some(first_peer) = discovered.first() {
+                let leader_id = first_peer.management_leader_node_id;
+                let leader_addr = &first_peer.management_leader_address;
+
+                if leader_id != 0 && leader_id != first_peer.node_id && !leader_addr.is_empty() {
+                    info!("Hopping to management leader: Node {} at {}", leader_id, leader_addr);
+                    match bootstrap::discover_peer(leader_addr).await {
+                        Ok(leader_peer) => {
+                            info!("Discovered management leader: highest_known={}", leader_peer.highest_known_node_id);
+                            // Replace with leader's discovery response (it may have more up-to-date info)
+                            discovered = vec![leader_peer];
+                        }
+                        Err(e) => {
+                            warn!("Failed to discover management leader, using initial discovery: {}", e);
+                        }
+                    }
+                } else if leader_id == 0 {
+                    info!("No management leader elected yet, using initial discovery");
+                } else {
+                    info!("Initial peer is the management leader");
+                }
+            }
+
+            let node_id = if let Some(id) = config.node_id {
                 info!("Using provided node ID: {}", id);
                 id
             } else {
                 let id = bootstrap::next_node_id(&discovered);
                 info!("Auto-assigned node ID: {}", id);
                 id
-            }
+            };
+
+            // Extract leader info for later use
+            let leader_info = discovered.first().map(|peer| (peer.management_leader_node_id, peer.management_leader_address.clone()));
+
+            (node_id, leader_info)
         };
 
         // Build initial node configuration - only this node
@@ -240,6 +269,22 @@ impl RaftoralGrpcRuntime {
         ).await?);
         info!("NodeManager ready with management cluster");
         info!("ClusterRouter configured for management (cluster_id=0)");
+
+        // If joining a cluster and we discovered a management leader, add it to transport and set leader_id
+        if let Some((leader_id, leader_addr)) = leader_info {
+            if leader_id != 0 && !leader_addr.is_empty() {
+                info!("Adding management leader to transport: Node {} at {}", leader_id, leader_addr);
+                // Add leader to transport so we can communicate with it
+                transport.add_node(NodeConfig {
+                    node_id: leader_id,
+                    address: leader_addr.clone(),
+                }).await?;
+
+                // Set the leader_id in management cluster to avoid scanning
+                node_manager.management_cluster().set_leader_id(leader_id);
+                info!("Set management cluster leader_id to {}", leader_id);
+            }
+        }
 
         // Start gRPC server - gets ClusterRouter from NodeManager internally
         // Server must be started BEFORE add_node so it can receive Raft messages

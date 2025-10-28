@@ -38,6 +38,9 @@ async fn test_three_node_grpc_cluster_bootstrap() {
     // Phase 3: Use NodeManager
     let node_manager1 = Arc::new(NodeManager::new(transport1.clone(), 1).await.expect("Should create node manager 1"));
 
+    // Wait for management cluster to elect a leader
+    sleep(Duration::from_millis(1000)).await;
+
     // Initialize the default execution cluster
     node_manager1.initialize_default_cluster().await.expect("Should initialize default cluster");
     sleep(Duration::from_millis(500)).await; // Wait for async cluster creation
@@ -63,7 +66,6 @@ async fn test_three_node_grpc_cluster_bootstrap() {
     println!("  Discovered {} peer(s)", discovered.len());
     assert_eq!(discovered.len(), 1, "Should discover node 1");
     assert_eq!(discovered[0].node_id, 1, "Discovered node should be node 1");
-    println!("  Discovered voters: {:?}", discovered[0].voters);
 
     let port2 = port_check::free_local_port().expect("Should find free port for node 2");
     let addr2 = format!("127.0.0.1:{}", port2);
@@ -74,9 +76,6 @@ async fn test_three_node_grpc_cluster_bootstrap() {
         NodeConfig { node_id: 2, address: addr2.clone() },
     ]));
     transport2.start().await.expect("Transport 2 should start");
-
-    // Set discovered voters from discovery
-    transport2.set_discovered_voters(discovered[0].voters.clone());
 
     // Phase 3: Add node 1 to transport BEFORE creating cluster
     // This prevents node 2 from being detected as single-node and campaigning
@@ -120,7 +119,6 @@ async fn test_three_node_grpc_cluster_bootstrap() {
     let discovered = discover_peers(vec![addr1.clone(), addr2.clone()]).await;
     println!("  Discovered {} peer(s)", discovered.len());
     assert!(discovered.len() >= 1, "Should discover at least one node");
-    println!("  Discovered voters from first peer: {:?}", discovered[0].voters);
 
     let port3 = port_check::free_local_port().expect("Should find free port for node 3");
     let addr3 = format!("127.0.0.1:{}", port3);
@@ -131,9 +129,6 @@ async fn test_three_node_grpc_cluster_bootstrap() {
         NodeConfig { node_id: 3, address: addr3.clone() },
     ]));
     transport3.start().await.expect("Transport 3 should start");
-
-    // Set discovered voters from discovery
-    transport3.set_discovered_voters(discovered[0].voters.clone());
 
     // Add existing cluster members to transport BEFORE creating cluster
     // This prevents node 3 from being detected as single-node and campaigning
@@ -165,15 +160,32 @@ async fn test_three_node_grpc_cluster_bootstrap() {
 
     println!("✓ Node 3 added as voter\n");
 
-    // Wait for node 3 to catch up
-    sleep(Duration::from_millis(5000)).await;
+    // Wait for node 3 to catch up and for all nodes to see the full configuration
+    println!("  Waiting for cluster convergence...");
+    let start = std::time::Instant::now();
+    let cluster3 = loop {
+        sleep(Duration::from_millis(500)).await;
 
-    // Get cluster3 after it's been created through the management cluster
-    let cluster3 = node_manager3.get_execution_cluster(&INITIAL_EXECUTION_CLUSTER_ID)
-        .expect("Should have execution cluster after being added");
+        if start.elapsed() > Duration::from_secs(15) {
+            panic!("Timeout waiting for cluster convergence after 15 seconds");
+        }
+
+        if let Some(cluster3) = node_manager3.get_execution_cluster(&INITIAL_EXECUTION_CLUSTER_ID) {
+            let node_ids_1 = cluster1.get_node_ids();
+            let node_ids_2 = cluster2.get_node_ids();
+            let node_ids_3 = cluster3.get_node_ids();
+
+            println!("    Node 1 sees: {:?}, Node 2 sees: {:?}, Node 3 sees: {:?}", node_ids_1, node_ids_2, node_ids_3);
+
+            if node_ids_1.len() == 3 && node_ids_2.len() == 3 && node_ids_3.len() == 3 {
+                println!("  ✓ All nodes see 3-node cluster");
+                break cluster3;
+            }
+        }
+    };
 
     // Step 4: Verify cluster membership
-    println!("Step 4: Verifying cluster membership");
+    println!("\nStep 4: Verifying cluster membership");
     let node_ids_1 = cluster1.get_node_ids();
     let node_ids_2 = cluster2.get_node_ids();
     let node_ids_3 = cluster3.get_node_ids();
@@ -182,7 +194,7 @@ async fn test_three_node_grpc_cluster_bootstrap() {
     println!("  Node 2 sees: {:?}", node_ids_2);
     println!("  Node 3 sees: {:?}", node_ids_3);
 
-    // Verify all nodes see the same 3-node cluster
+    // Verify all nodes see the same 3-node cluster (should be true if we got here)
     assert_eq!(node_ids_1.len(), 3, "Node 1 should see 3 nodes");
     assert_eq!(node_ids_2.len(), 3, "Node 2 should see 3 nodes");
     assert_eq!(node_ids_3.len(), 3, "Node 3 should see 3 nodes");
@@ -227,7 +239,8 @@ async fn test_three_node_grpc_cluster_bootstrap() {
         strings: vec!["hello".to_string(), " world!".to_string()],
     };
 
-    let workflow_run = cluster2.executor.runtime().start_workflow::<ConcatInput, ConcatOutput>(
+    let runtime = cluster2.executor.runtime().expect("Should have runtime");
+    let workflow_run = runtime.start_workflow::<ConcatInput, ConcatOutput>(
         "concat",
         1,
         input.clone()

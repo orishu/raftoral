@@ -102,6 +102,11 @@ impl WorkflowCommandExecutor {
         *rt = Some(runtime);
     }
 
+    /// Get the workflow runtime reference
+    pub fn runtime(&self) -> Option<Arc<crate::workflow::runtime::WorkflowRuntime>> {
+        self.runtime.lock().unwrap().clone()
+    }
+
     /// Set this node's ID for ownership checks
     pub fn set_node_id(&self, id: u64) {
         let mut node_id = self.node_id.lock().unwrap();

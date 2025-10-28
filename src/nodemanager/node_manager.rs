@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use crate::raft::RaftCluster;
 use crate::raft::generic::grpc_transport::GrpcClusterTransport;
 use crate::raft::generic::message::Message;
-use crate::workflow::{WorkflowCommand, WorkflowCommandExecutor};
+use crate::workflow::WorkflowCommandExecutor;
 use super::{ManagementCommand, ManagementCommandExecutor};
 
 /// Initial execution cluster ID (cluster_id = 1)
@@ -117,6 +117,18 @@ impl NodeManager {
     /// Get the management cluster executor for querying cluster state
     pub fn management_executor(&self) -> &ManagementCommandExecutor {
         &self.management_cluster.executor
+    }
+
+    /// Get the management cluster for accessing leader info
+    pub fn management_cluster(&self) -> &Arc<RaftCluster<ManagementCommandExecutor>> {
+        &self.management_cluster
+    }
+
+    /// Get the address for a specific node ID from the transport
+    /// Returns None if node is not found
+    pub fn get_node_address(&self, node_id: u64) -> Option<String> {
+        let addresses = self.transport.get_node_addresses_sync(&[node_id]);
+        addresses.first().cloned()
     }
 
     /// Get a specific execution cluster by ID

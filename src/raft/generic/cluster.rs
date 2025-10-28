@@ -64,19 +64,10 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
         // Create mailbox channel for this node
         let (local_sender, mailbox_receiver) = mpsc::unbounded_channel();
 
-        // Determine initial node count from discovered voters (peer nodes)
-        // For InMemoryClusterTransport, this will be empty initially (no peers registered yet)
-        // For GrpcClusterTransport, this comes from peer discovery
-        // Note: transport only handles outgoing messages to OTHER nodes, so discovered_voters
-        // represents peer nodes only. Total cluster size = discovered_voters + self (this node)
-        let discovered_voters = transport.get_discovered_voters();
-        let node_count = if discovered_voters.is_empty() {
-            // No discovered voters means single-node bootstrap (only this node, no peers)
-            1
-        } else {
-            // Multi-node: discovered peers + this node
-            discovered_voters.len() + 1
-        };
+        // Determine initial node count from transport
+        // For single-node bootstrap, list_nodes() returns just this node (count = 1)
+        // For multi-node clusters, list_nodes() returns all known nodes
+        let node_count = transport.list_nodes().len().max(1);
 
         // Special handling for InMemoryClusterTransport: register this node
         // This is necessary because InMemoryClusterTransport is an in-process testing transport
@@ -245,26 +236,16 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
             }
         }
 
-        // Try 3: If still not sent, scan all nodes to find the leader
-        if !sent {
-            let node_ids = self.transport.list_nodes();
-            for node_id in node_ids {
-                if node_id == self.node_id {
-                    continue; // Already tried self if we were leader
-                }
-                let message = create_message(sync_id);
-                if self.transport.send_message_to_node(node_id, message, self.cluster_id).is_ok() {
-                    sent = true;
-                    break;
-                }
-            }
-        }
-
+        // If still not sent, it means:
+        // - We're not the leader
+        // - We don't know who the leader is (leader_id = 0)
+        // This can happen during leader election or at cluster startup
+        // In this case, fail fast rather than scanning - the caller should retry
         if !sent {
             // Failed to send - clean up the waiter
             let mut waiters = self.sync_waiters.lock().unwrap();
             waiters.remove(&sync_id);
-            return Err(format!("Failed to send {} to any node", operation_name).into());
+            return Err(format!("Failed to send {} - no known leader (this node is not leader and leader_id is unknown)", operation_name).into());
         }
 
         // Wait for the entry to be applied
@@ -351,6 +332,16 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
     /// Get the full Raft configuration state (voters and learners separately)
     pub fn get_conf_state(&self) -> raft::prelude::ConfState {
         self.cached_conf_state.read().unwrap().clone()
+    }
+
+    /// Get the current leader node ID (0 = unknown/no leader)
+    pub fn get_leader_id(&self) -> u64 {
+        self.leader_id.load(Ordering::SeqCst)
+    }
+
+    /// Set the leader node ID (used during discovery to avoid scanning)
+    pub fn set_leader_id(&self, leader_id: u64) {
+        self.leader_id.store(leader_id, Ordering::SeqCst);
     }
 
     /// Get the ID of this node

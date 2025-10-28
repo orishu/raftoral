@@ -54,10 +54,6 @@ pub struct GrpcClusterTransport
 
     /// Custom channel builder for gRPC connections
     channel_builder: ChannelBuilder,
-
-    /// Discovered cluster configuration (voters from discovery)
-    /// Used to initialize joining nodes with proper Raft configuration
-    discovered_voters: Arc<RwLock<Vec<u64>>>,
 }
 
 impl GrpcClusterTransport
@@ -130,7 +126,6 @@ impl GrpcClusterTransport
             node_receivers: Arc::new(Mutex::new(node_receivers_map)),
             shutdown_tx: Arc::new(Mutex::new(None)),
             channel_builder,
-            discovered_voters: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -247,17 +242,6 @@ impl GrpcClusterTransport
     pub async fn get_all_nodes(&self) -> Vec<NodeConfig> {
         let nodes = self.nodes.read().unwrap();
         nodes.values().cloned().collect()
-    }
-
-    /// Set discovered voter configuration from peer discovery
-    /// This should be called after discovering the cluster but before creating nodes
-    pub fn set_discovered_voters(&self, voters: Vec<u64>) {
-        *self.discovered_voters.write().unwrap() = voters;
-    }
-
-    /// Get discovered voter configuration
-    pub fn get_discovered_voters(&self) -> Vec<u64> {
-        self.discovered_voters.read().unwrap().clone()
     }
 
     /// Get addresses for multiple nodes (synchronous version for convenience)
@@ -520,10 +504,6 @@ where
 
         Ok(())
     }
-
-    fn get_discovered_voters(&self) -> Vec<u64> {
-        self.discovered_voters.read().unwrap().clone()
-    }
 }
 
 #[cfg(test)]
@@ -644,11 +624,10 @@ mod tests {
             ) -> Result<Response<crate::grpc::server::raft_proto::DiscoveryResponse>, Status> {
                 Ok(Response::new(crate::grpc::server::raft_proto::DiscoveryResponse {
                     node_id: 1,
-                    role: 0,
                     highest_known_node_id: 1,
                     address: self.addr.clone(),
-                    voters: vec![1],
-                    learners: vec![],
+                    management_leader_node_id: 0,  // No leader in this test
+                    management_leader_address: String::new(),
                 }))
             }
         }
