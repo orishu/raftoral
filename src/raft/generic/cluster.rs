@@ -11,6 +11,7 @@ pub enum RoleChange {
     BecameLeader(u64),    // node_id that became leader
     BecameFollower(u64),  // node_id that became follower
     BecameCandidate(u64), // node_id that became candidate
+    LeaderKnown(u64),     // leader_id is now known (for followers)
 }
 
 #[derive(Clone)]
@@ -60,6 +61,7 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
         cluster_id: u32,
         transport: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<E::Command>>>,
         executor: E,
+        bootstrap_peers: Option<Vec<u64>>, // If Some, bootstrap multi-node cluster with these peers
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Create mailbox channel for this node
         let (local_sender, mailbox_receiver) = mpsc::unbounded_channel();
@@ -99,8 +101,11 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
         tokio::spawn(async move {
             let mut role_rx = role_change_tx_clone.subscribe();
             while let Ok(role_change) = role_rx.recv().await {
-                if let RoleChange::BecameLeader(id) = role_change {
-                    leader_id_listener.store(id, Ordering::SeqCst);
+                match role_change {
+                    RoleChange::BecameLeader(id) | RoleChange::LeaderKnown(id) => {
+                        leader_id_listener.store(id, Ordering::SeqCst);
+                    },
+                    _ => {}
                 }
             }
         });
@@ -149,6 +154,7 @@ impl<E: CommandExecutor + 'static> RaftCluster<E> {
             cached_config_arc.clone(),
             cached_conf_state_arc.clone(),
             applied_tx.clone(),
+            bootstrap_peers,
         )?;
 
         // Spawn the node
@@ -417,7 +423,7 @@ mod tests {
         let transport = Arc::new(InMemoryClusterTransport::<Message<TestCommand>>::new());
         let executor = TestCommandExecutor;
         let transport_ref: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<TestCommand>>> = transport.clone();
-        let cluster = RaftCluster::new(1, 0, transport_ref, executor).await;
+        let cluster = RaftCluster::new(1, 0, transport_ref, executor, None).await;
         assert!(cluster.is_ok());
 
         let cluster = Arc::new(cluster.unwrap());
@@ -460,7 +466,7 @@ mod tests {
         let transport = Arc::new(InMemoryClusterTransport::<Message<TestCommand>>::new());
         let executor = TestCommandExecutor;
         let transport_ref: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<TestCommand>>> = transport.clone();
-        let cluster = Arc::new(RaftCluster::new(1, 0, transport_ref, executor).await
+        let cluster = Arc::new(RaftCluster::new(1, 0, transport_ref, executor, None).await
             .expect("Failed to create single node cluster"));
 
         // Wait for leadership establishment
@@ -564,7 +570,7 @@ mod tests {
         let transport = Arc::new(InMemoryClusterTransport::<Message<TestCommand>>::new());
         let executor = TestCommandExecutor;
         let transport_ref: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<TestCommand>>> = transport.clone();
-        let cluster = Arc::new(RaftCluster::new(1, 0, transport_ref, executor).await
+        let cluster = Arc::new(RaftCluster::new(1, 0, transport_ref, executor, None).await
             .expect("Failed to create single node cluster"));
 
         // Wait for leadership establishment

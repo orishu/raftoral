@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
+use slog::Drain;
 
 use crate::raft::generic::message::CommandExecutor;
 use crate::raft::RaftCluster;
@@ -78,8 +79,12 @@ pub struct ManagementCommandExecutor {
 
 impl ManagementCommandExecutor {
     pub fn new() -> Self {
-        // Create a default logger with discard drain
-        let logger = slog::Logger::root(slog::Discard, slog::o!());
+        // Create a proper logger that outputs to terminal
+        let decorator = slog_term::TermDecorator::new().build();
+        let drain = slog_term::FullFormat::new(decorator).build().fuse();
+        let drain = slog_async::Async::new(drain).build().fuse();
+        let logger = slog::Logger::root(drain, slog::o!("component" => "ManagementExecutor"));
+
         Self {
             state: Arc::new(Mutex::new(ManagementState::default())),
             management_cluster: Mutex::new(None),
@@ -164,6 +169,7 @@ impl CommandExecutor for ManagementCommandExecutor {
     type Command = ManagementCommand;
 
     fn apply(&self, command: &Self::Command) -> Result<(), Box<dyn std::error::Error>> {
+        slog::error!(self.logger, "ManagementCommandExecutor::apply() CALLED!!!"; "command" => ?command);
         let mut state = self.state.lock().unwrap();
 
         match command {
@@ -242,7 +248,7 @@ impl CommandExecutor for ManagementCommandExecutor {
                     // Create transport reference
                     let transport_ref: Arc<dyn crate::raft::generic::transport::TransportInteraction<crate::raft::generic::message::Message<crate::workflow::WorkflowCommand>>> = transport.clone();
 
-                    match RaftCluster::new(node_id, cluster_id, transport_ref, executor).await {
+                    match RaftCluster::new(node_id, cluster_id, transport_ref, executor, None).await {
                         Ok(cluster) => {
                             let cluster = Arc::new(cluster);
 
@@ -363,15 +369,23 @@ impl CommandExecutor for ManagementCommandExecutor {
                         clusters.contains_key(&cluster_id)
                     };
 
+                    slog::info!(logger, "AssociateNode async task running";
+                        "cluster_exists" => cluster_exists,
+                        "current_node_id" => current_node_id,
+                        "node_id_to_add" => node_id_to_add);
+
                     // Path 1: If this is the node being associated and cluster doesn't exist, create it
+                    // The cluster will join via snapshot from the leader
                     if !cluster_exists && current_node_id == node_id_to_add {
-                        slog::info!(logger, "Creating execution cluster for joining node";
+                        slog::info!(logger, "Creating execution cluster for joining node (will receive snapshot from leader)";
                             "node_id" => node_id_to_add, "cluster_id" => %cluster_id);
 
                         let executor = WorkflowCommandExecutor::default();
                         let transport_ref: Arc<dyn crate::raft::generic::transport::TransportInteraction<crate::raft::generic::message::Message<crate::workflow::WorkflowCommand>>> = transport.clone();
 
-                        match RaftCluster::new(current_node_id, cluster_id, transport_ref, executor).await {
+                        // Create cluster in "joining" mode (no bootstrap_peers)
+                        // It will receive a snapshot from the leader with the correct configuration
+                        match RaftCluster::new(current_node_id, cluster_id, transport_ref, executor, None).await {
                             Ok(cluster) => {
                                 let cluster = Arc::new(cluster);
 
@@ -401,15 +415,21 @@ impl CommandExecutor for ManagementCommandExecutor {
 
                     // Path 2: If cluster exists, check if we're the leader and add the node
                     if cluster_exists {
+                        slog::info!(logger, "Path 2: Cluster exists, checking leadership");
+
                         let cluster = {
                             let clusters = execution_clusters_arc.lock().unwrap();
                             clusters.get(&cluster_id).cloned()
                         };
 
                         if let Some(cluster) = cluster {
+                            slog::info!(logger, "Path 2: Got cluster reference, checking is_leader");
+                            let is_leader = cluster.is_leader().await;
+                            slog::info!(logger, "Path 2: is_leader check result"; "is_leader" => is_leader);
+
                             // Only the leader should propose the ConfChange
-                            if !cluster.is_leader().await {
-                                slog::debug!(logger, "Not leader, skipping add_node ConfChange";
+                            if !is_leader {
+                                slog::info!(logger, "Not leader, skipping add_node ConfChange";
                                     "node_id" => node_id_to_add, "cluster_id" => %cluster_id);
                                 return;
                             }
@@ -423,6 +443,25 @@ impl CommandExecutor for ManagementCommandExecutor {
                                     return;
                                 }
                             };
+
+                            // Wait for the joining node to create its cluster (Path 1 is async)
+                            // Retry with exponential backoff: 50ms, 100ms, 200ms, 400ms, 800ms = ~1.5s total
+                            slog::info!(logger, "Waiting for joining node to create its cluster";
+                                "node_id" => node_id_to_add, "cluster_id" => %cluster_id);
+
+                            let mut delay_ms = 50u64;
+                            let mut retries = 0;
+                            let max_retries = 5;
+
+                            while retries < max_retries {
+                                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+                                retries += 1;
+
+                                slog::debug!(logger, "Retry attempt";
+                                    "retry" => retries, "delay_ms" => delay_ms);
+
+                                delay_ms *= 2; // Exponential backoff
+                            }
 
                             // Leader proposes ConfChange to add the node
                             slog::info!(logger, "Leader adding node to execution cluster via ConfChange";
@@ -486,9 +525,13 @@ impl CommandExecutor for ManagementCommandExecutor {
         Ok(())
     }
 
-    fn apply_with_index(&self, command: &Self::Command, _log_index: u64) -> Result<(), Box<dyn std::error::Error>> {
+    fn apply_with_index(&self, command: &Self::Command, log_index: u64) -> Result<(), Box<dyn std::error::Error>> {
         // For now, just delegate to apply (ignoring the index)
-        self.apply(command)
+        eprintln!("!!! ManagementCommandExecutor::apply_with_index() called! log_index={}, command={:?}", log_index, command);
+        slog::error!(self.logger, "ManagementCommandExecutor::apply_with_index() ENTRY!"; "log_index" => log_index, "command" => ?command);
+        let result = self.apply(command);
+        slog::error!(self.logger, "ManagementCommandExecutor::apply_with_index() EXIT!"; "result" => ?result);
+        result
     }
 
     fn on_node_added(&self, added_node_id: u64, address: &str, is_leader: bool) {
@@ -575,12 +618,92 @@ impl CommandExecutor for ManagementCommandExecutor {
 
         // Restore state
         let mut state = self.state.lock().unwrap();
-        state.restore_from_snapshot(snapshot);
+        state.restore_from_snapshot(snapshot.clone());
 
         slog::info!(self.logger, "Restored management state from snapshot";
                    "execution_clusters" => state.execution_clusters.len(),
                    "node_memberships" => state.node_memberships.len()
         );
+
+        // Drop the lock before async operations
+        drop(state);
+
+        // CRITICAL: After restoring snapshot, create any execution clusters this node should be part of
+        // This handles the case where a node joins via snapshot and skips the normal AssociateNode apply() path
+        if let Some(node_id) = self.node_id.lock().unwrap().as_ref() {
+            let node_id = *node_id;
+            slog::info!(self.logger, "Checking if node should have execution clusters after snapshot restore"; "node_id" => node_id);
+
+            // Find all clusters this node should be part of
+            slog::info!(self.logger, "Snapshot node_memberships";
+                "node_memberships" => ?snapshot.node_memberships);
+
+            let clusters_to_create: Vec<u32> = snapshot.node_memberships
+                .get(&node_id)
+                .map(|cluster_ids| cluster_ids.iter().copied().collect())
+                .unwrap_or_default();
+
+            slog::info!(self.logger, "Clusters to create for this node";
+                "node_id" => node_id,
+                "clusters" => ?clusters_to_create);
+
+            if !clusters_to_create.is_empty() {
+                slog::info!(self.logger, "Node should be in execution clusters, creating them";
+                    "node_id" => node_id,
+                    "cluster_ids" => ?clusters_to_create
+                );
+
+                // Create each execution cluster this node should be part of
+                for cluster_id in clusters_to_create {
+                    let execution_clusters_arc = self.execution_clusters.lock().unwrap().clone().expect("Execution clusters not set");
+                    let transport = self.transport.lock().unwrap().clone().expect("Transport not set");
+                    let cluster_router = self.cluster_router.lock().unwrap().clone().expect("ClusterRouter not set");
+                    let logger = self.logger.clone();
+
+                    // Check if cluster already exists
+                    let cluster_exists = execution_clusters_arc.lock().unwrap().contains_key(&cluster_id);
+
+                    if !cluster_exists {
+                        slog::info!(logger, "Creating execution cluster for node after snapshot restore";
+                            "node_id" => node_id, "cluster_id" => cluster_id);
+
+                        tokio::spawn(async move {
+                            let executor = WorkflowCommandExecutor::default();
+                            let transport_ref: Arc<dyn crate::raft::generic::transport::TransportInteraction<crate::raft::generic::message::Message<crate::workflow::WorkflowCommand>>> = transport.clone();
+
+                            match RaftCluster::new(node_id, cluster_id, transport_ref, executor, None).await {
+                                Ok(cluster) => {
+                                    let cluster = Arc::new(cluster);
+
+                                    // Create WorkflowRuntime for this cluster
+                                    let workflow_runtime = crate::workflow::runtime::WorkflowRuntime::new(cluster.clone());
+                                    cluster.executor.set_runtime(workflow_runtime);
+
+                                    // Register cluster in ClusterRouter
+                                    if let Err(e) = cluster_router.register_execution_cluster(cluster_id, cluster.local_sender.clone()) {
+                                        slog::error!(logger, "Failed to register execution cluster in router"; "error" => %e);
+                                        return;
+                                    }
+
+                                    // Add to shared execution_clusters HashMap
+                                    execution_clusters_arc.lock().unwrap().insert(cluster_id, cluster);
+
+                                    slog::info!(logger, "Execution cluster created successfully after snapshot restore";
+                                        "node_id" => node_id, "cluster_id" => cluster_id);
+                                }
+                                Err(e) => {
+                                    slog::error!(logger, "Failed to create execution cluster after snapshot restore";
+                                        "cluster_id" => cluster_id, "error" => %e);
+                                }
+                            }
+                        });
+                    } else {
+                        slog::debug!(logger, "Execution cluster already exists, skipping creation";
+                            "cluster_id" => cluster_id);
+                    }
+                }
+            }
+        }
 
         Ok(())
     }

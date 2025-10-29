@@ -212,6 +212,11 @@ async fn test_three_node_grpc_cluster_bootstrap() {
 
     println!("✓ All nodes see the same 3-node cluster\n");
 
+    // Wait for execution cluster to establish leadership
+    println!("  Waiting for execution cluster leadership...");
+    sleep(Duration::from_millis(1000)).await;
+    println!("✓ Leadership established\n");
+
     // Step 5: Register workflow on all nodes
     println!("Step 5: Registering string concatenation workflow on all nodes");
 

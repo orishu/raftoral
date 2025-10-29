@@ -49,7 +49,7 @@ impl NodeManager {
         // Create management cluster (cluster_id = 0) using the transport
         let management_executor = ManagementCommandExecutor::default();
         let management_transport_ref: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<ManagementCommand>>> = transport.clone();
-        let management_cluster = Arc::new(RaftCluster::new(node_id, 0, management_transport_ref, management_executor).await?);
+        let management_cluster = Arc::new(RaftCluster::new(node_id, 0, management_transport_ref, management_executor, None).await?);
 
         // Create ClusterRouter and register management cluster
         // Execution clusters will be registered dynamically as they're created

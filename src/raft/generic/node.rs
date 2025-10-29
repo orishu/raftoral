@@ -71,6 +71,9 @@ pub struct RaftNode<E: CommandExecutor> {
     // Snapshot configuration
     snapshot_config: SnapshotConfig,
 
+    // Flag to trigger snapshot creation after current batch of entries is committed
+    pending_snapshot: bool,
+
     // Applied entries channel: send (log_index, context) when entries are applied
     // Used by RaftCluster for synchronous command tracking
     applied_tx: mpsc::UnboundedSender<(u64, Vec<u8>)>,
@@ -87,9 +90,11 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
         cached_config: Arc<RwLock<Vec<u64>>>,
         cached_conf_state: Arc<RwLock<raft::prelude::ConfState>>,
         applied_tx: mpsc::UnboundedSender<(u64, Vec<u8>)>,
+        bootstrap_peers: Option<Vec<u64>>, // If Some, bootstrap multi-node cluster with these peers
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let node_count = transport.list_nodes().len();
         let is_single_node = node_count == 1;
+        let is_multi_node_bootstrap = bootstrap_peers.is_some();
 
         let config = Config {
             id: node_id,
@@ -98,15 +103,15 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             applied: 0,
             max_size_per_msg: 1024 * 1024 * 1024,
             max_inflight_msgs: 256,
-            check_quorum: !is_single_node, // Disable quorum check for single-node
-            pre_vote: !is_single_node, // Disable pre-vote for single node
+            check_quorum: !(is_single_node && !is_multi_node_bootstrap), // Enable quorum check for multi-node
+            pre_vote: !(is_single_node && !is_multi_node_bootstrap), // Enable pre-vote for multi-node
             ..Default::default()
         };
 
         let storage = MemStorageWithSnapshot::new();
 
         // Set up the initial cluster configuration
-        if is_single_node {
+        if is_single_node && !is_multi_node_bootstrap {
             // Bootstrap node: Initialize with self in configuration
             let mut initial_state = ConfState::default();
             initial_state.voters.push(node_id);
@@ -116,6 +121,15 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
 
             // Cache first entry info (will be set after first leader election creates index 1)
             // For now, leave as None - will be populated after the node becomes leader
+        } else if let Some(_peers) = bootstrap_peers {
+            // Reserved for future use: Multi-node bootstrap
+            // Currently we use join protocol via snapshots instead
+            // Joining node: Initialize with peer list from transport
+            let peer_ids: Vec<u64> = transport.list_nodes().into_iter()
+                .filter(|&id| id != node_id)  // Don't include self
+                .collect();
+            *cached_config.write().unwrap() = peer_ids;
+            // cached_conf_state stays empty - will be populated when snapshot is received
         } else {
             // Joining node: Initialize with peer list from transport
             // Use cached_config for tracking known peers (excluding self)
@@ -130,7 +144,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
         let decorator = slog_term::TermDecorator::new().build();
         let drain = slog_term::FullFormat::new(decorator).build().fuse();
         let drain = slog_async::Async::new(drain).build().fuse();
-        let logger = slog::Logger::root(drain, slog::o!("node_id" => node_id));
+        let logger = slog::Logger::root(drain, slog::o!("node_id" => node_id, "cluster_id" => cluster_id));
 
         let raft_group = RawNode::new(&config, storage, &logger)?;
 
@@ -149,6 +163,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             current_role: StateRole::Follower, // Start as follower
             committed_index: 0,
             snapshot_config: SnapshotConfig::default(),
+            pending_snapshot: false,
             applied_tx,
         };
 
@@ -228,7 +243,19 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             }
 
             // Apply to Raft storage (using our custom method that preserves data)
-            store.apply_snapshot_with_data(snapshot)?;
+            store.apply_snapshot_with_data(snapshot.clone())?;
+
+            // Update cached configuration from snapshot metadata
+            let conf_state = snapshot.get_metadata().get_conf_state();
+            *self.cached_conf_state.write().unwrap() = conf_state.clone();
+
+            // Update cached config with voter node IDs
+            let voters: Vec<u64> = conf_state.voters.iter().copied().collect();
+            *self.cached_config.write().unwrap() = voters.clone();
+
+            slog::info!(self.logger, "Updated cached config from snapshot";
+                "voters" => ?voters
+            );
         }
 
         // Handle committed entries BEFORE persisting new entries
@@ -290,6 +317,13 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
         // Advance apply index
         self.raft_group.advance_apply();
 
+        // Sync leader_id from raft's internal state
+        // This ensures followers know who the leader is after receiving heartbeats
+        let raft_leader_id = self.raft_group.raft.leader_id;
+        if raft_leader_id != raft::INVALID_ID {
+            let _ = self.role_change_tx.send(RoleChange::LeaderKnown(raft_leader_id));
+        }
+
         Ok(())
     }
 
@@ -307,9 +341,14 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
     fn handle_committed_entries(&mut self, entries: &[Entry]) -> Result<Option<u64>, Box<dyn std::error::Error>> {
         let mut last_applied_index = None;
 
+        slog::error!(self.logger, "handle_committed_entries() called"; "num_entries" => entries.len());
+
         for entry in entries {
+            slog::error!(self.logger, "Processing entry"; "index" => entry.index, "type" => ?entry.entry_type, "data_len" => entry.data.len());
+
             if entry.data.is_empty() {
                 // Empty entry, usually a leadership change
+                slog::error!(self.logger, "Empty entry, skipping");
                 last_applied_index = Some(entry.index);
                 continue;
             }
@@ -317,18 +356,33 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             match entry.entry_type {
                 EntryType::EntryNormal => {
                     // Deserialize command directly (no wrapper - sync_id is in context)
-                    if let Ok(command) = serde_json::from_slice::<E::Command>(&entry.data) {
-                        // Track committed index
-                        self.committed_index = entry.index;
+                    slog::error!(self.logger, "About to deserialize EntryNormal"; "index" => entry.index, "data_len" => entry.data.len());
+                    match serde_json::from_slice::<E::Command>(&entry.data) {
+                        Ok(command) => {
+                            slog::error!(self.logger, "Deserialization SUCCESS! Calling apply_command"; "index" => entry.index);
+                            // Track committed index
+                            self.committed_index = entry.index;
 
-                        let result = self.apply_command(&command, entry.index);
+                            let result = self.apply_command(&command, entry.index);
 
-                        // Send applied entry notification with context (for sync tracking)
-                        // Context contains the sync_id as 8 bytes
-                        let _ = self.applied_tx.send((entry.index, entry.context.to_vec()));
+                            // Send applied entry notification with context (for sync tracking)
+                            // Context contains the sync_id as 8 bytes
+                            let _ = self.applied_tx.send((entry.index, entry.context.to_vec()));
 
-                        result?;
-                        last_applied_index = Some(entry.index);
+                            result?;
+                            last_applied_index = Some(entry.index);
+                        }
+                        Err(e) => {
+                            slog::error!(self.logger, "Failed to deserialize command from log entry";
+                                "index" => entry.index,
+                                "error" => %e,
+                                "data_len" => entry.data.len(),
+                                "data_preview" => ?String::from_utf8_lossy(&entry.data[..entry.data.len().min(100)])
+                            );
+                            eprintln!("!!! DESERIALIZATION FAILED: index={}, error={}, data={:?}",
+                                entry.index, e, String::from_utf8_lossy(&entry.data[..entry.data.len().min(200)]));
+                            last_applied_index = Some(entry.index);
+                        }
                     }
                 },
                 EntryType::EntryConfChange => {
@@ -361,12 +415,33 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             }
         }
 
+        // Check if we need to create a snapshot after all entries are committed
+        if self.pending_snapshot {
+            self.pending_snapshot = false; // Clear the flag first
+
+            // Use the last applied index from this batch for the snapshot
+            let snapshot_index = last_applied_index.unwrap_or(self.committed_index);
+            if let Err(e) = self.trigger_snapshot_with_index(snapshot_index) {
+                slog::warn!(self.logger, "Failed to create snapshot after adding node"; "error" => %e);
+            } else {
+                slog::info!(self.logger, "Created snapshot for newly added node"; "index" => snapshot_index);
+            }
+        }
+
         Ok(last_applied_index)
     }
 
     fn apply_command(&mut self, command: &E::Command, log_index: u64) -> Result<(), Box<dyn std::error::Error>> {
         // Use the executor to apply the command with log index
-        self.executor.apply_with_index(command, log_index)
+        slog::error!(self.logger, "apply_command() calling executor.apply_with_index"; "log_index" => log_index);
+        let result = self.executor.apply_with_index(command, log_index);
+        if let Err(ref e) = result {
+            slog::error!(self.logger, "executor.apply_with_index() returned ERROR"; "error" => %e);
+            eprintln!("!!! executor.apply_with_index() ERROR: log_index={}, error={}", log_index, e);
+        } else {
+            slog::error!(self.logger, "executor.apply_with_index() SUCCESS!");
+        }
+        result
     }
 
 
@@ -413,6 +488,15 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                             // Notify the executor so it can handle dynamic cluster construction
                             let is_leader = self.is_leader();
                             self.executor.on_node_added(node_id, &meta.address, is_leader);
+
+                            // CRITICAL: If leader, create snapshot after adding node
+                            // For EXECUTION clusters only (cluster_id > 0), this enables joining nodes
+                            // to receive state via snapshot
+                            // For MANAGEMENT cluster (cluster_id = 0), skip to avoid timing issues
+                            if is_leader && self.cluster_id > 0 {
+                                self.pending_snapshot = true;
+                                slog::info!(self.logger, "Will create snapshot for new node after batch commits"; "node_id" => node_id);
+                            }
                         }
                     }
                 },
@@ -692,15 +776,17 @@ impl<E: CommandExecutor> RaftNode<E> {
 
     /// Trigger automatic snapshot creation using executor's implementation
     fn trigger_snapshot_creation(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let last_applied = self.committed_index;
+        self.trigger_snapshot_with_index(self.committed_index)
+    }
 
+    fn trigger_snapshot_with_index(&mut self, snapshot_index: u64) -> Result<(), Box<dyn std::error::Error>> {
         // Get snapshot data from executor
-        let snapshot_data = self.executor.create_snapshot(last_applied)?;
+        let snapshot_data = self.executor.create_snapshot(snapshot_index)?;
         let data_size = snapshot_data.len(); // Save size before moving
 
         // Get raft metadata
         let store = self.raft_group.raft.raft_log.store.clone();
-        let term = store.term(last_applied)?;
+        let term = store.term(snapshot_index)?;
         let conf_state = self.raft_group.raft.prs().conf().to_conf_state();
 
         // Create raft snapshot
@@ -708,7 +794,7 @@ impl<E: CommandExecutor> RaftNode<E> {
         raft_snapshot.set_data(snapshot_data.into());
 
         let mut snapshot_metadata = SnapshotMetadata::default();
-        snapshot_metadata.set_index(last_applied);
+        snapshot_metadata.set_index(snapshot_index);
         snapshot_metadata.set_term(term);
         snapshot_metadata.set_conf_state(conf_state);
         raft_snapshot.set_metadata(snapshot_metadata);
@@ -717,13 +803,13 @@ impl<E: CommandExecutor> RaftNode<E> {
         store.apply_snapshot_with_data(raft_snapshot)?;
 
         slog::info!(self.logger, "Created automatic snapshot";
-            "snapshot_index" => last_applied,
+            "snapshot_index" => snapshot_index,
             "data_size" => data_size
         );
 
         // Compact logs if configured
         if self.snapshot_config.auto_compact {
-            self.compact_log(last_applied)?;
+            self.compact_log(snapshot_index)?;
         }
 
         Ok(())
