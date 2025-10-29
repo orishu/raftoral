@@ -341,14 +341,14 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
     fn handle_committed_entries(&mut self, entries: &[Entry]) -> Result<Option<u64>, Box<dyn std::error::Error>> {
         let mut last_applied_index = None;
 
-        slog::error!(self.logger, "handle_committed_entries() called"; "num_entries" => entries.len());
+        slog::debug!(self.logger, "Processing committed entries"; "num_entries" => entries.len());
 
         for entry in entries {
-            slog::error!(self.logger, "Processing entry"; "index" => entry.index, "type" => ?entry.entry_type, "data_len" => entry.data.len());
+            slog::trace!(self.logger, "Processing entry"; "index" => entry.index, "type" => ?entry.entry_type, "data_len" => entry.data.len());
 
             if entry.data.is_empty() {
                 // Empty entry, usually a leadership change
-                slog::error!(self.logger, "Empty entry, skipping");
+                slog::trace!(self.logger, "Empty entry, skipping");
                 last_applied_index = Some(entry.index);
                 continue;
             }
@@ -356,10 +356,8 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             match entry.entry_type {
                 EntryType::EntryNormal => {
                     // Deserialize command directly (no wrapper - sync_id is in context)
-                    slog::error!(self.logger, "About to deserialize EntryNormal"; "index" => entry.index, "data_len" => entry.data.len());
                     match serde_json::from_slice::<E::Command>(&entry.data) {
                         Ok(command) => {
-                            slog::error!(self.logger, "Deserialization SUCCESS! Calling apply_command"; "index" => entry.index);
                             // Track committed index
                             self.committed_index = entry.index;
 
@@ -379,8 +377,6 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
                                 "data_len" => entry.data.len(),
                                 "data_preview" => ?String::from_utf8_lossy(&entry.data[..entry.data.len().min(100)])
                             );
-                            eprintln!("!!! DESERIALIZATION FAILED: index={}, error={}, data={:?}",
-                                entry.index, e, String::from_utf8_lossy(&entry.data[..entry.data.len().min(200)]));
                             last_applied_index = Some(entry.index);
                         }
                     }
@@ -433,13 +429,9 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
 
     fn apply_command(&mut self, command: &E::Command, log_index: u64) -> Result<(), Box<dyn std::error::Error>> {
         // Use the executor to apply the command with log index
-        slog::error!(self.logger, "apply_command() calling executor.apply_with_index"; "log_index" => log_index);
         let result = self.executor.apply_with_index(command, log_index);
         if let Err(ref e) = result {
-            slog::error!(self.logger, "executor.apply_with_index() returned ERROR"; "error" => %e);
-            eprintln!("!!! executor.apply_with_index() ERROR: log_index={}, error={}", log_index, e);
-        } else {
-            slog::error!(self.logger, "executor.apply_with_index() SUCCESS!");
+            slog::error!(self.logger, "Failed to apply command"; "log_index" => log_index, "error" => %e);
         }
         result
     }

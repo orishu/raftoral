@@ -169,7 +169,6 @@ impl CommandExecutor for ManagementCommandExecutor {
     type Command = ManagementCommand;
 
     fn apply(&self, command: &Self::Command) -> Result<(), Box<dyn std::error::Error>> {
-        slog::error!(self.logger, "ManagementCommandExecutor::apply() CALLED!!!"; "command" => ?command);
         let mut state = self.state.lock().unwrap();
 
         match command {
@@ -445,23 +444,13 @@ impl CommandExecutor for ManagementCommandExecutor {
                             };
 
                             // Wait for the joining node to create its cluster (Path 1 is async)
-                            // Retry with exponential backoff: 50ms, 100ms, 200ms, 400ms, 800ms = ~1.5s total
+                            // The async task (tokio::spawn in Path 1) creates the cluster and
+                            // we need it to exist before calling add_node via ConfChange
+                            // Typical cluster creation takes 50-200ms
                             slog::info!(logger, "Waiting for joining node to create its cluster";
                                 "node_id" => node_id_to_add, "cluster_id" => %cluster_id);
 
-                            let mut delay_ms = 50u64;
-                            let mut retries = 0;
-                            let max_retries = 5;
-
-                            while retries < max_retries {
-                                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
-                                retries += 1;
-
-                                slog::debug!(logger, "Retry attempt";
-                                    "retry" => retries, "delay_ms" => delay_ms);
-
-                                delay_ms *= 2; // Exponential backoff
-                            }
+                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
                             // Leader proposes ConfChange to add the node
                             slog::info!(logger, "Leader adding node to execution cluster via ConfChange";
@@ -527,11 +516,7 @@ impl CommandExecutor for ManagementCommandExecutor {
 
     fn apply_with_index(&self, command: &Self::Command, log_index: u64) -> Result<(), Box<dyn std::error::Error>> {
         // For now, just delegate to apply (ignoring the index)
-        eprintln!("!!! ManagementCommandExecutor::apply_with_index() called! log_index={}, command={:?}", log_index, command);
-        slog::error!(self.logger, "ManagementCommandExecutor::apply_with_index() ENTRY!"; "log_index" => log_index, "command" => ?command);
-        let result = self.apply(command);
-        slog::error!(self.logger, "ManagementCommandExecutor::apply_with_index() EXIT!"; "result" => ?result);
-        result
+        self.apply(command)
     }
 
     fn on_node_added(&self, added_node_id: u64, address: &str, is_leader: bool) {
