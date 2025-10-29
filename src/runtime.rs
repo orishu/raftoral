@@ -261,29 +261,38 @@ impl RaftoralGrpcRuntime {
         transport.start().await?;
         info!("Transport started");
 
+        // If joining a cluster and we discovered a management leader, add it to transport BEFORE creating NodeManager
+        // This ensures the management cluster knows about the leader from the start
+        let leader_id_for_cluster = if let Some((leader_id, leader_addr)) = &leader_info {
+            if *leader_id != 0 && !leader_addr.is_empty() {
+                info!("Adding management leader to transport: Node {} at {}", leader_id, leader_addr);
+                // Add leader to transport so we can communicate with it
+                transport.add_node(NodeConfig {
+                    node_id: *leader_id,
+                    address: leader_addr.clone(),
+                }).await?;
+                Some(*leader_id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Create NodeManager (creates management cluster, execution clusters will be created dynamically)
         // ClusterRouter is created and configured inside NodeManager
         let node_manager = Arc::new(crate::nodemanager::NodeManager::new(
             transport.clone(),
             node_id,
+            config.bootstrap,
         ).await?);
         info!("NodeManager ready with management cluster");
         info!("ClusterRouter configured for management (cluster_id=0)");
 
-        // If joining a cluster and we discovered a management leader, add it to transport and set leader_id
-        if let Some((leader_id, leader_addr)) = leader_info {
-            if leader_id != 0 && !leader_addr.is_empty() {
-                info!("Adding management leader to transport: Node {} at {}", leader_id, leader_addr);
-                // Add leader to transport so we can communicate with it
-                transport.add_node(NodeConfig {
-                    node_id: leader_id,
-                    address: leader_addr.clone(),
-                }).await?;
-
-                // Set the leader_id in management cluster to avoid scanning
-                node_manager.management_cluster().set_leader_id(leader_id);
-                info!("Set management cluster leader_id to {}", leader_id);
-            }
+        // If joining, set the leader_id in management cluster
+        if let Some(leader_id) = leader_id_for_cluster {
+            node_manager.management_cluster().set_leader_id(leader_id);
+            info!("Set management cluster leader_id to {}", leader_id);
         }
 
         // Start gRPC server - gets ClusterRouter from NodeManager internally

@@ -35,8 +35,8 @@ async fn test_three_node_grpc_cluster_bootstrap() {
     ]));
     transport1.start().await.expect("Transport 1 should start");
 
-    // Phase 3: Use NodeManager
-    let node_manager1 = Arc::new(NodeManager::new(transport1.clone(), 1).await.expect("Should create node manager 1"));
+    // Phase 3: Use NodeManager (bootstrap mode for first node)
+    let node_manager1 = Arc::new(NodeManager::new(transport1.clone(), 1, true).await.expect("Should create node manager 1"));
 
     // Wait for management cluster to elect a leader
     sleep(Duration::from_millis(1000)).await;
@@ -85,8 +85,8 @@ async fn test_three_node_grpc_cluster_bootstrap() {
     // Give time for gRPC client to be created
     sleep(Duration::from_millis(100)).await;
 
-    // Phase 3: Use NodeManager (node 2 will join existing cluster, no need to initialize)
-    let node_manager2 = Arc::new(NodeManager::new(transport2.clone(), 2).await.expect("Should create node manager 2"));
+    // Phase 3: Use NodeManager (node 2 will join existing cluster, join mode)
+    let node_manager2 = Arc::new(NodeManager::new(transport2.clone(), 2, false).await.expect("Should create node manager 2"));
 
     let server2 = start_grpc_server(
         addr2.clone(),
@@ -140,8 +140,8 @@ async fn test_three_node_grpc_cluster_bootstrap() {
     // Give time for gRPC clients to be created
     sleep(Duration::from_millis(100)).await;
 
-    // Phase 3: Use NodeManager (node 3 will join existing cluster, no need to initialize)
-    let node_manager3 = Arc::new(NodeManager::new(transport3.clone(), 3).await.expect("Should create node manager 3"));
+    // Phase 3: Use NodeManager (node 3 will join existing cluster, join mode)
+    let node_manager3 = Arc::new(NodeManager::new(transport3.clone(), 3, false).await.expect("Should create node manager 3"));
 
     let server3 = start_grpc_server(
         addr3.clone(),

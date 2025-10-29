@@ -57,13 +57,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start the runtime
     let runtime = RaftoralGrpcRuntime::start(config).await?;
 
-    // Give the cluster creation task a moment to complete (it runs asynchronously)
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-    // Get the default execution cluster (ID = 1)
+    // Wait for the default execution cluster to be created
+    // - Bootstrap nodes: Created immediately via initialize_default_cluster()
+    // - Joining nodes: Created asynchronously when AssociateNode is applied (takes 1-2 seconds)
     let default_cluster_id = 1u32;
-    let execution_cluster = runtime.node_manager().get_execution_cluster(&default_cluster_id)
-        .expect("Default execution cluster should exist after initialization");
+    let execution_cluster = if args.bootstrap {
+        // Bootstrap node: cluster should exist immediately
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        runtime.node_manager().get_execution_cluster(&default_cluster_id)
+            .expect("Default execution cluster should exist after bootstrap")
+    } else {
+        // Joining node: wait for cluster to be created
+        info!("Waiting for execution cluster to be created...");
+        let mut retries = 0;
+        let max_retries = 20; // 20 * 500ms = 10 seconds
+        loop {
+            if let Some(cluster) = runtime.node_manager().get_execution_cluster(&default_cluster_id) {
+                info!("Execution cluster found!");
+                break cluster;
+            }
+            retries += 1;
+            if retries >= max_retries {
+                return Err("Timeout waiting for execution cluster to be created".into());
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+    };
 
     // Register ping/pong workflow
     // Input: "ping" -> Output: "pong"

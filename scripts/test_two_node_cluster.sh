@@ -60,8 +60,27 @@ NODE2_PID=$!
 echo -e "${GREEN}✓ Node 2 started (PID: $NODE2_PID)${NC}"
 
 # Wait for cluster to stabilize
-echo -e "${YELLOW}Waiting for cluster to stabilize...${NC}"
-sleep 5
+# This includes:
+# 1. Node 2 joining management cluster via ConfChange
+# 2. Management cluster creating execution cluster on node 2
+# 3. Node 2 joining execution cluster
+echo -e "${YELLOW}Waiting for cluster to stabilize (node 2 joining both clusters)...${NC}"
+sleep 8
+
+# Verify cluster membership
+echo -e "${YELLOW}Verifying cluster membership...${NC}"
+if grep -q "Node added to cluster" /tmp/raftoral_node2.log; then
+    echo -e "${GREEN}✓ Node 2 successfully joined management cluster${NC}"
+else
+    echo -e "${RED}⚠ Node 2 may not have joined management cluster${NC}"
+fi
+
+if grep -q "Execution cluster created successfully for joining node" /tmp/raftoral_node1.log || \
+   grep -q "Creating execution cluster for joining node" /tmp/raftoral_node2.log; then
+    echo -e "${GREEN}✓ Node 2's execution cluster created${NC}"
+else
+    echo -e "${YELLOW}⚠ Node 2's execution cluster creation not detected${NC}"
+fi
 
 echo -e "\n${BLUE}=== Running Workflow Test ===${NC}\n"
 

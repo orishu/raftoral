@@ -103,8 +103,10 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
             applied: 0,
             max_size_per_msg: 1024 * 1024 * 1024,
             max_inflight_msgs: 256,
-            check_quorum: !(is_single_node && !is_multi_node_bootstrap), // Enable quorum check for multi-node
-            pre_vote: !(is_single_node && !is_multi_node_bootstrap), // Enable pre-vote for multi-node
+            // Single node bootstrap: check_quorum=false, pre_vote=false (no quorum needed)
+            // Multi-node (including joining): check_quorum=true, pre_vote=true
+            check_quorum: !is_single_node,
+            pre_vote: !is_single_node,
             ..Default::default()
         };
 
@@ -112,7 +114,7 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
 
         // Set up the initial cluster configuration
         if is_single_node && !is_multi_node_bootstrap {
-            // Bootstrap node: Initialize with self in configuration
+            // Single node bootstrap: Initialize with self in configuration
             let mut initial_state = ConfState::default();
             initial_state.voters.push(node_id);
             storage.wl().set_conf_state(initial_state.clone());
@@ -121,18 +123,9 @@ impl<E: CommandExecutor + 'static> RaftNode<E> {
 
             // Cache first entry info (will be set after first leader election creates index 1)
             // For now, leave as None - will be populated after the node becomes leader
-        } else if let Some(_peers) = bootstrap_peers {
-            // Reserved for future use: Multi-node bootstrap
-            // Currently we use join protocol via snapshots instead
-            // Joining node: Initialize with peer list from transport
-            let peer_ids: Vec<u64> = transport.list_nodes().into_iter()
-                .filter(|&id| id != node_id)  // Don't include self
-                .collect();
-            *cached_config.write().unwrap() = peer_ids;
-            // cached_conf_state stays empty - will be populated when snapshot is received
         } else {
-            // Joining node: Initialize with peer list from transport
-            // Use cached_config for tracking known peers (excluding self)
+            // Joining node or multi-node bootstrap
+            // Initialize with peer list from transport (excluding self)
             let peer_ids: Vec<u64> = transport.list_nodes().into_iter()
                 .filter(|&id| id != node_id)  // Don't include self
                 .collect();

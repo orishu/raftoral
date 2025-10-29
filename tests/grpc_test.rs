@@ -99,7 +99,7 @@ async fn test_discovery_rpc() {
     transport.start().await.expect("Should start transport");
 
     // Phase 3: Use NodeManager to create cluster with extract_typed_receiver
-    let node_manager = Arc::new(NodeManager::new(transport.clone(), 1).await.expect("Should create node manager"));
+    let node_manager = Arc::new(NodeManager::new(transport.clone(), 1, true).await.expect("Should create node manager"));
 
     // Start gRPC server
     let _server = start_grpc_server(

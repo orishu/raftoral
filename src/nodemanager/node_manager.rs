@@ -39,17 +39,26 @@ impl NodeManager {
     ///
     /// Execution clusters will be created dynamically through management commands.
     /// Call initialize_default_cluster() after construction to create the default cluster.
+    ///
+    /// # Arguments
+    /// * `transport` - The gRPC transport for communication
+    /// * `node_id` - This node's ID
+    /// * `bootstrap` - If true, bootstrap a new cluster (first node). If false, join existing cluster.
     pub async fn new(
         transport: Arc<GrpcClusterTransport>,
         node_id: u64,
+        bootstrap: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Create shared execution clusters HashMap (empty initially)
         let execution_clusters = Arc::new(Mutex::new(HashMap::new()));
 
         // Create management cluster (cluster_id = 0) using the transport
+        // For bootstrap mode, pass None to create single-node cluster
+        // For join mode, pass empty vec to indicate joining (will be added via ConfChange)
         let management_executor = ManagementCommandExecutor::default();
         let management_transport_ref: Arc<dyn crate::raft::generic::transport::TransportInteraction<Message<ManagementCommand>>> = transport.clone();
-        let management_cluster = Arc::new(RaftCluster::new(node_id, 0, management_transport_ref, management_executor, None).await?);
+        let bootstrap_peers = if bootstrap { None } else { Some(vec![]) };
+        let management_cluster = Arc::new(RaftCluster::new(node_id, 0, management_transport_ref, management_executor, bootstrap_peers).await?);
 
         // Create ClusterRouter and register management cluster
         // Execution clusters will be registered dynamically as they're created
