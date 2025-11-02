@@ -14,6 +14,7 @@ use raft::prelude::*;
 use raft::StateRole;
 use serde::{Deserialize, Serialize};
 use slog::{debug, info, warn, Logger};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, broadcast, Mutex, oneshot};
@@ -117,6 +118,12 @@ pub struct RaftNode<SM: StateMachine> {
     /// Cached configuration state
     cached_conf_state: Arc<Mutex<ConfState>>,
 
+    /// Proposal tracking: sync_id -> oneshot sender for completion notification
+    pending_proposals: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<(), String>>>>>,
+
+    /// Next sync_id for proposal tracking
+    next_sync_id: Arc<Mutex<u64>>,
+
     /// Logger
     logger: Logger,
 }
@@ -162,6 +169,8 @@ impl<SM: StateMachine> RaftNode<SM> {
             role_change_tx,
             committed_index: Arc::new(Mutex::new(0)),
             cached_conf_state: Arc::new(Mutex::new(ConfState::from((vec![config.node_id], vec![])))),
+            pending_proposals: Arc::new(Mutex::new(HashMap::new())),
+            next_sync_id: Arc::new(Mutex::new(1)),
             logger,
         })
     }
@@ -203,6 +212,8 @@ impl<SM: StateMachine> RaftNode<SM> {
             role_change_tx,
             committed_index: Arc::new(Mutex::new(0)),
             cached_conf_state: Arc::new(Mutex::new(ConfState::default())),
+            pending_proposals: Arc::new(Mutex::new(HashMap::new())),
+            next_sync_id: Arc::new(Mutex::new(1)),
             logger,
         })
     }
@@ -250,21 +261,40 @@ impl<SM: StateMachine> RaftNode<SM> {
     /// Propose a command (upper layer method, not mailbox)
     ///
     /// Serializes the command and submits it to Raft.
-    /// Returns oneshot receiver that will be notified when proposal is committed.
+    /// Returns oneshot receiver that will be notified when proposal is committed and applied.
     pub async fn propose(&mut self, command: SM::Command) -> Result<oneshot::Receiver<Result<(), String>>, String> {
         let (tx, rx) = oneshot::channel();
+
+        // Generate unique sync_id for tracking
+        let sync_id = {
+            let mut next_id = self.next_sync_id.lock().await;
+            let id = *next_id;
+            *next_id += 1;
+            id
+        };
+
+        // Store the completion channel
+        self.pending_proposals.lock().await.insert(sync_id, tx);
 
         // Serialize the command
         let data = serde_json::to_vec(&command)
             .map_err(|e| format!("Failed to serialize command: {}", e))?;
 
-        self.raw_node
-            .propose(vec![], data)
-            .map_err(|e| format!("Failed to propose: {:?}", e))?;
+        // Put sync_id in context for tracking (8 bytes, little endian)
+        let context = sync_id.to_le_bytes().to_vec();
 
-        // TODO: Track proposal with sync_id and complete tx when committed
-        // For now, immediately succeed (will be enhanced in future)
-        let _ = tx.send(Ok(()));
+        self.raw_node
+            .propose(context, data)
+            .map_err(|e| {
+                // Remove from tracking on error
+                let pending = self.pending_proposals.clone();
+                tokio::spawn(async move {
+                    pending.lock().await.remove(&sync_id);
+                });
+                format!("Failed to propose: {:?}", e)
+            })?;
+
+        debug!(self.logger, "Proposed command"; "sync_id" => sync_id);
 
         Ok(rx)
     }
@@ -280,26 +310,47 @@ impl<SM: StateMachine> RaftNode<SM> {
     pub async fn add_node(&mut self, node_id: u64, address: String) -> Result<oneshot::Receiver<Result<(), String>>, String> {
         let (tx, rx) = oneshot::channel();
 
-        // Create node metadata
+        // Generate unique sync_id for tracking
+        let sync_id = {
+            let mut next_id = self.next_sync_id.lock().await;
+            let id = *next_id;
+            *next_id += 1;
+            id
+        };
+
+        // Store the completion channel
+        self.pending_proposals.lock().await.insert(sync_id, tx);
+
+        // Create node metadata (prepend sync_id for tracking)
         let metadata = NodeMetadata { address: address.clone() };
         let metadata_bytes = serde_json::to_vec(&metadata)
             .map_err(|e| format!("Failed to serialize metadata: {}", e))?;
+
+        // Prepend sync_id to metadata (8 bytes LE + metadata)
+        let mut context_bytes = sync_id.to_le_bytes().to_vec();
+        context_bytes.extend_from_slice(&metadata_bytes);
 
         // Propose configuration change
         let mut cc = ConfChange::default();
         cc.set_change_type(ConfChangeType::AddNode);
         cc.node_id = node_id;
-        cc.context = Bytes::from(metadata_bytes);
+        cc.context = Bytes::from(context_bytes);
 
         self.raw_node
             .propose_conf_change(vec![], cc)
-            .map_err(|e| format!("Failed to propose conf change: {:?}", e))?;
+            .map_err(|e| {
+                // Remove from tracking on error
+                let pending = self.pending_proposals.clone();
+                tokio::spawn(async move {
+                    pending.lock().await.remove(&sync_id);
+                });
+                format!("Failed to propose conf change: {:?}", e)
+            })?;
 
         // Add peer to transport
         self.transport.add_peer(node_id, address).await;
 
-        // TODO: Track conf change and complete tx when applied
-        let _ = tx.send(Ok(()));
+        debug!(self.logger, "Proposed add_node"; "sync_id" => sync_id, "node_id" => node_id);
 
         Ok(rx)
     }
@@ -308,17 +359,38 @@ impl<SM: StateMachine> RaftNode<SM> {
     pub async fn remove_node(&mut self, node_id: u64) -> Result<oneshot::Receiver<Result<(), String>>, String> {
         let (tx, rx) = oneshot::channel();
 
+        // Generate unique sync_id for tracking
+        let sync_id = {
+            let mut next_id = self.next_sync_id.lock().await;
+            let id = *next_id;
+            *next_id += 1;
+            id
+        };
+
+        // Store the completion channel
+        self.pending_proposals.lock().await.insert(sync_id, tx);
+
+        // Put sync_id in context
+        let context_bytes = sync_id.to_le_bytes().to_vec();
+
         // Propose configuration change
         let mut cc = ConfChange::default();
         cc.set_change_type(ConfChangeType::RemoveNode);
         cc.node_id = node_id;
+        cc.context = Bytes::from(context_bytes);
 
         self.raw_node
             .propose_conf_change(vec![], cc)
-            .map_err(|e| format!("Failed to propose conf change: {:?}", e))?;
+            .map_err(|e| {
+                // Remove from tracking on error
+                let pending = self.pending_proposals.clone();
+                tokio::spawn(async move {
+                    pending.lock().await.remove(&sync_id);
+                });
+                format!("Failed to propose conf change: {:?}", e)
+            })?;
 
-        // TODO: Track conf change and complete tx when applied
-        let _ = tx.send(Ok(()));
+        debug!(self.logger, "Proposed remove_node"; "sync_id" => sync_id, "node_id" => node_id);
 
         Ok(rx)
     }
@@ -419,11 +491,28 @@ impl<SM: StateMachine> RaftNode<SM> {
 
                 match entry.get_entry_type() {
                     EntryType::EntryNormal => {
+                        // Extract sync_id from context (if present)
+                        let sync_id = if entry.context.len() == 8 {
+                            Some(u64::from_le_bytes([
+                                entry.context[0],
+                                entry.context[1],
+                                entry.context[2],
+                                entry.context[3],
+                                entry.context[4],
+                                entry.context[5],
+                                entry.context[6],
+                                entry.context[7],
+                            ]))
+                        } else {
+                            None
+                        };
+
                         // Deserialize and apply to state machine
-                        match serde_json::from_slice::<SM::Command>(&entry.data) {
+                        let apply_result = match serde_json::from_slice::<SM::Command>(&entry.data) {
                             Ok(command) => {
                                 debug!(self.logger, "Applying command";
                                     "index" => entry.index,
+                                    "sync_id" => sync_id,
                                     "data_len" => entry.data.len()
                                 );
 
@@ -439,12 +528,14 @@ impl<SM: StateMachine> RaftNode<SM> {
                                                 "subscriber_count" => count
                                             );
                                         }
+                                        Ok(())
                                     }
                                     Err(e) => {
                                         warn!(self.logger, "State machine apply failed";
                                             "index" => entry.index,
                                             "error" => %e
                                         );
+                                        Err(format!("Apply failed: {}", e))
                                     }
                                 }
                             }
@@ -453,6 +544,15 @@ impl<SM: StateMachine> RaftNode<SM> {
                                     "index" => entry.index,
                                     "error" => %e
                                 );
+                                Err(format!("Deserialization failed: {}", e))
+                            }
+                        };
+
+                        // Complete pending proposal if tracked
+                        if let Some(id) = sync_id {
+                            if let Some(tx) = self.pending_proposals.lock().await.remove(&id) {
+                                let _ = tx.send(apply_result);
+                                debug!(self.logger, "Completed proposal"; "sync_id" => id, "index" => entry.index);
                             }
                         }
 
@@ -538,11 +638,28 @@ impl<SM: StateMachine> RaftNode<SM> {
 
                 match entry.get_entry_type() {
                     EntryType::EntryNormal => {
+                        // Extract sync_id from context (if present)
+                        let sync_id = if entry.context.len() == 8 {
+                            Some(u64::from_le_bytes([
+                                entry.context[0],
+                                entry.context[1],
+                                entry.context[2],
+                                entry.context[3],
+                                entry.context[4],
+                                entry.context[5],
+                                entry.context[6],
+                                entry.context[7],
+                            ]))
+                        } else {
+                            None
+                        };
+
                         // Deserialize and apply to state machine
-                        match serde_json::from_slice::<SM::Command>(&entry.data) {
+                        let apply_result = match serde_json::from_slice::<SM::Command>(&entry.data) {
                             Ok(command) => {
                                 debug!(self.logger, "Applying command (light ready)";
-                                    "index" => entry.index
+                                    "index" => entry.index,
+                                    "sync_id" => sync_id
                                 );
 
                                 // Apply to state machine
@@ -552,12 +669,14 @@ impl<SM: StateMachine> RaftNode<SM> {
                                         if !events.is_empty() {
                                             self.event_bus.publish_batch(events);
                                         }
+                                        Ok(())
                                     }
                                     Err(e) => {
                                         warn!(self.logger, "State machine apply failed (light ready)";
                                             "index" => entry.index,
                                             "error" => %e
                                         );
+                                        Err(format!("Apply failed: {}", e))
                                     }
                                 }
                             }
@@ -566,6 +685,15 @@ impl<SM: StateMachine> RaftNode<SM> {
                                     "index" => entry.index,
                                     "error" => %e
                                 );
+                                Err(format!("Deserialization failed: {}", e))
+                            }
+                        };
+
+                        // Complete pending proposal if tracked
+                        if let Some(id) = sync_id {
+                            if let Some(tx) = self.pending_proposals.lock().await.remove(&id) {
+                                let _ = tx.send(apply_result);
+                                debug!(self.logger, "Completed proposal (light ready)"; "sync_id" => id, "index" => entry.index);
                             }
                         }
 
@@ -587,30 +715,70 @@ impl<SM: StateMachine> RaftNode<SM> {
     /// Apply a configuration change
     async fn apply_conf_change(&mut self, entry: &Entry) -> Result<(), Box<dyn std::error::Error>> {
         let cc: ConfChange = protobuf::Message::parse_from_bytes(&entry.data)?;
+
+        // Extract sync_id from context (first 8 bytes if present)
+        let (sync_id, metadata_start) = if cc.context.len() >= 8 {
+            let id = u64::from_le_bytes([
+                cc.context[0],
+                cc.context[1],
+                cc.context[2],
+                cc.context[3],
+                cc.context[4],
+                cc.context[5],
+                cc.context[6],
+                cc.context[7],
+            ]);
+            (Some(id), 8)
+        } else {
+            (None, 0)
+        };
+
         let cs = self.raw_node.apply_conf_change(&cc)?;
 
         // Update cached conf state
         *self.cached_conf_state.lock().await = cs;
 
         // Handle add/remove on transport layer
-        match cc.get_change_type() {
+        let conf_change_result = match cc.get_change_type() {
             ConfChangeType::AddNode => {
                 let node_id = cc.node_id;
 
-                // Deserialize metadata
-                if !cc.context.is_empty() {
-                    if let Ok(metadata) = serde_json::from_slice::<NodeMetadata>(&cc.context) {
-                        info!(self.logger, "Adding peer to transport"; "node_id" => node_id, "address" => &metadata.address);
-                        self.transport.add_peer(node_id, metadata.address).await;
+                // Deserialize metadata (after sync_id bytes)
+                if cc.context.len() > metadata_start {
+                    match serde_json::from_slice::<NodeMetadata>(&cc.context[metadata_start..]) {
+                        Ok(metadata) => {
+                            info!(self.logger, "Adding peer to transport";
+                                "node_id" => node_id,
+                                "address" => &metadata.address,
+                                "sync_id" => sync_id
+                            );
+                            self.transport.add_peer(node_id, metadata.address).await;
+                            Ok(())
+                        }
+                        Err(e) => Err(format!("Failed to deserialize node metadata: {}", e)),
                     }
+                } else {
+                    Ok(()) // No metadata, just tracking
                 }
             }
             ConfChangeType::RemoveNode => {
                 let node_id = cc.node_id;
-                info!(self.logger, "Removing peer from transport"; "node_id" => node_id);
+                info!(self.logger, "Removing peer from transport";
+                    "node_id" => node_id,
+                    "sync_id" => sync_id
+                );
                 self.transport.remove_peer(node_id).await;
+                Ok(())
             }
-            _ => {}
+            _ => Ok(()),
+        };
+
+        // Complete pending proposal if tracked
+        if let Some(id) = sync_id {
+            if let Some(tx) = self.pending_proposals.lock().await.remove(&id) {
+                let _ = tx.send(conf_change_result);
+                debug!(self.logger, "Completed conf change proposal"; "sync_id" => id);
+            }
         }
 
         Ok(())
