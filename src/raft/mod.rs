@@ -1,4 +1,5 @@
 pub mod generic;
+pub mod generic2;  // V2 architecture
 pub mod command;
 
 // Re-export the generic infrastructure
