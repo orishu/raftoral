@@ -5,6 +5,7 @@
 
 use crate::grpc::server::raft_proto::GenericMessage;
 use crate::raft::generic2::errors::TransportError;
+use crate::raft::generic2::ClusterRouter;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -66,9 +67,8 @@ pub struct TransportLayer {
     /// Protocol-specific message sender (injected by server layer)
     message_sender: Arc<dyn MessageSender>,
 
-    /// Optional callback for receiving messages
-    /// This is set by the ClusterRouter to receive incoming messages
-    receive_callback: Arc<Mutex<Option<Arc<dyn Fn(GenericMessage) -> Result<(), TransportError> + Send + Sync>>>>,
+    /// Optional ClusterRouter for routing incoming messages
+    cluster_router: Option<Arc<ClusterRouter>>,
 }
 
 impl TransportLayer {
@@ -77,17 +77,27 @@ impl TransportLayer {
         Self {
             peers: Arc::new(Mutex::new(HashMap::new())),
             message_sender,
-            receive_callback: Arc::new(Mutex::new(None)),
+            cluster_router: None,
         }
     }
 
-    /// Set the receive callback (typically called by ClusterRouter)
-    pub async fn set_receive_callback<F>(&self, callback: F)
-    where
-        F: Fn(GenericMessage) -> Result<(), TransportError> + Send + Sync + 'static,
-    {
-        let mut cb = self.receive_callback.lock().await;
-        *cb = Some(Arc::new(callback));
+    /// Create a new TransportLayer with MessageSender and ClusterRouter
+    ///
+    /// This variant integrates with ClusterRouter for automatic message routing
+    pub fn new_with_router(
+        message_sender: Arc<dyn MessageSender>,
+        cluster_router: Arc<ClusterRouter>,
+    ) -> Self {
+        Self {
+            peers: Arc::new(Mutex::new(HashMap::new())),
+            message_sender,
+            cluster_router: Some(cluster_router),
+        }
+    }
+
+    /// Set the ClusterRouter after construction
+    pub fn set_cluster_router(&mut self, cluster_router: Arc<ClusterRouter>) {
+        self.cluster_router = Some(cluster_router);
     }
 }
 
@@ -116,12 +126,16 @@ impl Transport for TransportLayer {
     }
 
     async fn receive_message(&self, message: GenericMessage) -> Result<(), TransportError> {
-        // Forward to receive callback (ClusterRouter)
-        let callback = self.receive_callback.lock().await;
-        match callback.as_ref() {
-            Some(cb) => cb(message),
+        // Forward to ClusterRouter if available
+        match &self.cluster_router {
+            Some(router) => {
+                router
+                    .route_message(message)
+                    .await
+                    .map_err(|e| TransportError::Other(e.to_string()))
+            }
             None => {
-                // No callback registered yet, this is okay during initialization
+                // No router registered yet, this is okay during initialization
                 Ok(())
             }
         }
@@ -272,57 +286,45 @@ mod tests {
         assert_eq!(addr, None);
     }
 
-    /// Integration test: Multi-node communication via InProcessServer
+    /// Integration test: Multi-node communication via InProcessServer + ClusterRouter
     #[tokio::test]
-    async fn test_multi_node_transport_integration() {
-        use crate::raft::generic2::{InProcessServer, InProcessMessageSender};
-        use tokio::sync::Mutex as TokioMutex;
+    async fn test_multi_node_transport_with_cluster_router() {
+        use crate::raft::generic2::{ClusterRouter, InProcessServer, InProcessMessageSender};
+        use tokio::sync::mpsc;
 
         // Create in-process server
         let server = Arc::new(InProcessServer::new());
 
-        // Create transports for two nodes
-        let transport1 = Arc::new(TransportLayer::new(Arc::new(InProcessMessageSender::new(
-            server.clone(),
-        ))));
-        let transport2 = Arc::new(TransportLayer::new(Arc::new(InProcessMessageSender::new(
-            server.clone(),
-        ))));
+        // Create cluster routers for two nodes
+        let router1 = Arc::new(ClusterRouter::new());
+        let router2 = Arc::new(ClusterRouter::new());
 
-        // Track messages received by each node
-        let node1_received = Arc::new(TokioMutex::new(Vec::new()));
-        let node2_received = Arc::new(TokioMutex::new(Vec::new()));
+        // Create transports with routers
+        let transport1 = Arc::new(TransportLayer::new_with_router(
+            Arc::new(InProcessMessageSender::new(server.clone())),
+            router1.clone(),
+        ));
+        let transport2 = Arc::new(TransportLayer::new_with_router(
+            Arc::new(InProcessMessageSender::new(server.clone())),
+            router2.clone(),
+        ));
 
-        // Set up receive callbacks
-        let node1_received_clone = node1_received.clone();
-        transport1
-            .set_receive_callback(move |msg| {
-                let received = node1_received_clone.clone();
-                tokio::spawn(async move {
-                    received.lock().await.push(msg);
-                });
-                Ok(())
-            })
-            .await;
+        // Create mailboxes for clusters
+        let (cluster1_tx, mut cluster1_rx) = mpsc::channel(10);
+        let (cluster2_tx, mut cluster2_rx) = mpsc::channel(10);
 
-        let node2_received_clone = node2_received.clone();
-        transport2
-            .set_receive_callback(move |msg| {
-                let received = node2_received_clone.clone();
-                tokio::spawn(async move {
-                    received.lock().await.push(msg);
-                });
-                Ok(())
-            })
-            .await;
+        // Register clusters with routers
+        // Node 1 has cluster 100, Node 2 has cluster 200
+        router1.register_cluster(100, cluster1_tx).await;
+        router2.register_cluster(200, cluster2_tx).await;
 
-        // Register nodes with server
+        // Register nodes with server (for incoming message routing)
         let transport1_clone = transport1.clone();
         server
             .register_node(1, move |msg| {
                 let t = transport1_clone.clone();
                 tokio::spawn(async move {
-                    t.receive_message(msg).await
+                    let _ = t.receive_message(msg).await;
                 });
                 Ok(())
             })
@@ -333,7 +335,7 @@ mod tests {
             .register_node(2, move |msg| {
                 let t = transport2_clone.clone();
                 tokio::spawn(async move {
-                    t.receive_message(msg).await
+                    let _ = t.receive_message(msg).await;
                 });
                 Ok(())
             })
@@ -343,16 +345,16 @@ mod tests {
         transport1.add_peer(2, "node:2".to_string()).await;
         transport2.add_peer(1, "node:1".to_string()).await;
 
-        // Node 1 sends message to Node 2
+        // Node 1 sends message to Node 2 for cluster 200
         let msg_to_2 = GenericMessage {
-            cluster_id: 100,
+            cluster_id: 200,
             message: None,
         };
         transport1.send_message(2, msg_to_2.clone()).await.unwrap();
 
-        // Node 2 sends message to Node 1
+        // Node 2 sends message to Node 1 for cluster 100
         let msg_to_1 = GenericMessage {
-            cluster_id: 200,
+            cluster_id: 100,
             message: None,
         };
         transport2.send_message(1, msg_to_1.clone()).await.unwrap();
@@ -360,14 +362,12 @@ mod tests {
         // Wait for messages to be processed
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-        // Verify Node 2 received message from Node 1
-        let node2_msgs = node2_received.lock().await;
-        assert_eq!(node2_msgs.len(), 1);
-        assert_eq!(node2_msgs[0].cluster_id, 100);
+        // Verify cluster 200 (on Node 2) received message
+        let received = cluster2_rx.try_recv().unwrap();
+        assert_eq!(received.cluster_id, 200);
 
-        // Verify Node 1 received message from Node 2
-        let node1_msgs = node1_received.lock().await;
-        assert_eq!(node1_msgs.len(), 1);
-        assert_eq!(node1_msgs[0].cluster_id, 200);
+        // Verify cluster 100 (on Node 1) received message
+        let received = cluster1_rx.try_recv().unwrap();
+        assert_eq!(received.cluster_id, 100);
     }
 }

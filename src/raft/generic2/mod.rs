@@ -10,10 +10,12 @@
 //! - Layer 6: Proposal Router (routes proposals to leader)
 //! - Layer 7: Application Runtime (management/workflow logic)
 
+pub mod cluster_router;
 pub mod errors;
 pub mod server;
 pub mod transport;
 
+pub use cluster_router::ClusterRouter;
 pub use errors::{TransportError, RoutingError};
 pub use transport::{Transport, TransportLayer, MessageSender};
 pub use server::{InProcessServer, InProcessMessageSender};
