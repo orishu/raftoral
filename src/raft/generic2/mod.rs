@@ -12,12 +12,16 @@
 
 pub mod cluster_router;
 pub mod errors;
+pub mod event_bus;
 pub mod node;
 pub mod server;
+pub mod state_machine;
 pub mod transport;
 
 pub use cluster_router::ClusterRouter;
 pub use errors::{TransportError, RoutingError};
+pub use event_bus::EventBus;
 pub use node::{RaftNode, RaftNodeConfig, NodeMetadata, RoleChange};
+pub use state_machine::{StateMachine, KvStateMachine, KvCommand, KvEvent};
 pub use transport::{Transport, TransportLayer, MessageSender};
 pub use server::{InProcessServer, InProcessMessageSender};

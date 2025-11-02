@@ -7,13 +7,13 @@
 use crate::grpc::server::raft_proto::{self, GenericMessage};
 use crate::raft::generic::storage::MemStorageWithSnapshot;
 use crate::raft::generic2::errors::TransportError;
-use crate::raft::generic2::Transport;
+use crate::raft::generic2::{EventBus, StateMachine, Transport};
 use bytes::Bytes;
 use protobuf::Message as ProtobufMessage;
 use raft::prelude::*;
 use raft::StateRole;
 use serde::{Deserialize, Serialize};
-use slog::{info, warn, Logger};
+use slog::{debug, info, warn, Logger};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, broadcast, Mutex, oneshot};
@@ -78,7 +78,12 @@ pub enum RoleChange {
 /// - Mailbox (message_rx): Receives peer Raft messages from ClusterRouter
 /// - Methods (propose, campaign, etc.): Called by upper layers
 /// - Transport: Sends outgoing messages to peers
-pub struct RaftNode {
+/// - State Machine: Applies committed commands, emits events
+/// - Event Bus: Broadcasts events to subscribers
+///
+/// # Type Parameters
+/// * `SM` - State Machine type implementing the StateMachine trait
+pub struct RaftNode<SM: StateMachine> {
     /// Raft node ID
     node_id: u64,
 
@@ -93,6 +98,12 @@ pub struct RaftNode {
 
     /// Mailbox for incoming peer Raft messages
     message_rx: mpsc::Receiver<GenericMessage>,
+
+    /// State machine for applying commands
+    state_machine: Arc<Mutex<SM>>,
+
+    /// Event bus for broadcasting state machine events
+    event_bus: Arc<EventBus<SM::Event>>,
 
     /// Current role
     current_role: Arc<Mutex<StateRole>>,
@@ -110,7 +121,7 @@ pub struct RaftNode {
     logger: Logger,
 }
 
-impl RaftNode {
+impl<SM: StateMachine> RaftNode<SM> {
     /// Create a new RaftNode with single-node bootstrap
     ///
     /// This initializes a single-node cluster that can accept proposals immediately.
@@ -118,6 +129,8 @@ impl RaftNode {
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
         message_rx: mpsc::Receiver<GenericMessage>,
+        state_machine: SM,
+        event_bus: Arc<EventBus<SM::Event>>,
         logger: Logger,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let storage = MemStorageWithSnapshot::new_with_conf_state(ConfState::from((
@@ -143,6 +156,8 @@ impl RaftNode {
             raw_node,
             transport,
             message_rx,
+            state_machine: Arc::new(Mutex::new(state_machine)),
+            event_bus,
             current_role: Arc::new(Mutex::new(StateRole::Follower)),
             role_change_tx,
             committed_index: Arc::new(Mutex::new(0)),
@@ -158,6 +173,8 @@ impl RaftNode {
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
         message_rx: mpsc::Receiver<GenericMessage>,
+        state_machine: SM,
+        event_bus: Arc<EventBus<SM::Event>>,
         logger: Logger,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let storage = MemStorageWithSnapshot::default();
@@ -180,6 +197,8 @@ impl RaftNode {
             raw_node,
             transport,
             message_rx,
+            state_machine: Arc::new(Mutex::new(state_machine)),
+            event_bus,
             current_role: Arc::new(Mutex::new(StateRole::Follower)),
             role_change_tx,
             committed_index: Arc::new(Mutex::new(0)),
@@ -191,6 +210,21 @@ impl RaftNode {
     /// Subscribe to role change notifications
     pub fn subscribe_role_changes(&self) -> broadcast::Receiver<RoleChange> {
         self.role_change_tx.subscribe()
+    }
+
+    /// Subscribe to state machine events
+    pub fn subscribe_events(&self) -> broadcast::Receiver<SM::Event> {
+        self.event_bus.subscribe()
+    }
+
+    /// Get reference to the event bus
+    pub fn event_bus(&self) -> Arc<EventBus<SM::Event>> {
+        self.event_bus.clone()
+    }
+
+    /// Get reference to the state machine
+    pub fn state_machine(&self) -> Arc<Mutex<SM>> {
+        self.state_machine.clone()
     }
 
     /// Get current role
@@ -215,9 +249,14 @@ impl RaftNode {
 
     /// Propose a command (upper layer method, not mailbox)
     ///
+    /// Serializes the command and submits it to Raft.
     /// Returns oneshot receiver that will be notified when proposal is committed.
-    pub async fn propose(&mut self, data: Vec<u8>) -> Result<oneshot::Receiver<Result<(), String>>, String> {
+    pub async fn propose(&mut self, command: SM::Command) -> Result<oneshot::Receiver<Result<(), String>>, String> {
         let (tx, rx) = oneshot::channel();
+
+        // Serialize the command
+        let data = serde_json::to_vec(&command)
+            .map_err(|e| format!("Failed to serialize command: {}", e))?;
 
         self.raw_node
             .propose(vec![], data)
@@ -380,8 +419,43 @@ impl RaftNode {
 
                 match entry.get_entry_type() {
                     EntryType::EntryNormal => {
-                        // TODO: Apply to state machine
-                        // For now, just update committed index
+                        // Deserialize and apply to state machine
+                        match serde_json::from_slice::<SM::Command>(&entry.data) {
+                            Ok(command) => {
+                                debug!(self.logger, "Applying command";
+                                    "index" => entry.index,
+                                    "data_len" => entry.data.len()
+                                );
+
+                                // Apply to state machine
+                                let mut sm = self.state_machine.lock().await;
+                                match sm.apply(&command) {
+                                    Ok(events) => {
+                                        // Publish events to event bus
+                                        if !events.is_empty() {
+                                            let count = self.event_bus.publish_batch(events);
+                                            debug!(self.logger, "Published events";
+                                                "index" => entry.index,
+                                                "subscriber_count" => count
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(self.logger, "State machine apply failed";
+                                            "index" => entry.index,
+                                            "error" => %e
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(self.logger, "Failed to deserialize command";
+                                    "index" => entry.index,
+                                    "error" => %e
+                                );
+                            }
+                        }
+
                         *self.committed_index.lock().await = entry.index;
                     }
                     EntryType::EntryConfChange | EntryType::EntryConfChangeV2 => {
@@ -464,7 +538,37 @@ impl RaftNode {
 
                 match entry.get_entry_type() {
                     EntryType::EntryNormal => {
-                        // TODO: Apply to state machine
+                        // Deserialize and apply to state machine
+                        match serde_json::from_slice::<SM::Command>(&entry.data) {
+                            Ok(command) => {
+                                debug!(self.logger, "Applying command (light ready)";
+                                    "index" => entry.index
+                                );
+
+                                // Apply to state machine
+                                let mut sm = self.state_machine.lock().await;
+                                match sm.apply(&command) {
+                                    Ok(events) => {
+                                        if !events.is_empty() {
+                                            self.event_bus.publish_batch(events);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(self.logger, "State machine apply failed (light ready)";
+                                            "index" => entry.index,
+                                            "error" => %e
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(self.logger, "Failed to deserialize command (light ready)";
+                                    "index" => entry.index,
+                                    "error" => %e
+                                );
+                            }
+                        }
+
                         *self.committed_index.lock().await = entry.index;
                     }
                     EntryType::EntryConfChange | EntryType::EntryConfChangeV2 => {
@@ -537,7 +641,7 @@ impl RaftNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::generic2::{InProcessServer, InProcessMessageSender, TransportLayer};
+    use crate::raft::generic2::{InProcessServer, InProcessMessageSender, KvStateMachine, TransportLayer};
     use tokio::sync::mpsc;
 
     fn create_logger() -> Logger {
@@ -561,7 +665,10 @@ mod tests {
             ..Default::default()
         };
 
-        let node = RaftNode::new_single_node(config, transport, rx, logger).unwrap();
+        let state_machine = KvStateMachine::new();
+        let event_bus = Arc::new(EventBus::new(100));
+
+        let node = RaftNode::new_single_node(config, transport, rx, state_machine, event_bus, logger).unwrap();
         assert_eq!(node.node_id, 1);
         assert_eq!(node.cluster_id, 0);
     }
@@ -579,7 +686,10 @@ mod tests {
             ..Default::default()
         };
 
-        let node = RaftNode::new_multi_node(config, transport, rx, logger).unwrap();
+        let state_machine = KvStateMachine::new();
+        let event_bus = Arc::new(EventBus::new(100));
+
+        let node = RaftNode::new_multi_node(config, transport, rx, state_machine, event_bus, logger).unwrap();
         assert_eq!(node.node_id, 2);
         assert_eq!(node.cluster_id, 1);
     }
@@ -592,7 +702,10 @@ mod tests {
         let (_tx, rx) = mpsc::channel(10);
 
         let config = RaftNodeConfig::default();
-        let node = RaftNode::new_single_node(config, transport, rx, logger).unwrap();
+        let state_machine = KvStateMachine::new();
+        let event_bus = Arc::new(EventBus::new(100));
+
+        let node = RaftNode::new_single_node(config, transport, rx, state_machine, event_bus, logger).unwrap();
 
         // Should start as follower
         assert_eq!(node.role().await, StateRole::Follower);
@@ -607,11 +720,33 @@ mod tests {
         let (_tx, rx) = mpsc::channel(10);
 
         let config = RaftNodeConfig::default();
-        let node = RaftNode::new_single_node(config, transport, rx, logger).unwrap();
+        let state_machine = KvStateMachine::new();
+        let event_bus = Arc::new(EventBus::new(100));
+
+        let node = RaftNode::new_single_node(config, transport, rx, state_machine, event_bus, logger).unwrap();
 
         let mut role_rx = node.subscribe_role_changes();
 
         // Should be able to subscribe
         assert!(role_rx.try_recv().is_err()); // No changes yet
+    }
+
+    #[tokio::test]
+    async fn test_raft_node_subscribe_events() {
+        let logger = create_logger();
+        let server = Arc::new(InProcessServer::new());
+        let transport = Arc::new(TransportLayer::new(Arc::new(InProcessMessageSender::new(server))));
+        let (_tx, rx) = mpsc::channel(10);
+
+        let config = RaftNodeConfig::default();
+        let state_machine = KvStateMachine::new();
+        let event_bus = Arc::new(EventBus::new(100));
+
+        let node = RaftNode::new_single_node(config, transport, rx, state_machine, event_bus, logger).unwrap();
+
+        let mut event_rx = node.subscribe_events();
+
+        // Should be able to subscribe
+        assert!(event_rx.try_recv().is_err()); // No events yet
     }
 }
