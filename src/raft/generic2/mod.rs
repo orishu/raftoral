@@ -12,10 +12,12 @@
 
 pub mod cluster_router;
 pub mod errors;
+pub mod node;
 pub mod server;
 pub mod transport;
 
 pub use cluster_router::ClusterRouter;
 pub use errors::{TransportError, RoutingError};
+pub use node::{RaftNode, RaftNodeConfig, NodeMetadata, RoleChange};
 pub use transport::{Transport, TransportLayer, MessageSender};
 pub use server::{InProcessServer, InProcessMessageSender};
