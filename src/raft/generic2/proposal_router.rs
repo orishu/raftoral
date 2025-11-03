@@ -261,6 +261,41 @@ impl<SM: StateMachine> ProposalRouter<SM> {
     pub async fn is_leader(&self) -> bool {
         self.node.lock().await.is_leader().await
     }
+
+    /// Add a node to the cluster
+    ///
+    /// # Arguments
+    /// * `node_id` - ID of the node to add
+    /// * `address` - Network address of the node
+    ///
+    /// # Returns
+    /// Receiver that will be notified when the configuration change completes
+    pub async fn add_node(
+        &self,
+        node_id: u64,
+        address: String,
+    ) -> Result<oneshot::Receiver<Result<(), String>>, String> {
+        self.node.lock().await.add_node(node_id, address).await
+    }
+
+    /// Remove a node from the cluster
+    ///
+    /// # Arguments
+    /// * `node_id` - ID of the node to remove
+    ///
+    /// # Returns
+    /// Receiver that will be notified when the configuration change completes
+    pub async fn remove_node(
+        &self,
+        node_id: u64,
+    ) -> Result<oneshot::Receiver<Result<(), String>>, String> {
+        self.node.lock().await.remove_node(node_id).await
+    }
+
+    /// Get reference to the underlying RaftNode
+    pub fn node(&self) -> Arc<Mutex<RaftNode<SM>>> {
+        self.node.clone()
+    }
 }
 
 #[cfg(test)]

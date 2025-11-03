@@ -247,6 +247,11 @@ impl<SM: StateMachine> RaftNode<SM> {
         self.state_machine.clone()
     }
 
+    /// Get this node's ID
+    pub fn node_id(&self) -> u64 {
+        self.node_id
+    }
+
     /// Get current role
     pub async fn role(&self) -> StateRole {
         *self.current_role.lock().await
@@ -421,6 +426,59 @@ impl<SM: StateMachine> RaftNode<SM> {
 
             // Process ready
             self.on_ready().await?;
+        }
+
+        Ok(())
+    }
+
+    /// Run the Raft node from an Arc<Mutex<>> (helper for tests/async contexts)
+    ///
+    /// This is a helper that allows running a node that's wrapped in Arc<Mutex<>>
+    /// without having to move it out first.
+    pub async fn run_from_arc(node_arc: Arc<Mutex<RaftNode<SM>>>) -> Result<(), Box<dyn std::error::Error>> {
+        let mut ticker = time::interval(Duration::from_millis(100));
+
+        loop {
+            // Lock for short duration to check for messages and tick
+            let should_shutdown = {
+                let mut node = node_arc.lock().await;
+
+                // Tick the node
+                node.raw_node.tick();
+
+                // Try to receive messages (non-blocking)
+                let mut found_message = true;
+                while found_message {
+                    match node.message_rx.try_recv() {
+                        Ok(generic_msg) => {
+                            if let Err(e) = node.handle_raft_message(generic_msg).await {
+                                return Err(e);
+                            }
+                        }
+                        Err(mpsc::error::TryRecvError::Empty) => {
+                            found_message = false;
+                        }
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            info!(node.logger, "Mailbox closed, shutting down");
+                            return Ok(());
+                        }
+                    }
+                }
+
+                // Process ready
+                if let Err(e) = node.on_ready().await {
+                    return Err(e);
+                }
+
+                false
+            };
+
+            if should_shutdown {
+                break;
+            }
+
+            // Wait for next tick
+            ticker.tick().await;
         }
 
         Ok(())

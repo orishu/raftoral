@@ -514,7 +514,7 @@ impl CommandExecutor for ManagementCommandExecutor {
         Ok(())
     }
 
-    fn apply_with_index(&self, command: &Self::Command, log_index: u64) -> Result<(), Box<dyn std::error::Error>> {
+    fn apply_with_index(&self, command: &Self::Command, _log_index: u64) -> Result<(), Box<dyn std::error::Error>> {
         // For now, just delegate to apply (ignoring the index)
         self.apply(command)
     }
