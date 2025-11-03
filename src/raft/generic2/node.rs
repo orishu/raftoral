@@ -121,9 +121,6 @@ pub struct RaftNode<SM: StateMachine> {
     /// Proposal tracking: sync_id -> oneshot sender for completion notification
     pending_proposals: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<(), String>>>>>,
 
-    /// Next sync_id for proposal tracking
-    next_sync_id: Arc<Mutex<u64>>,
-
     /// Logger
     logger: Logger,
 }
@@ -170,7 +167,6 @@ impl<SM: StateMachine> RaftNode<SM> {
             committed_index: Arc::new(Mutex::new(0)),
             cached_conf_state: Arc::new(Mutex::new(ConfState::from((vec![config.node_id], vec![])))),
             pending_proposals: Arc::new(Mutex::new(HashMap::new())),
-            next_sync_id: Arc::new(Mutex::new(1)),
             logger,
         })
     }
@@ -213,7 +209,6 @@ impl<SM: StateMachine> RaftNode<SM> {
             committed_index: Arc::new(Mutex::new(0)),
             cached_conf_state: Arc::new(Mutex::new(ConfState::default())),
             pending_proposals: Arc::new(Mutex::new(HashMap::new())),
-            next_sync_id: Arc::new(Mutex::new(1)),
             logger,
         })
     }
@@ -265,13 +260,8 @@ impl<SM: StateMachine> RaftNode<SM> {
     pub async fn propose(&mut self, command: SM::Command) -> Result<oneshot::Receiver<Result<(), String>>, String> {
         let (tx, rx) = oneshot::channel();
 
-        // Generate unique sync_id for tracking
-        let sync_id = {
-            let mut next_id = self.next_sync_id.lock().await;
-            let id = *next_id;
-            *next_id += 1;
-            id
-        };
+        // Generate random sync_id for tracking (avoids collisions across nodes)
+        let sync_id = rand::random::<u64>();
 
         // Store the completion channel
         self.pending_proposals.lock().await.insert(sync_id, tx);
@@ -310,13 +300,8 @@ impl<SM: StateMachine> RaftNode<SM> {
     pub async fn add_node(&mut self, node_id: u64, address: String) -> Result<oneshot::Receiver<Result<(), String>>, String> {
         let (tx, rx) = oneshot::channel();
 
-        // Generate unique sync_id for tracking
-        let sync_id = {
-            let mut next_id = self.next_sync_id.lock().await;
-            let id = *next_id;
-            *next_id += 1;
-            id
-        };
+        // Generate random sync_id for tracking (avoids collisions across nodes)
+        let sync_id = rand::random::<u64>();
 
         // Store the completion channel
         self.pending_proposals.lock().await.insert(sync_id, tx);
@@ -359,13 +344,8 @@ impl<SM: StateMachine> RaftNode<SM> {
     pub async fn remove_node(&mut self, node_id: u64) -> Result<oneshot::Receiver<Result<(), String>>, String> {
         let (tx, rx) = oneshot::channel();
 
-        // Generate unique sync_id for tracking
-        let sync_id = {
-            let mut next_id = self.next_sync_id.lock().await;
-            let id = *next_id;
-            *next_id += 1;
-            id
-        };
+        // Generate random sync_id for tracking (avoids collisions across nodes)
+        let sync_id = rand::random::<u64>();
 
         // Store the completion channel
         self.pending_proposals.lock().await.insert(sync_id, tx);

@@ -66,9 +66,6 @@ pub struct ProposalRouter<SM: StateMachine> {
     /// Pending forwarded proposals: sync_id -> oneshot sender
     pending_forwarded: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<(), String>>>>>,
 
-    /// Next sync_id for forwarded proposals
-    next_sync_id: Arc<Mutex<u64>>,
-
     /// Logger
     logger: Logger,
 }
@@ -96,7 +93,6 @@ impl<SM: StateMachine> ProposalRouter<SM> {
             leader_id: Arc::new(Mutex::new(None)),
             node_id,
             pending_forwarded: Arc::new(Mutex::new(HashMap::new())),
-            next_sync_id: Arc::new(Mutex::new(1)),
             logger,
         }
     }
@@ -182,13 +178,8 @@ impl<SM: StateMachine> ProposalRouter<SM> {
         leader_id: u64,
         command: SM::Command,
     ) -> Result<oneshot::Receiver<Result<(), String>>, ProposalError> {
-        // Generate unique sync_id for tracking
-        let sync_id = {
-            let mut next_id = self.next_sync_id.lock().await;
-            let id = *next_id;
-            *next_id += 1;
-            id
-        };
+        // Generate random sync_id for tracking (avoids collisions across nodes)
+        let sync_id = rand::random::<u64>();
 
         // Create oneshot channel for completion
         let (tx, rx) = oneshot::channel();
