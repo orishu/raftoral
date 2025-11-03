@@ -432,9 +432,13 @@ impl<SM: StateMachine> RaftNode<SM> {
         Ok(())
     }
 
-    /// Handle incoming peer Raft message
+    /// Handle incoming message from mailbox
+    ///
+    /// This handles both:
+    /// - Peer Raft messages (for consensus)
+    /// - Forwarded proposals (from non-leader nodes)
     async fn handle_raft_message(&mut self, generic_msg: raft_proto::GenericMessage) -> Result<(), Box<dyn std::error::Error>> {
-        // Extract the raft_message from the oneof
+        // Extract the message from the oneof
         let message = generic_msg.message
             .ok_or("GenericMessage missing message field")?;
 
@@ -446,9 +450,34 @@ impl<SM: StateMachine> RaftNode<SM> {
                 // Step the message
                 self.raw_node.step(raft_msg)?;
             }
+            raft_proto::generic_message::Message::Propose(propose_msg) => {
+                // Forwarded proposal from another node
+                // Extract sync_id (for tracking the completion back to originator)
+                let sync_id = if propose_msg.sync_id != 0 {
+                    Some(propose_msg.sync_id)
+                } else {
+                    None
+                };
+
+                debug!(self.logger, "Received forwarded proposal";
+                    "sync_id" => sync_id,
+                    "data_len" => propose_msg.command_json.len()
+                );
+
+                // Propose locally (we should be the leader if we received this)
+                if let Some(id) = sync_id {
+                    // Put sync_id in context for tracking
+                    let context = id.to_le_bytes().to_vec();
+                    self.raw_node.propose(context, propose_msg.command_json)?;
+                } else {
+                    self.raw_node.propose(vec![], propose_msg.command_json)?;
+                }
+
+                // Note: The proposal completion will happen through normal on_ready() processing
+                // The sync_id will be extracted from the context and the result sent back
+            }
             _ => {
-                // In generic2, the mailbox should only receive Raft messages
-                // Commands (propose, campaign, etc.) come via method calls
+                // Other message types (campaign, add_node, etc.) should come via method calls
                 warn!(self.logger, "Unexpected message type in mailbox, ignoring");
             }
         }
