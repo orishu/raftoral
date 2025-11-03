@@ -29,4 +29,4 @@ pub use node::{RaftNode, RaftNodeConfig, NodeMetadata, RoleChange};
 pub use proposal_router::{ProposalRouter, ProposalError};
 pub use state_machine::{StateMachine, KvStateMachine, KvCommand, KvEvent};
 pub use transport::{Transport, TransportLayer, MessageSender};
-pub use server::{InProcessServer, InProcessMessageSender};
+pub use server::{InProcessServer, InProcessMessageSender, InProcessNetwork, InProcessNetworkSender};

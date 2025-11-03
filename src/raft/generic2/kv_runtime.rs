@@ -98,6 +98,75 @@ impl KvRuntime {
         Ok((runtime, node_arc))
     }
 
+    /// Create a new KV runtime for a node joining an existing cluster
+    ///
+    /// This variant creates a node that will join an existing cluster rather than
+    /// starting as a single-node cluster.
+    ///
+    /// # Arguments
+    /// * `config` - Raft node configuration
+    /// * `transport` - Transport layer for network communication
+    /// * `mailbox_rx` - Mailbox receiver for Raft messages
+    /// * `initial_voters` - IDs of all nodes in the cluster (including this node)
+    /// * `logger` - Logger instance
+    ///
+    /// # Returns
+    /// A tuple of (KvRuntime, RaftNode handle for running event loop)
+    pub fn new_joining_node(
+        config: RaftNodeConfig,
+        transport: Arc<dyn Transport>,
+        mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
+        initial_voters: Vec<u64>,
+        logger: Logger,
+    ) -> Result<(Self, Arc<Mutex<RaftNode<KvStateMachine>>>), Box<dyn std::error::Error>> {
+        let state_machine = KvStateMachine::new();
+        let event_bus = Arc::new(EventBus::new(100));
+
+        info!(logger, "Creating KV runtime (joining existing cluster)";
+            "node_id" => config.node_id,
+            "cluster_id" => config.cluster_id,
+            "initial_voters" => ?initial_voters
+        );
+
+        // Create RaftNode for joining a multi-node cluster with known peers
+        let node = RaftNode::new_multi_node_with_peers(
+            config.clone(),
+            transport.clone(),
+            mailbox_rx,
+            state_machine,
+            event_bus.clone(),
+            initial_voters,
+            logger.clone(),
+        )?;
+
+        let node_arc = Arc::new(Mutex::new(node));
+
+        // Create ProposalRouter
+        let proposal_router = Arc::new(ProposalRouter::new(
+            node_arc.clone(),
+            transport,
+            config.cluster_id,
+            config.node_id,
+            logger.clone(),
+        ));
+
+        // Start leader tracker in background
+        let router_clone = proposal_router.clone();
+        tokio::spawn(async move {
+            router_clone.run_leader_tracker().await;
+        });
+
+        let runtime = Self {
+            proposal_router,
+            event_bus,
+            node_id: config.node_id,
+            cluster_id: config.cluster_id,
+            logger,
+        };
+
+        Ok((runtime, node_arc))
+    }
+
     /// Set a key-value pair
     ///
     /// # Arguments
