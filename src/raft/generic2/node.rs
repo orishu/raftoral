@@ -43,6 +43,9 @@ pub struct RaftNodeConfig {
 
     /// Tick interval
     pub tick_interval: Duration,
+
+    /// Number of committed entries between snapshots (0 = disable snapshots)
+    pub snapshot_interval: u64,
 }
 
 impl Default for RaftNodeConfig {
@@ -55,6 +58,7 @@ impl Default for RaftNodeConfig {
             check_quorum: true,
             pre_vote: true,
             tick_interval: Duration::from_millis(100),
+            snapshot_interval: 1000, // Create snapshot every 1000 committed entries
         }
     }
 }
@@ -121,6 +125,12 @@ pub struct RaftNode<SM: StateMachine> {
     /// Proposal tracking: sync_id -> oneshot sender for completion notification
     pending_proposals: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<(), String>>>>>,
 
+    /// Snapshot configuration
+    snapshot_interval: u64,
+
+    /// Last snapshot index
+    last_snapshot_index: Arc<Mutex<u64>>,
+
     /// Logger
     logger: Logger,
 }
@@ -167,6 +177,8 @@ impl<SM: StateMachine> RaftNode<SM> {
             committed_index: Arc::new(Mutex::new(0)),
             cached_conf_state: Arc::new(Mutex::new(ConfState::from((vec![config.node_id], vec![])))),
             pending_proposals: Arc::new(Mutex::new(HashMap::new())),
+            snapshot_interval: config.snapshot_interval,
+            last_snapshot_index: Arc::new(Mutex::new(0)),
             logger,
         })
     }
@@ -209,6 +221,8 @@ impl<SM: StateMachine> RaftNode<SM> {
             committed_index: Arc::new(Mutex::new(0)),
             cached_conf_state: Arc::new(Mutex::new(ConfState::default())),
             pending_proposals: Arc::new(Mutex::new(HashMap::new())),
+            snapshot_interval: config.snapshot_interval,
+            last_snapshot_index: Arc::new(Mutex::new(0)),
             logger,
         })
     }
@@ -482,11 +496,34 @@ impl<SM: StateMachine> RaftNode<SM> {
         let store = self.raw_node.raft.raft_log.store.clone();
         let mut ready = self.raw_node.ready();
 
-        // 1. Handle snapshot (unimplemented)
+        // 1. Handle snapshot restoration
         if !ready.snapshot().is_empty() {
-            warn!(self.logger, "Snapshot support not yet implemented");
-            // TODO: Restore state machine from snapshot
-            // TODO: Update cached_conf_state
+            let snapshot = ready.snapshot().clone();
+            info!(self.logger, "Restoring from snapshot";
+                "index" => snapshot.get_metadata().index,
+                "term" => snapshot.get_metadata().term
+            );
+
+            // Restore state machine from snapshot data
+            let mut sm = self.state_machine.lock().await;
+            if let Err(e) = sm.restore(snapshot.get_data()) {
+                warn!(self.logger, "Failed to restore state machine from snapshot"; "error" => %e);
+            } else {
+                info!(self.logger, "State machine restored from snapshot");
+            }
+            drop(sm);
+
+            // Update cached conf state
+            *self.cached_conf_state.lock().await = snapshot.get_metadata().get_conf_state().clone();
+
+            // Update last snapshot index
+            *self.last_snapshot_index.lock().await = snapshot.get_metadata().index;
+
+            // Apply snapshot to storage
+            let store = self.raw_node.raft.raft_log.store.clone();
+            if let Err(e) = store.apply_snapshot_with_data(snapshot) {
+                warn!(self.logger, "Failed to apply snapshot to storage"; "error" => ?e);
+            }
         }
 
         // 2. Handle committed entries BEFORE persisting new entries
@@ -718,6 +755,65 @@ impl<SM: StateMachine> RaftNode<SM> {
         // 12. Advance light ready
         self.raw_node.advance_apply();
 
+        // 13. Create periodic snapshots if needed
+        self.maybe_create_snapshot().await?;
+
+        Ok(())
+    }
+
+    /// Create a snapshot if the configured interval has been reached
+    async fn maybe_create_snapshot(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        // Skip if snapshots are disabled
+        if self.snapshot_interval == 0 {
+            return Ok(());
+        }
+
+        let current_committed = *self.committed_index.lock().await;
+        let last_snapshot = *self.last_snapshot_index.lock().await;
+
+        // Check if we've committed enough entries since last snapshot
+        if current_committed - last_snapshot < self.snapshot_interval {
+            return Ok(());
+        }
+
+        info!(self.logger, "Creating snapshot";
+            "committed_index" => current_committed,
+            "last_snapshot_index" => last_snapshot
+        );
+
+        // Get state machine snapshot
+        let sm = self.state_machine.lock().await;
+        let snapshot_data = match sm.snapshot() {
+            Ok(data) => data,
+            Err(e) => {
+                warn!(self.logger, "Failed to create state machine snapshot"; "error" => %e);
+                return Ok(()); // Don't fail the whole operation
+            }
+        };
+        drop(sm);
+
+        // Get current conf state
+        let conf_state = self.cached_conf_state.lock().await.clone();
+
+        // Create Raft snapshot
+        let store = self.raw_node.raft.raft_log.store.clone();
+        let mut snapshot = Snapshot::default();
+
+        let meta = snapshot.mut_metadata();
+        meta.index = current_committed;
+        meta.term = store.rl().hard_state().term;
+        meta.set_conf_state(conf_state);
+
+        snapshot.set_data(bytes::Bytes::from(snapshot_data));
+
+        // Apply snapshot to storage
+        store.apply_snapshot_with_data(snapshot)?;
+
+        // Update last snapshot index
+        *self.last_snapshot_index.lock().await = current_committed;
+
+        info!(self.logger, "Snapshot created successfully"; "index" => current_committed);
+
         Ok(())
     }
 
@@ -818,7 +914,7 @@ impl<SM: StateMachine> RaftNode<SM> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::generic2::{InProcessServer, InProcessMessageSender, KvStateMachine, TransportLayer};
+    use crate::raft::generic2::{InProcessServer, InProcessMessageSender, KvCommand, KvStateMachine, TransportLayer};
     use tokio::sync::mpsc;
 
     fn create_logger() -> Logger {
@@ -925,5 +1021,46 @@ mod tests {
 
         // Should be able to subscribe
         assert!(event_rx.try_recv().is_err()); // No events yet
+    }
+
+    #[tokio::test]
+    async fn test_raft_node_snapshot_restore() {
+        let logger = create_logger();
+        let server = Arc::new(InProcessServer::new());
+        let transport = Arc::new(TransportLayer::new(Arc::new(InProcessMessageSender::new(server))));
+        let (_tx, rx) = mpsc::channel(10);
+
+        let config = RaftNodeConfig::default();
+        let mut state_machine = KvStateMachine::new();
+
+        // Populate state machine with data
+        state_machine.apply(&KvCommand::Set {
+            key: "key1".to_string(),
+            value: "value1".to_string(),
+        }).unwrap();
+        state_machine.apply(&KvCommand::Set {
+            key: "key2".to_string(),
+            value: "value2".to_string(),
+        }).unwrap();
+
+        // Create snapshot from state machine
+        let snapshot_data = state_machine.snapshot().unwrap();
+
+        // Create new state machine and restore
+        let mut restored_sm = KvStateMachine::new();
+        restored_sm.restore(&snapshot_data).unwrap();
+
+        // Verify restored state
+        assert_eq!(restored_sm.get("key1"), Some(&"value1".to_string()));
+        assert_eq!(restored_sm.get("key2"), Some(&"value2".to_string()));
+
+        // Verify it works with node
+        let event_bus = Arc::new(EventBus::new(100));
+        let node = RaftNode::new_single_node(config, transport, rx, restored_sm, event_bus, logger).unwrap();
+
+        // State machine should have the restored data
+        let sm = node.state_machine();
+        assert_eq!(sm.lock().await.get("key1"), Some(&"value1".to_string()));
+        assert_eq!(sm.lock().await.get("key2"), Some(&"value2".to_string()));
     }
 }
