@@ -3,9 +3,10 @@
 //! Provides a high-level application interface for managing sub-cluster metadata
 //! built on the generic2 Raft infrastructure.
 
-use crate::management::{ManagementEvent, ManagementStateMachine};
-use crate::raft::generic2::{EventBus, ProposalRouter, RaftNode, RaftNodeConfig, Transport};
+use crate::management::{ManagementEvent, ManagementStateMachine, SubClusterRuntime};
+use crate::raft::generic2::{ClusterRouter, EventBus, ProposalRouter, RaftNode, RaftNodeConfig, Transport};
 use slog::{info, Logger};
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -19,14 +20,24 @@ use uuid::Uuid;
 /// - Setting and querying sub-cluster metadata
 /// - Subscribing to management events
 ///
-/// The type parameter R represents the sub-cluster runtime type (e.g., KvRuntime)
-/// but is only used for type safety - no actual sub-clusters are instantiated yet.
+/// The type parameter R represents the sub-cluster runtime type (e.g., WorkflowRuntime)
+/// that implements the SubClusterRuntime trait. When management events are observed,
+/// ManagementRuntime will dynamically create and manage instances of R.
 pub struct ManagementRuntime<R> {
     /// Proposal router for submitting operations
     proposal_router: Arc<ProposalRouter<ManagementStateMachine>>,
 
     /// Event bus for management event notifications
     event_bus: Arc<EventBus<ManagementEvent>>,
+
+    /// Cluster router for registering sub-clusters
+    cluster_router: Arc<ClusterRouter>,
+
+    /// Transport layer (shared across all clusters)
+    transport: Arc<dyn Transport>,
+
+    /// Active sub-cluster runtimes managed by this node
+    sub_clusters: Arc<Mutex<HashMap<Uuid, Arc<R>>>>,
 
     /// Node ID
     node_id: u64,
@@ -48,22 +59,27 @@ impl<R> ManagementRuntime<R> {
     /// * `config` - Raft node configuration
     /// * `transport` - Transport layer for network communication
     /// * `mailbox_rx` - Mailbox receiver for Raft messages
+    /// * `cluster_router` - Cluster router for registering sub-clusters
     /// * `logger` - Logger instance
     ///
     /// # Returns
-    /// A tuple of (ManagementRuntime, RaftNode handle for running event loop)
+    /// A tuple of (Arc<ManagementRuntime>, RaftNode handle for running event loop)
     pub fn new(
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
         mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
+        cluster_router: Arc<ClusterRouter>,
         logger: Logger,
     ) -> Result<
         (
-            Self,
+            Arc<Self>,
             Arc<Mutex<RaftNode<ManagementStateMachine>>>,
         ),
         Box<dyn std::error::Error>,
-    > {
+    >
+    where
+        R: SubClusterRuntime,
+    {
         let state_machine = ManagementStateMachine::new();
         let event_bus = Arc::new(EventBus::new(100));
 
@@ -87,7 +103,7 @@ impl<R> ManagementRuntime<R> {
         // Create ProposalRouter
         let proposal_router = Arc::new(ProposalRouter::new(
             node_arc.clone(),
-            transport,
+            transport.clone(),
             config.cluster_id,
             config.node_id,
             logger.clone(),
@@ -99,14 +115,23 @@ impl<R> ManagementRuntime<R> {
             router_clone.run_leader_tracker().await;
         });
 
-        let runtime = Self {
+        let runtime = Arc::new(Self {
             proposal_router,
-            event_bus,
+            event_bus: event_bus.clone(),
+            cluster_router,
+            transport,
+            sub_clusters: Arc::new(Mutex::new(HashMap::new())),
             node_id: config.node_id,
             cluster_id: config.cluster_id,
-            logger,
+            logger: logger.clone(),
             _phantom: PhantomData,
-        };
+        });
+
+        // Start event observer in background
+        let runtime_clone = runtime.clone();
+        tokio::spawn(async move {
+            runtime_clone.run_event_observer().await;
+        });
 
         Ok((runtime, node_arc))
     }
@@ -118,23 +143,28 @@ impl<R> ManagementRuntime<R> {
     /// * `transport` - Transport layer for network communication
     /// * `mailbox_rx` - Mailbox receiver for Raft messages
     /// * `initial_voters` - IDs of all nodes in the cluster (including this node)
+    /// * `cluster_router` - Cluster router for registering sub-clusters
     /// * `logger` - Logger instance
     ///
     /// # Returns
-    /// A tuple of (ManagementRuntime, RaftNode handle for running event loop)
+    /// A tuple of (Arc<ManagementRuntime>, RaftNode handle for running event loop)
     pub fn new_joining_node(
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
         mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
         initial_voters: Vec<u64>,
+        cluster_router: Arc<ClusterRouter>,
         logger: Logger,
     ) -> Result<
         (
-            Self,
+            Arc<Self>,
             Arc<Mutex<RaftNode<ManagementStateMachine>>>,
         ),
         Box<dyn std::error::Error>,
-    > {
+    >
+    where
+        R: SubClusterRuntime,
+    {
         let state_machine = ManagementStateMachine::new();
         let event_bus = Arc::new(EventBus::new(100));
 
@@ -160,7 +190,7 @@ impl<R> ManagementRuntime<R> {
         // Create ProposalRouter
         let proposal_router = Arc::new(ProposalRouter::new(
             node_arc.clone(),
-            transport,
+            transport.clone(),
             config.cluster_id,
             config.node_id,
             logger.clone(),
@@ -172,14 +202,23 @@ impl<R> ManagementRuntime<R> {
             router_clone.run_leader_tracker().await;
         });
 
-        let runtime = Self {
+        let runtime = Arc::new(Self {
             proposal_router,
-            event_bus,
+            event_bus: event_bus.clone(),
+            cluster_router,
+            transport,
+            sub_clusters: Arc::new(Mutex::new(HashMap::new())),
             node_id: config.node_id,
             cluster_id: config.cluster_id,
-            logger,
+            logger: logger.clone(),
             _phantom: PhantomData,
-        };
+        });
+
+        // Start event observer in background
+        let runtime_clone = runtime.clone();
+        tokio::spawn(async move {
+            runtime_clone.run_event_observer().await;
+        });
 
         Ok((runtime, node_arc))
     }
@@ -464,6 +503,185 @@ impl<R> ManagementRuntime<R> {
     ) -> Result<oneshot::Receiver<Result<(), String>>, String> {
         info!(self.logger, "Removing node from management cluster"; "node_id" => node_id);
         self.proposal_router.remove_node(node_id).await
+    }
+
+    /// Run event observer for dynamic sub-cluster management (private background task)
+    ///
+    /// This method observes management events and dynamically creates/manages sub-cluster runtimes:
+    /// - SubClusterCreated: Creates a new sub-cluster runtime if this node is in the node list
+    /// - NodeAddedToSubCluster: Adds node to existing sub-cluster or joins as new member
+    /// - NodeRemovedFromSubCluster: Removes node from sub-cluster or shuts down if removed
+    /// - SubClusterDeleted: Shuts down and removes sub-cluster runtime
+    async fn run_event_observer(self: Arc<Self>)
+    where
+        R: SubClusterRuntime,
+    {
+        use slog::{error, info};
+
+        let mut event_rx = self.event_bus.subscribe();
+
+        info!(self.logger, "Management event observer started");
+
+        loop {
+            match event_rx.recv().await {
+                Ok(event) => {
+                    match event {
+                        ManagementEvent::SubClusterCreated {
+                            cluster_id,
+                            node_ids,
+                        } => {
+                            // Check if this node is in the cluster
+                            if !node_ids.contains(&self.node_id) {
+                                continue;
+                            }
+
+                            info!(self.logger, "Sub-cluster created event received";
+                                "cluster_id" => %cluster_id,
+                                "node_ids" => ?node_ids,
+                                "this_node" => self.node_id
+                            );
+
+                            // Check if we're the first node (leader/initiator)
+                            let is_first_node = node_ids.first() == Some(&self.node_id);
+
+                            // Create mailbox for this cluster
+                            let (mailbox_tx, mailbox_rx) = mpsc::channel(1000);
+
+                            // Compute cluster_id as u32 from UUID
+                            // TODO: Better mapping strategy or use full UUID
+                            let cluster_id_u32 = (cluster_id.as_u128() % (u32::MAX as u128)) as u32;
+                            if cluster_id_u32 == 0 {
+                                error!(self.logger, "Invalid cluster_id (cannot be 0)");
+                                continue;
+                            }
+
+                            // Register cluster in cluster router
+                            self.cluster_router.register_cluster(cluster_id_u32, mailbox_tx).await;
+
+                            // Create config for sub-cluster
+                            let config = RaftNodeConfig {
+                                node_id: self.node_id,
+                                cluster_id: cluster_id_u32,
+                                snapshot_interval: 100,
+                                ..Default::default()
+                            };
+
+                            // Create runtime based on whether we're first node or joining
+                            let (runtime, node) = if is_first_node {
+                                info!(self.logger, "Creating single-node sub-cluster";
+                                    "cluster_id" => %cluster_id
+                                );
+                                match R::new_single_node(
+                                    config,
+                                    self.transport.clone(),
+                                    mailbox_rx,
+                                    self.logger.clone(),
+                                ) {
+                                    Ok(pair) => pair,
+                                    Err(e) => {
+                                        let error_msg = e.to_string();
+                                        error!(self.logger, "Failed to create sub-cluster runtime";
+                                            "cluster_id" => %cluster_id,
+                                            "error" => error_msg
+                                        );
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                info!(self.logger, "Joining existing sub-cluster";
+                                    "cluster_id" => %cluster_id,
+                                    "initial_voters" => ?node_ids
+                                );
+                                match R::new_joining_node(
+                                    config,
+                                    self.transport.clone(),
+                                    mailbox_rx,
+                                    node_ids.clone(),
+                                    self.logger.clone(),
+                                ) {
+                                    Ok(pair) => pair,
+                                    Err(e) => {
+                                        let error_msg = e.to_string();
+                                        error!(self.logger, "Failed to create sub-cluster runtime";
+                                            "cluster_id" => %cluster_id,
+                                            "error" => error_msg
+                                        );
+                                        continue;
+                                    }
+                                }
+                            };
+
+                            // Store runtime
+                            self.sub_clusters.lock().await.insert(cluster_id, Arc::new(runtime));
+
+                            // Run node in background
+                            tokio::spawn(async move {
+                                let _ = RaftNode::run_from_arc(node).await;
+                            });
+
+                            info!(self.logger, "Sub-cluster runtime created successfully";
+                                "cluster_id" => %cluster_id
+                            );
+                        }
+
+                        ManagementEvent::NodeAddedToSubCluster {
+                            cluster_id,
+                            node_id,
+                        } => {
+                            info!(self.logger, "Node added to sub-cluster event";
+                                "cluster_id" => %cluster_id,
+                                "node_id" => node_id
+                            );
+
+                            // TODO: Implement node addition to existing sub-cluster
+                            // If this is this node, we need to join
+                            // If we own the cluster, we need to add the node via proposal router
+                        }
+
+                        ManagementEvent::NodeRemovedFromSubCluster {
+                            cluster_id,
+                            node_id,
+                        } => {
+                            info!(self.logger, "Node removed from sub-cluster event";
+                                "cluster_id" => %cluster_id,
+                                "node_id" => node_id
+                            );
+
+                            // If this is this node being removed, shut down the runtime
+                            if node_id == self.node_id {
+                                info!(self.logger, "This node removed from sub-cluster, shutting down";
+                                    "cluster_id" => %cluster_id
+                                );
+                                self.sub_clusters.lock().await.remove(&cluster_id);
+                            }
+
+                            // TODO: If we own the cluster, remove via proposal router
+                        }
+
+                        ManagementEvent::SubClusterDeleted { cluster_id } => {
+                            info!(self.logger, "Sub-cluster deleted event";
+                                "cluster_id" => %cluster_id
+                            );
+
+                            // Shut down and remove the runtime
+                            self.sub_clusters.lock().await.remove(&cluster_id);
+                        }
+
+                        _ => {
+                            // Ignore other events (metadata changes)
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    // Continue on lag
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    info!(self.logger, "Management event observer stopped (event channel closed)");
+                    break;
+                }
+            }
+        }
     }
 }
 

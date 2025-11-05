@@ -7,7 +7,9 @@
 pub mod event;
 pub mod runtime;
 pub mod state_machine;
+pub mod sub_cluster_runtime;
 
 pub use event::ManagementEvent;
 pub use runtime::ManagementRuntime;
 pub use state_machine::ManagementStateMachine;
+pub use sub_cluster_runtime::SubClusterRuntime;

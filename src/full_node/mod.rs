@@ -14,17 +14,21 @@ use crate::management::ManagementRuntime;
 use crate::raft::generic2::{
     ClusterRouter, RaftNode, RaftNodeConfig, TransportLayer,
 };
+use crate::workflow2::WorkflowRuntime;
 use slog::{info, Logger};
-use std::marker::PhantomData;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tonic::transport::Server;
 
 /// A complete Raft node with all layers from gRPC to ManagementRuntime
-pub struct FullNode<R> {
-    /// Management runtime (Layer 7)
-    runtime: Arc<ManagementRuntime<R>>,
+///
+/// The FullNode manages a management cluster (cluster_id=0) that tracks metadata
+/// about workflow execution clusters. When sub-clusters are created via the management
+/// runtime, FullNode automatically creates and manages WorkflowRuntime instances.
+pub struct FullNode {
+    /// Management runtime (Layer 7) - manages WorkflowRuntime sub-clusters
+    runtime: Arc<ManagementRuntime<WorkflowRuntime>>,
 
     /// Raft node handle
     node: Arc<Mutex<RaftNode<crate::management::ManagementStateMachine>>>,
@@ -37,12 +41,9 @@ pub struct FullNode<R> {
 
     /// Logger
     logger: Logger,
-
-    /// Phantom data for sub-cluster runtime type
-    _phantom: PhantomData<R>,
 }
 
-impl<R> FullNode<R> {
+impl FullNode {
     /// Create and start a new full node
     ///
     /// # Arguments
@@ -84,10 +85,9 @@ impl<R> FullNode<R> {
             config,
             transport.clone(),
             mailbox_rx,
+            cluster_router.clone(),
             logger.clone(),
         )?;
-
-        let runtime = Arc::new(runtime);
 
         // Run Raft node in background
         let node_clone = node.clone();
@@ -124,12 +124,11 @@ impl<R> FullNode<R> {
             grpc_server_handle: Some(grpc_server_handle),
             address,
             logger,
-            _phantom: PhantomData,
         })
     }
 
     /// Get a reference to the management runtime
-    pub fn runtime(&self) -> &Arc<ManagementRuntime<R>> {
+    pub fn runtime(&self) -> &Arc<ManagementRuntime<WorkflowRuntime>> {
         &self.runtime
     }
 
@@ -176,7 +175,7 @@ mod tests {
         let logger = create_logger();
 
         // Create a full node with gRPC server
-        let node = FullNode::<()>::new(
+        let node = FullNode::new(
             1,
             "127.0.0.1:50051".to_string(),
             logger.clone(),
