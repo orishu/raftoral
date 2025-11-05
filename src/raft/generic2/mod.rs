@@ -14,7 +14,6 @@ pub mod cluster_router;
 pub mod errors;
 pub mod event_bus;
 pub mod integration_tests;
-pub mod kv_runtime;
 pub mod node;
 pub mod proposal_router;
 pub mod server;
@@ -24,9 +23,11 @@ pub mod transport;
 pub use cluster_router::ClusterRouter;
 pub use errors::{TransportError, RoutingError};
 pub use event_bus::EventBus;
-pub use kv_runtime::KvRuntime;
 pub use node::{RaftNode, RaftNodeConfig, NodeMetadata, RoleChange};
 pub use proposal_router::{ProposalRouter, ProposalError};
 pub use state_machine::{StateMachine, KvStateMachine, KvCommand, KvEvent};
 pub use transport::{Transport, TransportLayer, MessageSender};
 pub use server::{InProcessServer, InProcessMessageSender, InProcessNetwork, InProcessNetworkSender};
+
+// Re-export KvRuntime from the kv module (Layer 7)
+pub use crate::kv::KvRuntime;
