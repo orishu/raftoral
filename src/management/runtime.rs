@@ -10,7 +10,6 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
-use uuid::Uuid;
 
 /// High-level runtime for managing sub-cluster metadata
 ///
@@ -37,7 +36,7 @@ pub struct ManagementRuntime<R> {
     transport: Arc<dyn Transport>,
 
     /// Active sub-cluster runtimes managed by this node
-    sub_clusters: Arc<Mutex<HashMap<Uuid, Arc<R>>>>,
+    sub_clusters: Arc<Mutex<HashMap<u32, Arc<R>>>>,
 
     /// Node ID
     node_id: u64,
@@ -226,31 +225,44 @@ impl<R> ManagementRuntime<R> {
     /// Create a new sub-cluster
     ///
     /// # Arguments
-    /// * `cluster_id` - Unique identifier for the sub-cluster
     /// * `node_ids` - Initial node IDs to include in the sub-cluster
     ///
     /// # Returns
-    /// * `Ok(())` - Operation completed successfully
+    /// * `Ok(cluster_id)` - Operation completed successfully, returns the assigned cluster ID
     /// * `Err(String)` - Operation failed
     pub async fn create_sub_cluster(
         &self,
-        cluster_id: Uuid,
         node_ids: Vec<u64>,
-    ) -> Result<(), String> {
+    ) -> Result<u32, String> {
         info!(self.logger, "Creating sub-cluster";
-            "cluster_id" => %cluster_id,
             "node_ids" => ?node_ids
         );
 
+        // Subscribe to events to capture the assigned cluster_id
+        let mut event_rx = self.event_bus.subscribe();
+
         let command = crate::management::state_machine::ManagementCommand::CreateSubCluster {
-            cluster_id,
             node_ids,
         };
 
+        // Propose the command
         self.proposal_router
             .propose_and_wait(command)
             .await
-            .map_err(|e| format!("{}", e))
+            .map_err(|e| format!("{}", e))?;
+
+        // Wait for the SubClusterCreated event to get the assigned cluster_id
+        // We need to do this because the cluster_id is assigned by the state machine
+        loop {
+            match event_rx.recv().await {
+                Ok(ManagementEvent::SubClusterCreated { cluster_id, .. }) => {
+                    info!(self.logger, "Sub-cluster created"; "cluster_id" => cluster_id);
+                    return Ok(cluster_id);
+                }
+                Ok(_) => continue, // Ignore other events
+                Err(_) => return Err("Event channel closed".to_string()),
+            }
+        }
     }
 
     /// Delete a sub-cluster
@@ -261,8 +273,8 @@ impl<R> ManagementRuntime<R> {
     /// # Returns
     /// * `Ok(())` - Operation completed successfully
     /// * `Err(String)` - Operation failed
-    pub async fn delete_sub_cluster(&self, cluster_id: Uuid) -> Result<(), String> {
-        info!(self.logger, "Deleting sub-cluster"; "cluster_id" => %cluster_id);
+    pub async fn delete_sub_cluster(&self, cluster_id: u32) -> Result<(), String> {
+        info!(self.logger, "Deleting sub-cluster"; "cluster_id" => cluster_id);
 
         let command = crate::management::state_machine::ManagementCommand::DeleteSubCluster {
             cluster_id,
@@ -285,11 +297,11 @@ impl<R> ManagementRuntime<R> {
     /// * `Err(String)` - Operation failed
     pub async fn add_node_to_sub_cluster(
         &self,
-        cluster_id: Uuid,
+        cluster_id: u32,
         node_id: u64,
     ) -> Result<(), String> {
         info!(self.logger, "Adding node to sub-cluster";
-            "cluster_id" => %cluster_id,
+            "cluster_id" => cluster_id,
             "node_id" => node_id
         );
 
@@ -316,11 +328,11 @@ impl<R> ManagementRuntime<R> {
     /// * `Err(String)` - Operation failed
     pub async fn remove_node_from_sub_cluster(
         &self,
-        cluster_id: Uuid,
+        cluster_id: u32,
         node_id: u64,
     ) -> Result<(), String> {
         info!(self.logger, "Removing node from sub-cluster";
-            "cluster_id" => %cluster_id,
+            "cluster_id" => cluster_id,
             "node_id" => node_id
         );
 
@@ -348,12 +360,12 @@ impl<R> ManagementRuntime<R> {
     /// * `Err(String)` - Operation failed
     pub async fn set_metadata(
         &self,
-        cluster_id: Uuid,
+        cluster_id: u32,
         key: String,
         value: String,
     ) -> Result<(), String> {
         info!(self.logger, "Setting sub-cluster metadata";
-            "cluster_id" => %cluster_id,
+            "cluster_id" => cluster_id,
             "key" => &key,
             "value" => &value
         );
@@ -379,9 +391,9 @@ impl<R> ManagementRuntime<R> {
     /// # Returns
     /// * `Ok(())` - Operation completed successfully
     /// * `Err(String)` - Operation failed
-    pub async fn delete_metadata(&self, cluster_id: Uuid, key: String) -> Result<(), String> {
+    pub async fn delete_metadata(&self, cluster_id: u32, key: String) -> Result<(), String> {
         info!(self.logger, "Deleting sub-cluster metadata";
-            "cluster_id" => %cluster_id,
+            "cluster_id" => cluster_id,
             "key" => &key
         );
 
@@ -406,7 +418,7 @@ impl<R> ManagementRuntime<R> {
     /// * `None` - Sub-cluster does not exist
     pub async fn get_sub_cluster(
         &self,
-        cluster_id: &Uuid,
+        cluster_id: &u32,
     ) -> Option<crate::management::state_machine::SubClusterMetadata> {
         let node_arc = self.proposal_router.node();
         let node = node_arc.lock().await;
@@ -420,7 +432,7 @@ impl<R> ManagementRuntime<R> {
     ///
     /// # Returns
     /// Vector of all sub-cluster IDs
-    pub async fn list_sub_clusters(&self) -> Vec<Uuid> {
+    pub async fn list_sub_clusters(&self) -> Vec<u32> {
         let node_arc = self.proposal_router.node();
         let node = node_arc.lock().await;
         let sm = node.state_machine().clone();
@@ -435,7 +447,7 @@ impl<R> ManagementRuntime<R> {
     /// HashMap of all sub-cluster metadata
     pub async fn get_all_sub_clusters(
         &self,
-    ) -> std::collections::HashMap<Uuid, crate::management::state_machine::SubClusterMetadata>
+    ) -> std::collections::HashMap<u32, crate::management::state_machine::SubClusterMetadata>
     {
         let node_arc = self.proposal_router.node();
         let node = node_arc.lock().await;
@@ -536,7 +548,7 @@ impl<R> ManagementRuntime<R> {
                             }
 
                             info!(self.logger, "Sub-cluster created event received";
-                                "cluster_id" => %cluster_id,
+                                "cluster_id" => cluster_id,
                                 "node_ids" => ?node_ids,
                                 "this_node" => self.node_id
                             );
@@ -547,21 +559,19 @@ impl<R> ManagementRuntime<R> {
                             // Create mailbox for this cluster
                             let (mailbox_tx, mailbox_rx) = mpsc::channel(1000);
 
-                            // Compute cluster_id as u32 from UUID
-                            // TODO: Better mapping strategy or use full UUID
-                            let cluster_id_u32 = (cluster_id.as_u128() % (u32::MAX as u128)) as u32;
-                            if cluster_id_u32 == 0 {
+                            // Validate cluster_id (0 is reserved for management cluster)
+                            if cluster_id == 0 {
                                 error!(self.logger, "Invalid cluster_id (cannot be 0)");
                                 continue;
                             }
 
                             // Register cluster in cluster router
-                            self.cluster_router.register_cluster(cluster_id_u32, mailbox_tx).await;
+                            self.cluster_router.register_cluster(cluster_id, mailbox_tx).await;
 
                             // Create config for sub-cluster
                             let config = RaftNodeConfig {
                                 node_id: self.node_id,
-                                cluster_id: cluster_id_u32,
+                                cluster_id,
                                 snapshot_interval: 100,
                                 ..Default::default()
                             };
@@ -569,7 +579,7 @@ impl<R> ManagementRuntime<R> {
                             // Create runtime based on whether we're first node or joining
                             let (runtime, node) = if is_first_node {
                                 info!(self.logger, "Creating single-node sub-cluster";
-                                    "cluster_id" => %cluster_id
+                                    "cluster_id" => cluster_id
                                 );
                                 match R::new_single_node(
                                     config,
@@ -581,7 +591,7 @@ impl<R> ManagementRuntime<R> {
                                     Err(e) => {
                                         let error_msg = e.to_string();
                                         error!(self.logger, "Failed to create sub-cluster runtime";
-                                            "cluster_id" => %cluster_id,
+                                            "cluster_id" => cluster_id,
                                             "error" => error_msg
                                         );
                                         continue;
@@ -589,7 +599,7 @@ impl<R> ManagementRuntime<R> {
                                 }
                             } else {
                                 info!(self.logger, "Joining existing sub-cluster";
-                                    "cluster_id" => %cluster_id,
+                                    "cluster_id" => cluster_id,
                                     "initial_voters" => ?node_ids
                                 );
                                 match R::new_joining_node(
@@ -603,7 +613,7 @@ impl<R> ManagementRuntime<R> {
                                     Err(e) => {
                                         let error_msg = e.to_string();
                                         error!(self.logger, "Failed to create sub-cluster runtime";
-                                            "cluster_id" => %cluster_id,
+                                            "cluster_id" => cluster_id,
                                             "error" => error_msg
                                         );
                                         continue;
@@ -620,7 +630,7 @@ impl<R> ManagementRuntime<R> {
                             });
 
                             info!(self.logger, "Sub-cluster runtime created successfully";
-                                "cluster_id" => %cluster_id
+                                "cluster_id" => cluster_id
                             );
                         }
 
@@ -629,7 +639,7 @@ impl<R> ManagementRuntime<R> {
                             node_id,
                         } => {
                             info!(self.logger, "Node added to sub-cluster event";
-                                "cluster_id" => %cluster_id,
+                                "cluster_id" => cluster_id,
                                 "node_id" => node_id
                             );
 
@@ -643,14 +653,14 @@ impl<R> ManagementRuntime<R> {
                             node_id,
                         } => {
                             info!(self.logger, "Node removed from sub-cluster event";
-                                "cluster_id" => %cluster_id,
+                                "cluster_id" => cluster_id,
                                 "node_id" => node_id
                             );
 
                             // If this is this node being removed, shut down the runtime
                             if node_id == self.node_id {
                                 info!(self.logger, "This node removed from sub-cluster, shutting down";
-                                    "cluster_id" => %cluster_id
+                                    "cluster_id" => cluster_id
                                 );
                                 self.sub_clusters.lock().await.remove(&cluster_id);
                             }
@@ -660,7 +670,7 @@ impl<R> ManagementRuntime<R> {
 
                         ManagementEvent::SubClusterDeleted { cluster_id } => {
                             info!(self.logger, "Sub-cluster deleted event";
-                                "cluster_id" => %cluster_id
+                                "cluster_id" => cluster_id
                             );
 
                             // Shut down and remove the runtime
@@ -690,6 +700,70 @@ mod tests {
     use super::*;
     use crate::raft::generic2::{InProcessMessageSender, InProcessServer, TransportLayer};
     use crate::raft::generic2::errors::TransportError;
+    use crate::raft::generic2::StateMachine;
+
+    // Dummy implementation for testing
+    impl SubClusterRuntime for () {
+        type StateMachine = DummyStateMachine;
+
+        fn new_single_node(
+            _config: RaftNodeConfig,
+            _transport: Arc<dyn crate::raft::generic2::Transport>,
+            _mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
+            _logger: Logger,
+        ) -> Result<(Self, Arc<Mutex<RaftNode<Self::StateMachine>>>), Box<dyn std::error::Error>> {
+            unimplemented!("Dummy implementation for testing")
+        }
+
+        fn new_joining_node(
+            _config: RaftNodeConfig,
+            _transport: Arc<dyn crate::raft::generic2::Transport>,
+            _mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
+            _initial_voters: Vec<u64>,
+            _logger: Logger,
+        ) -> Result<(Self, Arc<Mutex<RaftNode<Self::StateMachine>>>), Box<dyn std::error::Error>> {
+            unimplemented!("Dummy implementation for testing")
+        }
+
+        async fn add_node(&self, _node_id: u64, _address: String)
+            -> Result<oneshot::Receiver<Result<(), String>>, String> {
+            unimplemented!("Dummy implementation for testing")
+        }
+
+        async fn remove_node(&self, _node_id: u64)
+            -> Result<oneshot::Receiver<Result<(), String>>, String> {
+            unimplemented!("Dummy implementation for testing")
+        }
+
+        fn node_id(&self) -> u64 {
+            0
+        }
+
+        fn cluster_id(&self) -> u32 {
+            0
+        }
+    }
+
+    // Dummy state machine for testing
+    #[derive(Debug, Clone)]
+    pub struct DummyStateMachine;
+
+    impl StateMachine for DummyStateMachine {
+        type Command = ();
+        type Event = ();
+
+        fn apply(&mut self, _command: &Self::Command) -> Result<Vec<Self::Event>, Box<dyn std::error::Error>> {
+            Ok(vec![])
+        }
+
+        fn snapshot(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+            Ok(vec![])
+        }
+
+        fn restore(&mut self, _snapshot: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+            Ok(())
+        }
+    }
 
     fn create_logger() -> Logger {
         use slog::Drain;
@@ -708,6 +782,7 @@ mod tests {
         ))));
 
         let (tx, rx) = mpsc::channel(100);
+        let cluster_router = Arc::new(ClusterRouter::new());
 
         let config = RaftNodeConfig {
             node_id: 1,
@@ -729,7 +804,7 @@ mod tests {
 
         // Use () as placeholder for sub-cluster type since we're not instantiating any
         let (runtime, node) =
-            ManagementRuntime::<()>::new(config, transport, rx, logger).unwrap();
+            ManagementRuntime::<()>::new(config, transport, rx, cluster_router, logger).unwrap();
 
         // Campaign to become leader
         node.lock()
@@ -749,12 +824,12 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
         assert!(runtime.is_leader().await, "Node should be leader");
 
-        // Test create sub-cluster
-        let cluster_id = Uuid::new_v4();
-        runtime
-            .create_sub_cluster(cluster_id, vec![1, 2, 3])
+        // Test create sub-cluster (cluster_id assigned automatically)
+        let cluster_id = runtime
+            .create_sub_cluster(vec![1, 2, 3])
             .await
             .expect("Create sub-cluster should succeed");
+        assert_eq!(cluster_id, 1); // First cluster should get ID 1
 
         // Test get sub-cluster
         let metadata = runtime.get_sub_cluster(&cluster_id).await;
@@ -831,6 +906,7 @@ mod tests {
         ))));
 
         let (tx, rx) = mpsc::channel(100);
+        let cluster_router = Arc::new(ClusterRouter::new());
 
         let config = RaftNodeConfig {
             node_id: 1,
@@ -852,7 +928,7 @@ mod tests {
 
         // Create ManagementRuntime typed to manage KvRuntime sub-clusters
         let (runtime, node) =
-            ManagementRuntime::<KvRuntime>::new(config, transport, rx, logger).unwrap();
+            ManagementRuntime::<KvRuntime>::new(config, transport, rx, cluster_router, logger).unwrap();
 
         // Campaign to become leader
         node.lock()
@@ -872,16 +948,12 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
         assert!(runtime.is_leader().await, "Node should be leader");
 
-        // Track metadata for three KV execution clusters
-        let kv_cluster_1 = Uuid::new_v4();
-        let kv_cluster_2 = Uuid::new_v4();
-        let kv_cluster_3 = Uuid::new_v4();
-
         // Create first KV cluster with nodes 1,2,3
-        runtime
-            .create_sub_cluster(kv_cluster_1, vec![1, 2, 3])
+        let kv_cluster_1 = runtime
+            .create_sub_cluster(vec![1, 2, 3])
             .await
             .expect("Create first KV cluster should succeed");
+        assert_eq!(kv_cluster_1, 1); // First cluster should get ID 1
 
         runtime
             .set_metadata(kv_cluster_1, "type".to_string(), "kv".to_string())
@@ -894,10 +966,11 @@ mod tests {
             .expect("Set metadata should succeed");
 
         // Create second KV cluster with nodes 4,5,6
-        runtime
-            .create_sub_cluster(kv_cluster_2, vec![4, 5, 6])
+        let kv_cluster_2 = runtime
+            .create_sub_cluster(vec![4, 5, 6])
             .await
             .expect("Create second KV cluster should succeed");
+        assert_eq!(kv_cluster_2, 2); // Second cluster should get ID 2
 
         runtime
             .set_metadata(kv_cluster_2, "type".to_string(), "kv".to_string())
@@ -910,10 +983,11 @@ mod tests {
             .expect("Set metadata should succeed");
 
         // Create third KV cluster with nodes 7,8,9
-        runtime
-            .create_sub_cluster(kv_cluster_3, vec![7, 8, 9])
+        let kv_cluster_3 = runtime
+            .create_sub_cluster(vec![7, 8, 9])
             .await
             .expect("Create third KV cluster should succeed");
+        assert_eq!(kv_cluster_3, 3); // Third cluster should get ID 3
 
         runtime
             .set_metadata(kv_cluster_3, "type".to_string(), "kv".to_string())

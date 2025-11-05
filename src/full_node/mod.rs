@@ -160,7 +160,6 @@ impl FullNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use uuid::Uuid;
 
     fn create_logger() -> Logger {
         use slog::Drain;
@@ -188,11 +187,11 @@ mod tests {
         assert!(node.is_leader().await, "Node should be leader");
 
         // Create a sub-cluster using the management runtime
-        let cluster_id = Uuid::new_v4();
-        node.runtime()
-            .create_sub_cluster(cluster_id, vec![1, 2, 3])
+        let cluster_id = node.runtime()
+            .create_sub_cluster(vec![1, 2, 3])
             .await
             .expect("Create sub-cluster should succeed");
+        assert_eq!(cluster_id, 1); // First cluster should get ID 1
 
         // Set metadata using the management runtime
         node.runtime()

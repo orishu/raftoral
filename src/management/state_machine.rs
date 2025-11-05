@@ -3,49 +3,49 @@
 //! Maintains metadata about sub-clusters. The actual sub-cluster Raft nodes
 //! are managed by the ManagementRuntime (Layer 7), while this state machine
 //! just tracks the metadata.
+//!
+//! Cluster IDs are assigned sequentially starting from 1 (0 is reserved for the management cluster).
 
 use crate::management::ManagementEvent;
 use crate::raft::generic2::StateMachine;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use uuid::Uuid;
 
 /// Commands for the management state machine
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum ManagementCommand {
-    /// Create a new sub-cluster
+    /// Create a new sub-cluster (cluster_id assigned sequentially by state machine)
     CreateSubCluster {
-        cluster_id: Uuid,
         node_ids: Vec<u64>,
     },
 
     /// Delete a sub-cluster
     DeleteSubCluster {
-        cluster_id: Uuid,
+        cluster_id: u32,
     },
 
     /// Add a node to a sub-cluster
     AddNodeToSubCluster {
-        cluster_id: Uuid,
+        cluster_id: u32,
         node_id: u64,
     },
 
     /// Remove a node from a sub-cluster
     RemoveNodeFromSubCluster {
-        cluster_id: Uuid,
+        cluster_id: u32,
         node_id: u64,
     },
 
     /// Set metadata for a sub-cluster
     SetMetadata {
-        cluster_id: Uuid,
+        cluster_id: u32,
         key: String,
         value: String,
     },
 
     /// Delete metadata for a sub-cluster
     DeleteMetadata {
-        cluster_id: Uuid,
+        cluster_id: u32,
         key: String,
     },
 }
@@ -64,7 +64,10 @@ pub struct SubClusterMetadata {
 #[derive(Debug)]
 pub struct ManagementStateMachine {
     /// Sub-cluster ID → metadata
-    sub_clusters: HashMap<Uuid, SubClusterMetadata>,
+    sub_clusters: HashMap<u32, SubClusterMetadata>,
+
+    /// Next cluster ID to assign (starts at 1, 0 is reserved for management cluster)
+    next_cluster_id: u32,
 }
 
 impl ManagementStateMachine {
@@ -72,21 +75,22 @@ impl ManagementStateMachine {
     pub fn new() -> Self {
         Self {
             sub_clusters: HashMap::new(),
+            next_cluster_id: 1, // Start at 1, 0 is reserved for management
         }
     }
 
     /// Get metadata for a sub-cluster
-    pub fn get_sub_cluster(&self, cluster_id: &Uuid) -> Option<&SubClusterMetadata> {
+    pub fn get_sub_cluster(&self, cluster_id: &u32) -> Option<&SubClusterMetadata> {
         self.sub_clusters.get(cluster_id)
     }
 
     /// List all sub-cluster IDs
-    pub fn list_sub_clusters(&self) -> Vec<Uuid> {
+    pub fn list_sub_clusters(&self) -> Vec<u32> {
         self.sub_clusters.keys().copied().collect()
     }
 
     /// Get all sub-cluster metadata
-    pub fn get_all_sub_clusters(&self) -> &HashMap<Uuid, SubClusterMetadata> {
+    pub fn get_all_sub_clusters(&self) -> &HashMap<u32, SubClusterMetadata> {
         &self.sub_clusters
     }
 }
@@ -103,16 +107,20 @@ impl StateMachine for ManagementStateMachine {
 
     fn apply(&mut self, command: &Self::Command) -> Result<Vec<Self::Event>, Box<dyn std::error::Error>> {
         match command {
-            ManagementCommand::CreateSubCluster { cluster_id, node_ids } => {
+            ManagementCommand::CreateSubCluster { node_ids } => {
+                // Auto-assign sequential cluster ID
+                let cluster_id = self.next_cluster_id;
+                self.next_cluster_id += 1;
+
                 self.sub_clusters.insert(
-                    *cluster_id,
+                    cluster_id,
                     SubClusterMetadata {
                         node_ids: node_ids.clone(),
                         metadata: HashMap::new(),
                     },
                 );
                 Ok(vec![ManagementEvent::SubClusterCreated {
-                    cluster_id: *cluster_id,
+                    cluster_id,
                     node_ids: node_ids.clone(),
                 }])
             }
@@ -179,12 +187,31 @@ impl StateMachine for ManagementStateMachine {
     }
 
     fn snapshot(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        let snapshot_data = serde_json::to_vec(&self.sub_clusters)?;
+        #[derive(Serialize)]
+        struct Snapshot {
+            sub_clusters: HashMap<u32, SubClusterMetadata>,
+            next_cluster_id: u32,
+        }
+
+        let snapshot = Snapshot {
+            sub_clusters: self.sub_clusters.clone(),
+            next_cluster_id: self.next_cluster_id,
+        };
+
+        let snapshot_data = serde_json::to_vec(&snapshot)?;
         Ok(snapshot_data)
     }
 
     fn restore(&mut self, snapshot: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-        self.sub_clusters = serde_json::from_slice(snapshot)?;
+        #[derive(Deserialize)]
+        struct Snapshot {
+            sub_clusters: HashMap<u32, SubClusterMetadata>,
+            next_cluster_id: u32,
+        }
+
+        let snapshot: Snapshot = serde_json::from_slice(snapshot)?;
+        self.sub_clusters = snapshot.sub_clusters;
+        self.next_cluster_id = snapshot.next_cluster_id;
         Ok(())
     }
 }
@@ -196,31 +223,37 @@ mod tests {
     #[test]
     fn test_create_sub_cluster() {
         let mut sm = ManagementStateMachine::new();
-        let cluster_id = Uuid::new_v4();
 
         let cmd = ManagementCommand::CreateSubCluster {
-            cluster_id,
             node_ids: vec![1, 2, 3],
         };
 
         let events = sm.apply(&cmd).unwrap();
         assert_eq!(events.len(), 1);
 
-        let metadata = sm.get_sub_cluster(&cluster_id).unwrap();
+        // First cluster should be assigned ID 1
+        if let ManagementEvent::SubClusterCreated { cluster_id, node_ids } = &events[0] {
+            assert_eq!(*cluster_id, 1);
+            assert_eq!(node_ids, &vec![1, 2, 3]);
+        } else {
+            panic!("Expected SubClusterCreated event");
+        }
+
+        let metadata = sm.get_sub_cluster(&1).unwrap();
         assert_eq!(metadata.node_ids, vec![1, 2, 3]);
     }
 
     #[test]
     fn test_add_node_to_sub_cluster() {
         let mut sm = ManagementStateMachine::new();
-        let cluster_id = Uuid::new_v4();
 
-        // Create cluster first
+        // Create cluster first (will get ID 1)
         sm.apply(&ManagementCommand::CreateSubCluster {
-            cluster_id,
             node_ids: vec![1, 2],
         })
         .unwrap();
+
+        let cluster_id = 1;
 
         // Add node
         let cmd = ManagementCommand::AddNodeToSubCluster {
@@ -238,14 +271,14 @@ mod tests {
     #[test]
     fn test_set_metadata() {
         let mut sm = ManagementStateMachine::new();
-        let cluster_id = Uuid::new_v4();
 
-        // Create cluster first
+        // Create cluster first (will get ID 1)
         sm.apply(&ManagementCommand::CreateSubCluster {
-            cluster_id,
             node_ids: vec![1],
         })
         .unwrap();
+
+        let cluster_id = 1;
 
         // Set metadata
         let cmd = ManagementCommand::SetMetadata {

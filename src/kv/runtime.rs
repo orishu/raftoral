@@ -312,6 +312,48 @@ impl KvRuntime {
     }
 }
 
+// Implement SubClusterRuntime for use with ManagementRuntime
+impl crate::management::SubClusterRuntime for KvRuntime {
+    type StateMachine = KvStateMachine;
+
+    fn new_single_node(
+        config: RaftNodeConfig,
+        transport: Arc<dyn Transport>,
+        mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
+        logger: slog::Logger,
+    ) -> Result<(Self, Arc<Mutex<RaftNode<Self::StateMachine>>>), Box<dyn std::error::Error>> {
+        KvRuntime::new(config, transport, mailbox_rx, logger)
+    }
+
+    fn new_joining_node(
+        config: RaftNodeConfig,
+        transport: Arc<dyn Transport>,
+        mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
+        initial_voters: Vec<u64>,
+        logger: slog::Logger,
+    ) -> Result<(Self, Arc<Mutex<RaftNode<Self::StateMachine>>>), Box<dyn std::error::Error>> {
+        KvRuntime::new_joining_node(config, transport, mailbox_rx, initial_voters, logger)
+    }
+
+    async fn add_node(&self, node_id: u64, address: String)
+        -> Result<oneshot::Receiver<Result<(), String>>, String> {
+        self.add_node(node_id, address).await
+    }
+
+    async fn remove_node(&self, node_id: u64)
+        -> Result<oneshot::Receiver<Result<(), String>>, String> {
+        self.remove_node(node_id).await
+    }
+
+    fn node_id(&self) -> u64 {
+        self.node_id()
+    }
+
+    fn cluster_id(&self) -> u32 {
+        self.cluster_id()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
