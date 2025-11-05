@@ -149,15 +149,15 @@ impl WorkflowRegistry {
         I: Send + Sync + for<'de> serde::Deserialize<'de> + 'static,
         O: Send + Sync + serde::Serialize + 'static,
         F: Fn(I, WorkflowContext) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<O, WorkflowError>> + Send + Sync + 'static,
+        Fut: Future<Output = Result<O, WorkflowError>> + Send + 'static,
     {
         struct ClosureWorkflow<I, O, F, Fut>
         where
             F: Fn(I, WorkflowContext) -> Fut + Send + Sync + 'static,
-            Fut: Future<Output = Result<O, WorkflowError>> + Send + Sync + 'static,
+            Fut: Future<Output = Result<O, WorkflowError>> + Send + 'static,
         {
             closure: F,
-            _phantom: std::marker::PhantomData<(I, O, Fut)>,
+            _phantom: std::marker::PhantomData<(I, O)>,
         }
 
         impl<I, O, F, Fut> WorkflowFunction<I, O> for ClosureWorkflow<I, O, F, Fut>
@@ -165,7 +165,7 @@ impl WorkflowRegistry {
             I: Send + Sync + for<'de> serde::Deserialize<'de> + 'static,
             O: Send + Sync + serde::Serialize + 'static,
             F: Fn(I, WorkflowContext) -> Fut + Send + Sync + 'static,
-            Fut: Future<Output = Result<O, WorkflowError>> + Send + Sync + 'static,
+            Fut: Future<Output = Result<O, WorkflowError>> + Send + 'static,
         {
             fn execute(
                 &self,

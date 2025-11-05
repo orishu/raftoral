@@ -63,6 +63,9 @@ pub struct WorkflowStateMachine {
     /// Track workflow status by ID
     workflows: HashMap<String, WorkflowStatus>,
 
+    /// Store workflow inputs (serialized) by ID for workflow execution
+    inputs: HashMap<String, Vec<u8>>,
+
     /// Store workflow results (serialized) by ID for retrieval after completion
     results: HashMap<String, Vec<u8>>,
 
@@ -80,6 +83,7 @@ impl WorkflowStateMachine {
     pub fn new() -> Self {
         Self {
             workflows: HashMap::new(),
+            inputs: HashMap::new(),
             results: HashMap::new(),
             checkpoint_queues: HashMap::new(),
             ownership: HashMap::new(),
@@ -94,6 +98,11 @@ impl WorkflowStateMachine {
     /// Get workflow result
     pub fn get_result(&self, workflow_id: &str) -> Option<&Vec<u8>> {
         self.results.get(workflow_id)
+    }
+
+    /// Get workflow input
+    pub fn get_input(&self, workflow_id: &str) -> Option<&Vec<u8>> {
+        self.inputs.get(workflow_id)
     }
 
     /// Get workflow owner node ID
@@ -146,12 +155,15 @@ impl StateMachine for WorkflowStateMachine {
                 workflow_id,
                 workflow_type,
                 version,
-                input: _,
+                input,
                 owner_node_id,
             } => {
                 // Mark workflow as running
                 self.workflows
                     .insert(workflow_id.clone(), WorkflowStatus::Running);
+
+                // Store input for workflow execution
+                self.inputs.insert(workflow_id.clone(), input.clone());
 
                 // Set ownership
                 self.ownership.insert(workflow_id.clone(), *owner_node_id);
@@ -174,6 +186,9 @@ impl StateMachine for WorkflowStateMachine {
 
                 // Store result
                 self.results.insert(workflow_id.clone(), result.clone());
+
+                // Clean up input (no longer needed)
+                self.inputs.remove(workflow_id);
 
                 // Clean up checkpoint queues for this workflow
                 let prefix = format!("{}:", workflow_id);
@@ -230,6 +245,7 @@ impl StateMachine for WorkflowStateMachine {
         #[derive(Serialize)]
         struct Snapshot {
             workflows: HashMap<String, WorkflowStatus>,
+            inputs: HashMap<String, Vec<u8>>,
             results: HashMap<String, Vec<u8>>,
             checkpoint_queues: HashMap<String, VecDeque<Vec<u8>>>,
             ownership: HashMap<String, u64>,
@@ -237,6 +253,7 @@ impl StateMachine for WorkflowStateMachine {
 
         let snapshot = Snapshot {
             workflows: self.workflows.clone(),
+            inputs: self.inputs.clone(),
             results: self.results.clone(),
             checkpoint_queues: self.checkpoint_queues.clone(),
             ownership: self.ownership.clone(),
@@ -250,6 +267,7 @@ impl StateMachine for WorkflowStateMachine {
         #[derive(Deserialize)]
         struct Snapshot {
             workflows: HashMap<String, WorkflowStatus>,
+            inputs: HashMap<String, Vec<u8>>,
             results: HashMap<String, Vec<u8>>,
             checkpoint_queues: HashMap<String, VecDeque<Vec<u8>>>,
             ownership: HashMap<String, u64>,
@@ -257,6 +275,7 @@ impl StateMachine for WorkflowStateMachine {
 
         let snapshot: Snapshot = serde_json::from_slice(snapshot)?;
         self.workflows = snapshot.workflows;
+        self.inputs = snapshot.inputs;
         self.results = snapshot.results;
         self.checkpoint_queues = snapshot.checkpoint_queues;
         self.ownership = snapshot.ownership;
