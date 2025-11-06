@@ -301,6 +301,19 @@ impl<SM: StateMachine> RaftNode<SM> {
         *self.current_role.lock().await == StateRole::Leader
     }
 
+    /// Get the current leader ID (if known)
+    ///
+    /// Returns the node ID of the current leader, or None if unknown.
+    /// Note: This is best-effort - the leader may change at any time.
+    pub fn leader_id(&self) -> Option<u64> {
+        let leader = self.raw_node.raft.leader_id;
+        if leader == 0 || leader == raft::INVALID_ID {
+            None
+        } else {
+            Some(leader)
+        }
+    }
+
     /// Propose a command (upper layer method, not mailbox)
     ///
     /// Serializes the command and submits it to Raft.

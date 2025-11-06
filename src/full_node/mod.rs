@@ -100,16 +100,25 @@ impl FullNode {
         node.lock().await.campaign().await?;
 
         // Layer 0: Start gRPC server
-        let grpc_server = GrpcServer::new_with_node_id(cluster_router, node_id);
+        let grpc_server = Arc::new(GrpcServer::new(
+            cluster_router,
+            node_id,
+            address.clone(),
+        ));
+
+        // Start leader tracker
+        grpc_server.start_leader_tracker(node.clone(), transport.clone());
+
         let addr = address.parse()?;
 
         info!(logger, "Starting gRPC server"; "address" => &address);
 
+        let grpc_server_clone = grpc_server.clone();
         let grpc_server_handle = tokio::spawn(async move {
             Server::builder()
                 .add_service(
                     crate::grpc::server::raft_proto::raft_service_server::RaftServiceServer::new(
-                        grpc_server,
+                        (*grpc_server_clone).clone(),
                     ),
                 )
                 .serve(addr)
@@ -222,16 +231,25 @@ impl FullNode {
         // The leader will add us via add_node()
 
         // Layer 0: Start gRPC server
-        let grpc_server = GrpcServer::new_with_node_id(cluster_router, node_id);
+        let grpc_server = Arc::new(GrpcServer::new(
+            cluster_router,
+            node_id,
+            address.clone(),
+        ));
+
+        // Start leader tracker
+        grpc_server.start_leader_tracker(node.clone(), transport.clone());
+
         let addr = address.parse()?;
 
         info!(logger, "Starting gRPC server"; "address" => &address);
 
+        let grpc_server_clone = grpc_server.clone();
         let grpc_server_handle = tokio::spawn(async move {
             Server::builder()
                 .add_service(
                     crate::grpc::server::raft_proto::raft_service_server::RaftServiceServer::new(
-                        grpc_server,
+                        (*grpc_server_clone).clone(),
                     ),
                 )
                 .serve(addr)

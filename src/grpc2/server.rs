@@ -8,19 +8,42 @@ use crate::grpc::server::raft_proto::{
     GenericMessage, MessageResponse,
 };
 use crate::raft::generic2::ClusterRouter;
+use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tonic::{transport::Server, Request, Response, Status};
+
+/// Cached leader information for discovery endpoint
+#[derive(Clone, Debug)]
+struct LeaderInfo {
+    /// Current leader node ID (0 if unknown)
+    leader_id: u64,
+    /// Current leader address (empty if unknown)
+    leader_address: String,
+}
 
 /// gRPC server implementation for generic2 architecture
 ///
 /// This server receives GenericMessage via gRPC and routes them to
 /// the appropriate cluster via ClusterRouter.
+#[derive(Clone)]
 pub struct GrpcServer {
     /// ClusterRouter for routing messages to the correct cluster
     cluster_router: Arc<ClusterRouter>,
 
-    /// Optional node ID for logging/debugging
-    node_id: Option<u64>,
+    /// This node's ID
+    node_id: u64,
+
+    /// This node's address
+    node_address: String,
+
+    /// Cached management cluster leader information
+    /// Updated by background task listening to role changes
+    management_leader: Arc<Mutex<LeaderInfo>>,
+
+    /// Map of node_id -> address for all known nodes
+    /// Used to resolve leader_id to leader_address
+    peer_addresses: Arc<Mutex<HashMap<u64, String>>>,
 }
 
 impl GrpcServer {
@@ -28,19 +51,77 @@ impl GrpcServer {
     ///
     /// # Arguments
     /// * `cluster_router` - The ClusterRouter for message routing
-    pub fn new(cluster_router: Arc<ClusterRouter>) -> Self {
+    /// * `node_id` - This node's ID
+    /// * `node_address` - This node's network address
+    pub fn new(cluster_router: Arc<ClusterRouter>, node_id: u64, node_address: String) -> Self {
         Self {
             cluster_router,
-            node_id: None,
+            node_id,
+            node_address,
+            management_leader: Arc::new(Mutex::new(LeaderInfo {
+                leader_id: 0,
+                leader_address: String::new(),
+            })),
+            peer_addresses: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Create a new GrpcServer with node ID
-    pub fn new_with_node_id(cluster_router: Arc<ClusterRouter>, node_id: u64) -> Self {
-        Self {
-            cluster_router,
-            node_id: Some(node_id),
-        }
+    /// Start background task to track management cluster leadership
+    ///
+    /// # Arguments
+    /// * `management_node` - The management cluster RaftNode
+    /// * `transport` - Transport to query peer addresses
+    pub fn start_leader_tracker<SM>(
+        self: &Arc<Self>,
+        management_node: Arc<Mutex<crate::raft::generic2::RaftNode<SM>>>,
+        transport: Arc<dyn crate::raft::generic2::Transport>,
+    ) where
+        SM: crate::raft::generic2::StateMachine + 'static,
+    {
+        let server = Arc::clone(self);
+
+        tokio::spawn(async move {
+            // Subscribe to role changes
+            let mut role_rx = {
+                let node = management_node.lock().await;
+                node.subscribe_role_changes()
+            };
+
+            loop {
+                // Check current leader
+                let leader_id = {
+                    let node = management_node.lock().await;
+                    node.leader_id()
+                };
+
+                // Update cached leader info
+                if let Some(lid) = leader_id {
+                    let leader_address = if lid == server.node_id {
+                        // We are the leader
+                        server.node_address.clone()
+                    } else {
+                        // Look up leader address from transport peers
+                        transport.get_peer_address(lid).await.unwrap_or_default()
+                    };
+
+                    let mut leader = server.management_leader.lock().await;
+                    leader.leader_id = lid;
+                    leader.leader_address = leader_address;
+                }
+
+                // Wait for role change
+                match role_rx.recv().await {
+                    Ok(_) => {
+                        // Role changed, loop will check leader again
+                        continue;
+                    }
+                    Err(_) => {
+                        // Channel closed, exit
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     /// Start the gRPC server on the given address
@@ -94,14 +175,20 @@ impl RaftService for GrpcServer {
         &self,
         _request: Request<crate::grpc::server::raft_proto::DiscoveryRequest>,
     ) -> Result<Response<crate::grpc::server::raft_proto::DiscoveryResponse>, Status> {
-        // Basic implementation - can be enhanced later
+        // Get cached leader information
+        let leader = self.management_leader.lock().await.clone();
+
+        // TODO: Track highest_known_node_id properly
+        // For now, just return this node's ID as the highest known
+        let highest_known = self.node_id;
+
         Ok(Response::new(
             crate::grpc::server::raft_proto::DiscoveryResponse {
-                node_id: self.node_id.unwrap_or(0),
-                highest_known_node_id: self.node_id.unwrap_or(0),
-                address: String::new(),
-                management_leader_node_id: 0,
-                management_leader_address: String::new(),
+                node_id: self.node_id,
+                highest_known_node_id: highest_known,
+                address: self.node_address.clone(),
+                management_leader_node_id: leader.leader_id,
+                management_leader_address: leader.leader_address,
             },
         ))
     }
@@ -114,14 +201,8 @@ mod tests {
     #[test]
     fn test_grpc_server_creation() {
         let router = Arc::new(ClusterRouter::new());
-        let server = GrpcServer::new(router);
-        assert!(server.node_id.is_none());
-    }
-
-    #[test]
-    fn test_grpc_server_creation_with_node_id() {
-        let router = Arc::new(ClusterRouter::new());
-        let server = GrpcServer::new_with_node_id(router, 42);
-        assert_eq!(server.node_id, Some(42));
+        let server = GrpcServer::new(router, 1, "127.0.0.1:5001".to_string());
+        assert_eq!(server.node_id, 1);
+        assert_eq!(server.node_address, "127.0.0.1:5001");
     }
 }
