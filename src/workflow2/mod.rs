@@ -15,7 +15,7 @@ pub mod replicated_var;
 pub use error::{WorkflowError, ReplicatedVarError, WorkflowStatus};
 pub use event::WorkflowEvent;
 pub use state_machine::{WorkflowCommand, WorkflowStateMachine};
-pub use runtime::WorkflowRuntime;
+pub use runtime::{WorkflowRuntime, WorkflowSubscription};
 pub use registry::WorkflowRegistry;
 pub use ownership::WorkflowOwnershipMap;
 pub use context::{WorkflowContext, WorkflowRun, TypedWorkflowRun};

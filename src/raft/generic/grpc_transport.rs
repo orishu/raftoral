@@ -630,6 +630,16 @@ mod tests {
                     management_leader_address: String::new(),
                 }))
             }
+
+            async fn add_node(
+                &self,
+                _request: Request<crate::grpc::server::raft_proto::AddNodeRequest>,
+            ) -> Result<Response<crate::grpc::server::raft_proto::AddNodeResponse>, Status> {
+                Ok(Response::new(crate::grpc::server::raft_proto::AddNodeResponse {
+                    success: false,
+                    error: "Not supported in test".to_string(),
+                }))
+            }
         }
 
         let test_addr = addr.parse().expect("Should parse address");
