@@ -12,7 +12,7 @@
 use crate::grpc2::{GrpcMessageSender, GrpcServer};
 use crate::management::ManagementRuntime;
 use crate::raft::generic2::{
-    ClusterRouter, RaftNode, RaftNodeConfig, TransportLayer,
+    ClusterRouter, RaftNode, RaftNodeConfig, Transport, TransportLayer,
 };
 use crate::workflow2::WorkflowRuntime;
 use slog::{info, Logger};
@@ -44,7 +44,7 @@ pub struct FullNode {
 }
 
 impl FullNode {
-    /// Create and start a new full node
+    /// Create and start a new full node in bootstrap mode (single-node cluster)
     ///
     /// # Arguments
     /// * `node_id` - Unique identifier for this node
@@ -117,6 +117,128 @@ impl FullNode {
         });
 
         info!(logger, "FullNode started"; "node_id" => node_id, "address" => &address);
+
+        Ok(Self {
+            runtime,
+            node,
+            grpc_server_handle: Some(grpc_server_handle),
+            address,
+            logger,
+        })
+    }
+
+    /// Create and start a new full node in join mode (joining existing cluster)
+    ///
+    /// # Arguments
+    /// * `address` - Network address to bind to (e.g., "127.0.0.1:50051")
+    /// * `seed_addresses` - Addresses of existing cluster nodes to discover
+    /// * `logger` - Logger instance
+    ///
+    /// # Returns
+    /// A running FullNode instance that has joined the cluster
+    pub async fn new_joining(
+        address: String,
+        seed_addresses: Vec<String>,
+        logger: Logger,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        info!(logger, "Creating FullNode in join mode";
+            "address" => &address,
+            "seeds" => ?seed_addresses
+        );
+
+        // Discover existing peers
+        use crate::grpc::bootstrap::{discover_peers, next_node_id};
+        let discovered_peers = discover_peers(seed_addresses).await;
+
+        if discovered_peers.is_empty() {
+            return Err("Failed to discover any peers".into());
+        }
+
+        // Determine our node ID
+        let node_id = next_node_id(&discovered_peers);
+        info!(logger, "Assigned node ID"; "node_id" => node_id);
+
+        // Find management leader
+        let leader_peer = discovered_peers.iter()
+            .find(|p| p.management_leader_node_id != 0)
+            .ok_or("No management leader found in discovered peers")?;
+
+        info!(logger, "Found management leader";
+            "leader_node_id" => leader_peer.management_leader_node_id,
+            "leader_address" => &leader_peer.management_leader_address
+        );
+
+        // Layer 1: Create transport with gRPC message sender
+        let grpc_sender = Arc::new(GrpcMessageSender::new());
+        let transport = Arc::new(TransportLayer::new(grpc_sender));
+
+        // Add all discovered peers to transport
+        for peer in &discovered_peers {
+            transport.add_peer(peer.node_id, peer.address.clone()).await;
+        }
+
+        // Create mailbox for this node
+        let (mailbox_tx, mailbox_rx) = mpsc::channel(1000);
+
+        // Layer 2: Create cluster router
+        let cluster_router = Arc::new(ClusterRouter::new());
+
+        // Register this node's cluster (cluster_id = 0 for management)
+        cluster_router.register_cluster(0, mailbox_tx).await;
+
+        // Collect voter node IDs for initial conf_state
+        let initial_voters: Vec<u64> = discovered_peers.iter()
+            .map(|p| p.node_id)
+            .chain(std::iter::once(node_id)) // Include ourselves
+            .collect();
+
+        info!(logger, "Joining management cluster with voters"; "voters" => ?initial_voters);
+
+        // Layers 3-7: Create management runtime in joining mode
+        let config = RaftNodeConfig {
+            node_id,
+            cluster_id: 0, // Management cluster ID
+            snapshot_interval: 100,
+            ..Default::default()
+        };
+
+        let (runtime, node) = ManagementRuntime::new_joining_node(
+            config,
+            transport.clone(),
+            mailbox_rx,
+            initial_voters,
+            cluster_router.clone(),
+            logger.clone(),
+        )?;
+
+        // Run Raft node in background
+        let node_clone = node.clone();
+        tokio::spawn(async move {
+            info!(slog::Logger::root(slog::Discard, slog::o!()), "Starting Raft node event loop");
+            let _ = RaftNode::run_from_arc(node_clone).await;
+        });
+
+        // Do NOT campaign - we're joining an existing cluster
+        // The leader will add us via add_node()
+
+        // Layer 0: Start gRPC server
+        let grpc_server = GrpcServer::new_with_node_id(cluster_router, node_id);
+        let addr = address.parse()?;
+
+        info!(logger, "Starting gRPC server"; "address" => &address);
+
+        let grpc_server_handle = tokio::spawn(async move {
+            Server::builder()
+                .add_service(
+                    crate::grpc::server::raft_proto::raft_service_server::RaftServiceServer::new(
+                        grpc_server,
+                    ),
+                )
+                .serve(addr)
+                .await
+        });
+
+        info!(logger, "FullNode started in join mode"; "node_id" => node_id, "address" => &address);
 
         Ok(Self {
             runtime,
