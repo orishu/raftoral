@@ -1,7 +1,8 @@
 use clap::Parser;
-use log::info;
-use raftoral::runtime::{RaftoralConfig, RaftoralGrpcRuntime};
-use raftoral::workflow::{WorkflowContext, WorkflowError};
+use raftoral::full_node::FullNode;
+use raftoral::workflow2::WorkflowError;
+use serde::{Deserialize, Serialize};
+use slog::{info, o, Drain};
 use tokio::signal;
 
 #[derive(Parser, Debug)]
@@ -30,91 +31,105 @@ struct Args {
     bootstrap: bool,
 }
 
+// Workflow input/output types for ping_pong
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct PingInput {
+    message: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct PongOutput {
+    response: String,
+}
+
+fn create_logger() -> slog::Logger {
+    let decorator = slog_term::PlainDecorator::new(std::io::stdout());
+    let drain = slog_term::FullFormat::new(decorator).build().fuse();
+    let drain = slog_async::Async::new(drain).build().fuse();
+    slog::Logger::root(drain, o!())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize logger
-    env_logger::init();
-
     let args = Args::parse();
+    let logger = create_logger();
 
-    // Build configuration from CLI args
-    let mut config = if args.bootstrap {
-        RaftoralConfig::bootstrap(args.listen, args.node_id)
+    info!(logger, "Starting Raftoral node";
+        "listen" => &args.listen,
+        "bootstrap" => args.bootstrap
+    );
+
+    // Determine address (advertise takes precedence if provided)
+    let address = args.advertise.as_ref().unwrap_or(&args.listen).clone();
+
+    // Create FullNode based on mode
+    let node = if args.bootstrap {
+        let node_id = args.node_id.unwrap_or(1);
+        info!(logger, "Bootstrap mode"; "node_id" => node_id);
+
+        FullNode::new(node_id, address, logger.clone()).await?
     } else {
-        RaftoralConfig::join(args.listen, args.peers)
+        if args.peers.is_empty() {
+            return Err("--peers is required when not in bootstrap mode".into());
+        }
+
+        info!(logger, "Join mode"; "peers" => ?args.peers);
+
+        let node = FullNode::new_joining(address, args.peers, logger.clone()).await?;
+
+        info!(logger, "Node joined with ID"; "node_id" => node.node_id());
+        node
     };
 
-    if let Some(advertise) = args.advertise {
-        config = config.with_advertise_address(advertise);
-    }
+    info!(logger, "FullNode started"; "node_id" => node.node_id());
 
-    if !args.bootstrap {
-        if let Some(node_id) = args.node_id {
-            config = config.with_node_id(node_id);
-        }
-    }
-
-    // Start the runtime
-    let runtime = RaftoralGrpcRuntime::start(config).await?;
-
-    // Wait for the default execution cluster to be created
-    // - Bootstrap nodes: Created immediately via initialize_default_cluster()
-    // - Joining nodes: Created asynchronously when AssociateNode is applied (takes 1-2 seconds)
+    // Wait for sub-cluster 1 to be created
+    // Bootstrap nodes create it immediately via management cluster initialization
+    // Joining nodes will observe SubClusterCreated event
     let default_cluster_id = 1u32;
-    let execution_cluster = if args.bootstrap {
-        // Bootstrap node: cluster should exist immediately
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        runtime.node_manager().get_execution_cluster(&default_cluster_id)
-            .expect("Default execution cluster should exist after bootstrap")
-    } else {
-        // Joining node: wait for cluster to be created
-        info!("Waiting for execution cluster to be created...");
-        let mut retries = 0;
-        let max_retries = 20; // 20 * 500ms = 10 seconds
-        loop {
-            if let Some(cluster) = runtime.node_manager().get_execution_cluster(&default_cluster_id) {
-                info!("Execution cluster found!");
-                break cluster;
-            }
-            retries += 1;
-            if retries >= max_retries {
-                return Err("Timeout waiting for execution cluster to be created".into());
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    info!(logger, "Waiting for workflow execution cluster to be created...");
+    let workflow_runtime = loop {
+        // Check if sub-cluster runtime exists
+        if let Some(runtime) = node.runtime().get_sub_cluster_runtime(&default_cluster_id).await {
+            info!(logger, "Workflow execution cluster ready"; "cluster_id" => default_cluster_id);
+            break runtime;
         }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     };
 
     // Register ping/pong workflow
-    // Input: "ping" -> Output: "pong"
-    // Any other input returns an error
-    let ping_pong_fn = |input: String, _context: WorkflowContext| async move {
-        if input == "ping" {
-            Ok::<String, WorkflowError>("pong".to_string())
-        } else {
-            Err(WorkflowError::ClusterError(format!(
-                "Expected 'ping', got '{}'",
-                input
-            )))
-        }
-    };
+    // Input: PingInput { message: "ping" } -> Output: PongOutput { response: "pong" }
+    workflow_runtime
+        .register_workflow_closure(
+            "ping_pong",
+            1,
+            |input: PingInput, _ctx| async move {
+                if input.message == "ping" {
+                    Ok(PongOutput {
+                        response: "pong".to_string(),
+                    })
+                } else {
+                    Err(WorkflowError::ClusterError(format!(
+                        "Expected 'ping', got '{}'",
+                        input.message
+                    )))
+                }
+            },
+        )
+        .await
+        .map_err(|e| format!("Failed to register ping_pong workflow: {}", e))?;
 
-    execution_cluster
-        .executor
-        .registry()
-        .lock()
-        .unwrap()
-        .register_closure("ping_pong", 1, ping_pong_fn)
-        .expect("Failed to register ping_pong workflow");
-    info!("Registered ping_pong workflow (v1)");
-
-    info!("Press Ctrl+C to shutdown gracefully");
-    info!("Use gRPC calls to run workflows (see scripts/run_ping_pong.sh)");
+    info!(logger, "Registered ping_pong workflow (v1)");
+    info!(logger, "Press Ctrl+C to shutdown gracefully");
+    info!(logger, "Use gRPC calls to run workflows (see scripts/run_ping_pong.sh)");
 
     // Wait for shutdown signal
     signal::ctrl_c().await?;
 
-    // Gracefully shutdown
-    runtime.shutdown().await?;
+    info!(logger, "Shutting down...");
+    node.shutdown().await;
 
     Ok(())
 }

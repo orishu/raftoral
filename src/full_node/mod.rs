@@ -99,6 +99,15 @@ impl FullNode {
         // Campaign to become leader (for single-node cluster)
         node.lock().await.campaign().await?;
 
+        // Wait for leader election to complete
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // Create default execution cluster (cluster_id=1) with this node
+        info!(logger, "Creating default execution cluster");
+        let _cluster_id = runtime.create_sub_cluster(vec![node_id]).await
+            .map_err(|e| format!("Failed to create default execution cluster: {}", e))?;
+        info!(logger, "Default execution cluster created"; "cluster_id" => 1);
+
         // Layer 0: Start gRPC server
         let grpc_server = Arc::new(GrpcServer::new(
             cluster_router,

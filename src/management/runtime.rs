@@ -457,6 +457,18 @@ impl<R> ManagementRuntime<R> {
         sm.lock().await.get_all_sub_clusters().clone()
     }
 
+    /// Get a reference to a sub-cluster runtime instance
+    ///
+    /// # Arguments
+    /// * `cluster_id` - ID of the sub-cluster
+    ///
+    /// # Returns
+    /// * `Some(Arc<R>)` - Sub-cluster runtime if it exists on this node
+    /// * `None` - Sub-cluster does not exist or hasn't been created yet
+    pub async fn get_sub_cluster_runtime(&self, cluster_id: &u32) -> Option<Arc<R>> {
+        self.sub_clusters.lock().await.get(cluster_id).cloned()
+    }
+
     /// Subscribe to management events
     ///
     /// # Returns
