@@ -380,4 +380,99 @@ mod tests {
         // Shutdown
         node.shutdown().await;
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_two_node_cluster_with_discovery() {
+        let logger = create_logger();
+
+        println!("\n=== Starting two-node FullNode integration test ===\n");
+
+        // Node 1: Bootstrap mode (creates single-node cluster)
+        println!("Creating Node 1 (bootstrap mode) on 127.0.0.1:50061...");
+        let node1 = FullNode::new(
+            1,
+            "127.0.0.1:50061".to_string(),
+            logger.clone(),
+        )
+        .await
+        .expect("Failed to create node 1");
+
+        // Wait for node 1 to become leader
+        println!("Waiting for Node 1 to become leader...");
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        assert!(node1.is_leader().await, "Node 1 should be leader");
+        println!("✓ Node 1 is leader");
+
+        // Node 2: Join mode (discovers and joins via node 1)
+        println!("\nCreating Node 2 (join mode) on 127.0.0.1:50062...");
+        let node2 = FullNode::new_joining(
+            "127.0.0.1:50062".to_string(),
+            vec!["127.0.0.1:50061".to_string()],
+            logger.clone(),
+        )
+        .await
+        .expect("Failed to create node 2");
+
+        println!("Node 2 created, node_id: {}", node2.node_id());
+
+        // Add node 2 to the management cluster via node 1 (as leader)
+        println!("\nAdding Node 2 to management cluster via Node 1...");
+        let add_rx = node1.runtime()
+            .add_node(2, "127.0.0.1:50062".to_string())
+            .await
+            .expect("Should initiate add_node");
+
+        // Wait for the configuration change to complete
+        match add_rx.await {
+            Ok(Ok(_)) => println!("✓ Node 2 added to management cluster"),
+            Ok(Err(e)) => println!("⚠ Add node returned error: {}", e),
+            Err(e) => println!("⚠ Add node oneshot error: {}", e),
+        }
+
+        // Wait for cluster to stabilize
+        println!("\nWaiting for cluster to stabilize...");
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+        // Create a sub-cluster from node 1 (the leader)
+        println!("\nCreating sub-cluster with nodes [1, 2] via Node 1...");
+        let cluster_id = node1.runtime()
+            .create_sub_cluster(vec![1, 2])
+            .await
+            .expect("Create sub-cluster should succeed");
+
+        println!("✓ Sub-cluster created with ID: {}", cluster_id);
+        assert_eq!(cluster_id, 1, "First sub-cluster should have ID 1");
+
+        // Wait for both nodes to observe the sub-cluster creation event
+        println!("\nWaiting for both nodes to observe sub-cluster creation...");
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+        // Verify node 1 has the sub-cluster
+        println!("\nVerifying Node 1 observed sub-cluster...");
+        let metadata1 = node1.runtime()
+            .get_sub_cluster(&cluster_id)
+            .await
+            .expect("Node 1 should have sub-cluster metadata");
+        println!("✓ Node 1 metadata: node_ids={:?}", metadata1.node_ids);
+        assert_eq!(metadata1.node_ids, vec![1, 2]);
+
+        // Verify node 2 has the sub-cluster
+        println!("\nVerifying Node 2 observed sub-cluster...");
+        let metadata2 = node2.runtime()
+            .get_sub_cluster(&cluster_id)
+            .await
+            .expect("Node 2 should have sub-cluster metadata");
+        println!("✓ Node 2 metadata: node_ids={:?}", metadata2.node_ids);
+        assert_eq!(metadata2.node_ids, vec![1, 2]);
+
+        println!("\n✓ Both nodes successfully observed the sub-cluster creation!");
+
+        println!("\n=== Test complete - shutting down nodes ===");
+
+        // Cleanup
+        node1.shutdown().await;
+        node2.shutdown().await;
+
+        println!("✓ All tests passed!\n");
+    }
 }
