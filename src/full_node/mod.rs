@@ -9,6 +9,9 @@
 //! - Layer 6: Proposal Router
 //! - Layer 7: Application Runtime (ManagementRuntime)
 
+mod workflow_service;
+pub use workflow_service::WorkflowManagementService;
+
 use crate::grpc2::{GrpcMessageSender, GrpcServer};
 use crate::management::ManagementRuntime;
 use crate::raft::generic2::{
@@ -118,16 +121,31 @@ impl FullNode {
         // Start leader tracker
         grpc_server.start_leader_tracker(node.clone(), transport.clone());
 
+        // Create WorkflowManagement service
+        let workflow_service = WorkflowManagementService::new(runtime.clone(), logger.clone());
+
         let addr = address.parse()?;
 
         info!(logger, "Starting gRPC server"; "address" => &address);
 
         let grpc_server_clone = grpc_server.clone();
         let grpc_server_handle = tokio::spawn(async move {
+            // Enable gRPC reflection for grpcurl support
+            let reflection_service = tonic_reflection::server::Builder::configure()
+                .register_encoded_file_descriptor_set(crate::grpc::server::raft_proto::FILE_DESCRIPTOR_SET)
+                .build()
+                .unwrap();
+
             Server::builder()
+                .add_service(reflection_service)
                 .add_service(
                     crate::grpc::server::raft_proto::raft_service_server::RaftServiceServer::new(
                         (*grpc_server_clone).clone(),
+                    ),
+                )
+                .add_service(
+                    crate::grpc::server::raft_proto::workflow_management_server::WorkflowManagementServer::new(
+                        workflow_service,
                     ),
                 )
                 .serve(addr)
@@ -249,16 +267,31 @@ impl FullNode {
         // Start leader tracker
         grpc_server.start_leader_tracker(node.clone(), transport.clone());
 
+        // Create WorkflowManagement service
+        let workflow_service = WorkflowManagementService::new(runtime.clone(), logger.clone());
+
         let addr = address.parse()?;
 
         info!(logger, "Starting gRPC server"; "address" => &address);
 
         let grpc_server_clone = grpc_server.clone();
         let grpc_server_handle = tokio::spawn(async move {
+            // Enable gRPC reflection for grpcurl support
+            let reflection_service = tonic_reflection::server::Builder::configure()
+                .register_encoded_file_descriptor_set(crate::grpc::server::raft_proto::FILE_DESCRIPTOR_SET)
+                .build()
+                .unwrap();
+
             Server::builder()
+                .add_service(reflection_service)
                 .add_service(
                     crate::grpc::server::raft_proto::raft_service_server::RaftServiceServer::new(
                         (*grpc_server_clone).clone(),
+                    ),
+                )
+                .add_service(
+                    crate::grpc::server::raft_proto::workflow_management_server::WorkflowManagementServer::new(
+                        workflow_service,
                     ),
                 )
                 .serve(addr)

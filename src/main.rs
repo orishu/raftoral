@@ -1,7 +1,6 @@
 use clap::Parser;
 use raftoral::full_node::FullNode;
 use raftoral::workflow2::WorkflowError;
-use serde::{Deserialize, Serialize};
 use slog::{info, o, Drain};
 use tokio::signal;
 
@@ -31,16 +30,7 @@ struct Args {
     bootstrap: bool,
 }
 
-// Workflow input/output types for ping_pong
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct PingInput {
-    message: String,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct PongOutput {
-    response: String,
-}
+// Workflow uses simple String input/output for compatibility with scripts
 
 fn create_logger() -> slog::Logger {
     let decorator = slog_term::PlainDecorator::new(std::io::stdout());
@@ -100,20 +90,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Register ping/pong workflow
-    // Input: PingInput { message: "ping" } -> Output: PongOutput { response: "pong" }
+    // Input: "ping" (String) -> Output: "pong" (String)
     workflow_runtime
         .register_workflow_closure(
             "ping_pong",
             1,
-            |input: PingInput, _ctx| async move {
-                if input.message == "ping" {
-                    Ok(PongOutput {
-                        response: "pong".to_string(),
-                    })
+            |input: String, _ctx| async move {
+                if input == "ping" {
+                    Ok("pong".to_string())
                 } else {
                     Err(WorkflowError::ClusterError(format!(
                         "Expected 'ping', got '{}'",
-                        input.message
+                        input
                     )))
                 }
             },
