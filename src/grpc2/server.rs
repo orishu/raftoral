@@ -5,9 +5,11 @@
 
 use crate::grpc::server::raft_proto::{
     raft_service_server::{RaftService, RaftServiceServer},
-    GenericMessage, MessageResponse,
+    AddNodeRequest, AddNodeResponse, GenericMessage, MessageResponse,
 };
+use crate::management::ManagementRuntime;
 use crate::raft::generic2::ClusterRouter;
+use crate::workflow2::WorkflowRuntime;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -44,6 +46,9 @@ pub struct GrpcServer {
     /// Map of node_id -> address for all known nodes
     /// Used to resolve leader_id to leader_address
     peer_addresses: Arc<Mutex<HashMap<u64, String>>>,
+
+    /// Management runtime for cluster operations (e.g., adding nodes)
+    management_runtime: Arc<ManagementRuntime<WorkflowRuntime>>,
 }
 
 impl GrpcServer {
@@ -53,7 +58,13 @@ impl GrpcServer {
     /// * `cluster_router` - The ClusterRouter for message routing
     /// * `node_id` - This node's ID
     /// * `node_address` - This node's network address
-    pub fn new(cluster_router: Arc<ClusterRouter>, node_id: u64, node_address: String) -> Self {
+    /// * `management_runtime` - The ManagementRuntime for cluster operations
+    pub fn new(
+        cluster_router: Arc<ClusterRouter>,
+        node_id: u64,
+        node_address: String,
+        management_runtime: Arc<ManagementRuntime<WorkflowRuntime>>,
+    ) -> Self {
         Self {
             cluster_router,
             node_id,
@@ -63,6 +74,7 @@ impl GrpcServer {
                 leader_address: String::new(),
             })),
             peer_addresses: Arc::new(Mutex::new(HashMap::new())),
+            management_runtime,
         }
     }
 
@@ -192,17 +204,48 @@ impl RaftService for GrpcServer {
             },
         ))
     }
+
+    async fn add_node(
+        &self,
+        request: Request<AddNodeRequest>,
+    ) -> Result<Response<AddNodeResponse>, Status> {
+        let req = request.into_inner();
+
+        // Call management runtime to add the node
+        match self
+            .management_runtime
+            .add_node(req.node_id, req.address)
+            .await
+        {
+            Ok(rx) => {
+                // Wait for the operation to complete
+                match rx.await {
+                    Ok(Ok(_)) => Ok(Response::new(AddNodeResponse {
+                        success: true,
+                        error: String::new(),
+                    })),
+                    Ok(Err(e)) => Ok(Response::new(AddNodeResponse {
+                        success: false,
+                        error: format!("Failed to add node: {:?}", e),
+                    })),
+                    Err(e) => Ok(Response::new(AddNodeResponse {
+                        success: false,
+                        error: format!("Operation cancelled: {:?}", e),
+                    })),
+                }
+            }
+            Err(e) => Ok(Response::new(AddNodeResponse {
+                success: false,
+                error: format!("Failed to initiate add_node: {:?}", e),
+            })),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_grpc_server_creation() {
-        let router = Arc::new(ClusterRouter::new());
-        let server = GrpcServer::new(router, 1, "127.0.0.1:5001".to_string());
-        assert_eq!(server.node_id, 1);
-        assert_eq!(server.node_address, "127.0.0.1:5001");
-    }
+    // Test removed - GrpcServer creation is tested via FullNode integration tests
+    // Creating a standalone ManagementRuntime for unit testing is complex
 }

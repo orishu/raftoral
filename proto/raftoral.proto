@@ -49,6 +49,9 @@ service RaftService {
 
     // Discover node information (for bootstrap)
     rpc Discover(DiscoveryRequest) returns (DiscoveryResponse);
+
+    // Add a node to the management cluster (for joining nodes to bootstrap themselves)
+    rpc AddNode(AddNodeRequest) returns (AddNodeResponse);
 }
 
 message MessageResponse {
@@ -66,6 +69,16 @@ message DiscoveryResponse {
     string address = 3;                      // Address of the responding node
     uint64 management_leader_node_id = 4;    // Node ID of management cluster leader (0 = no leader)
     string management_leader_address = 5;    // Address of management cluster leader (empty if no leader)
+}
+
+message AddNodeRequest {
+    uint64 node_id = 1;    // ID of the node to add
+    string address = 2;    // Network address of the node
+}
+
+message AddNodeResponse {
+    bool success = 1;      // Whether the add succeeded
+    string error = 2;      // Error message if success=false
 }
 
 // Workflow Management Service

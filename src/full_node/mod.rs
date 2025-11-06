@@ -116,6 +116,7 @@ impl FullNode {
             cluster_router,
             node_id,
             address.clone(),
+            runtime.clone(),
         ));
 
         // Start leader tracker
@@ -133,7 +134,7 @@ impl FullNode {
             // Enable gRPC reflection for grpcurl support
             let reflection_service = tonic_reflection::server::Builder::configure()
                 .register_encoded_file_descriptor_set(crate::grpc::server::raft_proto::FILE_DESCRIPTOR_SET)
-                .build()
+                .build_v1()
                 .unwrap();
 
             Server::builder()
@@ -262,6 +263,7 @@ impl FullNode {
             cluster_router,
             node_id,
             address.clone(),
+            runtime.clone(),
         ));
 
         // Start leader tracker
@@ -279,7 +281,7 @@ impl FullNode {
             // Enable gRPC reflection for grpcurl support
             let reflection_service = tonic_reflection::server::Builder::configure()
                 .register_encoded_file_descriptor_set(crate::grpc::server::raft_proto::FILE_DESCRIPTOR_SET)
-                .build()
+                .build_v1()
                 .unwrap();
 
             Server::builder()
@@ -300,13 +302,49 @@ impl FullNode {
 
         info!(logger, "FullNode started in join mode"; "node_id" => node_id, "address" => &address);
 
-        Ok(Self {
-            runtime,
+        let full_node = Self {
+            runtime: runtime.clone(),
             node,
             grpc_server_handle: Some(grpc_server_handle),
-            address,
-            logger,
-        })
+            address: address.clone(),
+            logger: logger.clone(),
+        };
+
+        // Use AddNode RPC to register with management cluster leader
+        info!(logger, "Calling AddNode RPC on management leader";
+            "node_id" => node_id, "leader" => &leader_peer.management_leader_address);
+
+        use crate::grpc::server::raft_proto::raft_service_client::RaftServiceClient;
+        use crate::grpc::server::raft_proto::AddNodeRequest;
+
+        let leader_endpoint = format!("http://{}", leader_peer.management_leader_address);
+        match RaftServiceClient::connect(leader_endpoint).await {
+            Ok(mut client) => {
+                let request = tonic::Request::new(AddNodeRequest {
+                    node_id,
+                    address: address.clone(),
+                });
+
+                match client.add_node(request).await {
+                    Ok(response) => {
+                        let resp = response.into_inner();
+                        if resp.success {
+                            info!(logger, "Successfully added to management cluster via RPC");
+                        } else {
+                            info!(logger, "AddNode RPC returned error"; "error" => &resp.error);
+                        }
+                    }
+                    Err(e) => {
+                        info!(logger, "AddNode RPC call failed"; "error" => %e);
+                    }
+                }
+            }
+            Err(e) => {
+                info!(logger, "Failed to connect to management leader"; "error" => %e);
+            }
+        }
+
+        Ok(full_node)
     }
 
     /// Get a reference to the management runtime

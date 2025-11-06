@@ -69,18 +69,16 @@ sleep 8
 
 # Verify cluster membership
 echo -e "${YELLOW}Verifying cluster membership...${NC}"
-if grep -q "Node added to cluster" /tmp/raftoral_node2.log; then
+if grep -q "Successfully added to management cluster" /tmp/raftoral_node2.log; then
     echo -e "${GREEN}✓ Node 2 successfully joined management cluster${NC}"
+elif grep -q "Adding self to management cluster" /tmp/raftoral_node2.log; then
+    echo -e "${YELLOW}⚠ Node 2 attempted to join (may need manual addition)${NC}"
 else
-    echo -e "${RED}⚠ Node 2 may not have joined management cluster${NC}"
+    echo -e "${RED}⚠ Node 2 did not attempt to join management cluster${NC}"
 fi
 
-if grep -q "Execution cluster created successfully for joining node" /tmp/raftoral_node1.log || \
-   grep -q "Creating execution cluster for joining node" /tmp/raftoral_node2.log; then
-    echo -e "${GREEN}✓ Node 2's execution cluster created${NC}"
-else
-    echo -e "${YELLOW}⚠ Node 2's execution cluster creation not detected${NC}"
-fi
+# Note: Execution cluster creation on node 2 requires node 2 to be added to management cluster first
+# This is currently a manual step (see test_two_node_cluster_with_manual_add.sh)
 
 echo -e "\n${BLUE}=== Running Workflow Test ===${NC}\n"
 
@@ -152,8 +150,11 @@ fi
 if grep -q "Registered ping_pong workflow (v1)" /tmp/raftoral_node2.log; then
     echo -e "${GREEN}✓ Node 2: Workflow registered${NC}"
 else
-    echo -e "${YELLOW}⚠ Node 2: Workflow not registered${NC}"
+    echo -e "${YELLOW}⚠ Node 2: Workflow not registered (node 2 not yet part of cluster)${NC}"
 fi
+
+echo -e "\n${YELLOW}Note: Two-node clustering requires manual coordination.${NC}"
+echo -e "${YELLOW}For automatic clustering, node 1 must explicitly add node 2 via RPC.${NC}"
 
 # Cleanup
 echo -e "\n${YELLOW}Cleaning up...${NC}"

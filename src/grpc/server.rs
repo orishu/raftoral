@@ -17,6 +17,7 @@ use raft_proto::{
     workflow_management_server::{WorkflowManagement, WorkflowManagementServer},
     GenericMessage, MessageResponse,
     DiscoveryRequest, DiscoveryResponse,
+    AddNodeRequest, AddNodeResponse,
     RunWorkflowRequest, RunWorkflowResponse, RunWorkflowAsyncResponse, WaitForWorkflowRequest,
 };
 
@@ -162,6 +163,18 @@ impl<E: CommandExecutor + Default + 'static> RaftService for RaftServiceImpl<E> 
                 management_leader_address: String::new(),
             }))
         }
+    }
+
+    async fn add_node(
+        &self,
+        _request: Request<AddNodeRequest>,
+    ) -> Result<Response<AddNodeResponse>, Status> {
+        // This old server implementation is deprecated
+        // AddNode is only supported via the new GrpcServer in grpc2/server.rs
+        Ok(Response::new(AddNodeResponse {
+            success: false,
+            error: "AddNode not supported in legacy server".to_string(),
+        }))
     }
 }
 
