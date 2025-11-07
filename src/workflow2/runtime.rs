@@ -113,6 +113,7 @@ impl WorkflowRuntime {
     /// * `config` - Raft node configuration
     /// * `transport` - Transport layer for network communication
     /// * `mailbox_rx` - Mailbox receiver for Raft messages
+    /// * `registry` - Shared workflow registry
     /// * `logger` - Logger instance
     ///
     /// # Returns
@@ -121,6 +122,7 @@ impl WorkflowRuntime {
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
         mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
+        registry: Arc<Mutex<WorkflowRegistry>>,
         logger: Logger,
     ) -> Result<
         (Self, Arc<Mutex<RaftNode<WorkflowStateMachine>>>),
@@ -164,7 +166,7 @@ impl WorkflowRuntime {
         let runtime = Arc::new(Self {
             proposal_router,
             event_bus: event_bus.clone(),
-            registry: Arc::new(Mutex::new(WorkflowRegistry::new())),
+            registry,
             node_id: config.node_id,
             cluster_id: config.cluster_id,
             logger: logger.clone(),
@@ -185,6 +187,7 @@ impl WorkflowRuntime {
         transport: Arc<dyn Transport>,
         mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
         initial_voters: Vec<u64>,
+        registry: Arc<Mutex<WorkflowRegistry>>,
         logger: Logger,
     ) -> Result<
         (Self, Arc<Mutex<RaftNode<WorkflowStateMachine>>>),
@@ -230,7 +233,7 @@ impl WorkflowRuntime {
         let runtime = Arc::new(Self {
             proposal_router,
             event_bus: event_bus.clone(),
-            registry: Arc::new(Mutex::new(WorkflowRegistry::new())),
+            registry,
             node_id: config.node_id,
             cluster_id: config.cluster_id,
             logger: logger.clone(),
@@ -909,7 +912,10 @@ mod tests {
             ..Default::default()
         };
 
-        let (runtime, node) = WorkflowRuntime::new(config, transport, rx, logger.clone()).unwrap();
+        // Create shared registry
+        let registry = Arc::new(Mutex::new(WorkflowRegistry::new()));
+
+        let (runtime, node) = WorkflowRuntime::new(config, transport, rx, registry.clone(), logger.clone()).unwrap();
         let runtime = Arc::new(runtime);
 
         // Campaign to become leader
@@ -1001,7 +1007,10 @@ mod tests {
             ..Default::default()
         };
 
-        let (runtime, node) = WorkflowRuntime::new(config, transport, rx, logger.clone()).unwrap();
+        // Create shared registry
+        let registry = Arc::new(Mutex::new(WorkflowRegistry::new()));
+
+        let (runtime, node) = WorkflowRuntime::new(config, transport, rx, registry.clone(), logger.clone()).unwrap();
         let runtime = Arc::new(runtime);
 
         // Campaign to become leader
@@ -1047,6 +1056,9 @@ mod tests {
         // Create shared network infrastructure
         let network = Arc::new(InProcessNetwork::new());
 
+        // Create shared registry for all nodes
+        let registry = Arc::new(Mutex::new(WorkflowRegistry::new()));
+
         // === Setup Node 1 (Leader/Owner) ===
         let (tx1, rx1) = mpsc::channel(100);
 
@@ -1064,7 +1076,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (runtime1, node1) = WorkflowRuntime::new(config1, transport1.clone(), rx1, logger.clone()).unwrap();
+        let (runtime1, node1) = WorkflowRuntime::new(config1, transport1.clone(), rx1, registry.clone(), logger.clone()).unwrap();
         let runtime1 = Arc::new(runtime1);
 
         // Campaign node 1 to become leader
@@ -1103,6 +1115,7 @@ mod tests {
             transport2.clone(),
             rx2,
             vec![],  // Empty initial voters - will be populated via snapshot from node 1
+            registry.clone(),
             logger.clone(),
         ).unwrap();
         let runtime2 = Arc::new(runtime2);
@@ -1132,30 +1145,28 @@ mod tests {
         // Wait for cluster to stabilize
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-        // Register the same workflow on both nodes
-        for runtime in &[&runtime1, &runtime2] {
-            runtime
-                .register_workflow_closure(
-                    "checkpoint_test",
-                    1,
-                    |input: FibonacciInput, ctx: WorkflowContext| async move {
-                        // Create multiple checkpoints to test owner/wait pattern
-                        let mut counter = ReplicatedVar::with_value("counter", &ctx, 0u64).await?;
+        // Register workflow once (both nodes share the same registry)
+        runtime1
+            .register_workflow_closure(
+                "checkpoint_test",
+                1,
+                |input: FibonacciInput, ctx: WorkflowContext| async move {
+                    // Create multiple checkpoints to test owner/wait pattern
+                    let mut counter = ReplicatedVar::with_value("counter", &ctx, 0u64).await?;
 
-                        for i in 1..=input.n {
-                            counter.set(i as u64).await?;
-                        }
+                    for i in 1..=input.n {
+                        counter.set(i as u64).await?;
+                    }
 
-                        Ok(FibonacciOutput {
-                            result: counter.get(),
-                        })
-                    },
-                )
-                .await
-                .expect("Workflow registration should succeed");
-        }
+                    Ok(FibonacciOutput {
+                        result: counter.get(),
+                    })
+                },
+            )
+            .await
+            .expect("Workflow registration should succeed");
 
-        info!(logger, "Workflows registered on both nodes");
+        info!(logger, "Workflow registered (shared registry)");
 
         // Start workflow on node 1 (node 1 will be the owner since it's starting it)
         let workflow1 = runtime1
@@ -1206,17 +1217,19 @@ mod tests {
 // Implement SubClusterRuntime trait for WorkflowRuntime
 impl crate::management::SubClusterRuntime for WorkflowRuntime {
     type StateMachine = WorkflowStateMachine;
+    type Registry = WorkflowRegistry;
 
     fn new_single_node(
         config: RaftNodeConfig,
         transport: Arc<dyn crate::raft::generic2::Transport>,
         mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
+        registry: Arc<Mutex<Self::Registry>>,
         logger: slog::Logger,
     ) -> Result<
         (Self, Arc<Mutex<RaftNode<Self::StateMachine>>>),
         Box<dyn std::error::Error>,
     > {
-        WorkflowRuntime::new(config, transport, mailbox_rx, logger)
+        WorkflowRuntime::new(config, transport, mailbox_rx, registry, logger)
     }
 
     fn new_joining_node(
@@ -1224,12 +1237,13 @@ impl crate::management::SubClusterRuntime for WorkflowRuntime {
         transport: Arc<dyn crate::raft::generic2::Transport>,
         mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
         initial_voters: Vec<u64>,
+        registry: Arc<Mutex<Self::Registry>>,
         logger: slog::Logger,
     ) -> Result<
         (Self, Arc<Mutex<RaftNode<Self::StateMachine>>>),
         Box<dyn std::error::Error>,
     > {
-        WorkflowRuntime::new_joining_node(config, transport, mailbox_rx, initial_voters, logger)
+        WorkflowRuntime::new_joining_node(config, transport, mailbox_rx, initial_voters, registry, logger)
     }
 
     async fn add_node(

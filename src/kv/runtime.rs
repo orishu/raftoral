@@ -312,14 +312,19 @@ impl KvRuntime {
     }
 }
 
+/// Dummy registry for KvRuntime (not actually used, but required by trait)
+pub struct KvRegistry;
+
 // Implement SubClusterRuntime for use with ManagementRuntime
 impl crate::management::SubClusterRuntime for KvRuntime {
     type StateMachine = KvStateMachine;
+    type Registry = KvRegistry;
 
     fn new_single_node(
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
         mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
+        _registry: Arc<tokio::sync::Mutex<Self::Registry>>,
         logger: slog::Logger,
     ) -> Result<(Self, Arc<Mutex<RaftNode<Self::StateMachine>>>), Box<dyn std::error::Error>> {
         KvRuntime::new(config, transport, mailbox_rx, logger)
@@ -330,6 +335,7 @@ impl crate::management::SubClusterRuntime for KvRuntime {
         transport: Arc<dyn Transport>,
         mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
         initial_voters: Vec<u64>,
+        _registry: Arc<tokio::sync::Mutex<Self::Registry>>,
         logger: slog::Logger,
     ) -> Result<(Self, Arc<Mutex<RaftNode<Self::StateMachine>>>), Box<dyn std::error::Error>> {
         KvRuntime::new_joining_node(config, transport, mailbox_rx, initial_voters, logger)

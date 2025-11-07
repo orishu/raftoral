@@ -73,43 +73,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!(logger, "FullNode started"; "node_id" => node.node_id());
 
-    // Wait for sub-cluster 1 to be created
-    // Bootstrap nodes create it immediately via management cluster initialization
-    // Joining nodes will observe SubClusterCreated event
-    let default_cluster_id = 1u32;
-
-    info!(logger, "Waiting for workflow execution cluster to be created...");
-    let workflow_runtime = loop {
-        // Check if sub-cluster runtime exists
-        if let Some(runtime) = node.runtime().get_sub_cluster_runtime(&default_cluster_id).await {
-            info!(logger, "Workflow execution cluster ready"; "cluster_id" => default_cluster_id);
-            break runtime;
-        }
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-    };
-
-    // Register ping/pong workflow
+    // Register ping/pong workflow on shared registry
+    // This is now done before waiting for execution cluster creation
+    // All workflow runtimes share this registry, so workflows only need to be registered once
     // Input: "ping" (String) -> Output: "pong" (String)
-    workflow_runtime
-        .register_workflow_closure(
-            "ping_pong",
-            1,
-            |input: String, _ctx| async move {
-                if input == "ping" {
-                    Ok("pong".to_string())
-                } else {
-                    Err(WorkflowError::ClusterError(format!(
-                        "Expected 'ping', got '{}'",
-                        input
-                    )))
-                }
-            },
-        )
-        .await
-        .map_err(|e| format!("Failed to register ping_pong workflow: {}", e))?;
+    {
+        let registry = node.workflow_registry();
+        let mut registry_guard = registry.lock().await;
+        registry_guard
+            .register_closure(
+                "ping_pong",
+                1,
+                |input: String, _ctx| async move {
+                    if input == "ping" {
+                        Ok("pong".to_string())
+                    } else {
+                        Err(WorkflowError::ClusterError(format!(
+                            "Expected 'ping', got '{}'",
+                            input
+                        )))
+                    }
+                },
+            )
+            .map_err(|e| format!("Failed to register ping_pong workflow: {}", e))?;
+    }
 
-    info!(logger, "Registered ping_pong workflow (v1)");
+    info!(logger, "Registered ping_pong workflow (v1) on shared registry");
     info!(logger, "Press Ctrl+C to shutdown gracefully");
     info!(logger, "Use gRPC calls to run workflows (see scripts/run_ping_pong.sh)");
 

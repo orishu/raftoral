@@ -17,6 +17,10 @@ pub trait SubClusterRuntime: Send + Sync + 'static {
     /// The state machine type used by this runtime
     type StateMachine: crate::raft::generic2::StateMachine + Send + Sync + 'static;
 
+    /// The registry type used by this runtime (e.g., WorkflowRegistry for WorkflowRuntime)
+    /// This allows sharing registries across multiple runtime instances
+    type Registry: Send + Sync + 'static;
+
     /// Create a new single-node cluster runtime
     ///
     /// This is called when a sub-cluster is created and this node is the first node.
@@ -25,6 +29,7 @@ pub trait SubClusterRuntime: Send + Sync + 'static {
     /// * `config` - Raft node configuration
     /// * `transport` - Transport layer for network communication
     /// * `mailbox_rx` - Mailbox receiver for Raft messages
+    /// * `registry` - Shared registry for this runtime type
     /// * `logger` - Logger instance
     ///
     /// # Returns
@@ -33,6 +38,7 @@ pub trait SubClusterRuntime: Send + Sync + 'static {
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
         mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
+        registry: Arc<Mutex<Self::Registry>>,
         logger: Logger,
     ) -> Result<
         (Self, Arc<Mutex<RaftNode<Self::StateMachine>>>),
@@ -50,6 +56,7 @@ pub trait SubClusterRuntime: Send + Sync + 'static {
     /// * `transport` - Transport layer for network communication
     /// * `mailbox_rx` - Mailbox receiver for Raft messages
     /// * `initial_voters` - IDs of all nodes in the cluster (including this node)
+    /// * `registry` - Shared registry for this runtime type
     /// * `logger` - Logger instance
     ///
     /// # Returns
@@ -59,6 +66,7 @@ pub trait SubClusterRuntime: Send + Sync + 'static {
         transport: Arc<dyn Transport>,
         mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
         initial_voters: Vec<u64>,
+        registry: Arc<Mutex<Self::Registry>>,
         logger: Logger,
     ) -> Result<
         (Self, Arc<Mutex<RaftNode<Self::StateMachine>>>),

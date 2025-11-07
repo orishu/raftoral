@@ -22,7 +22,10 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 /// The type parameter R represents the sub-cluster runtime type (e.g., WorkflowRuntime)
 /// that implements the SubClusterRuntime trait. When management events are observed,
 /// ManagementRuntime will dynamically create and manage instances of R.
-pub struct ManagementRuntime<R> {
+pub struct ManagementRuntime<R>
+where
+    R: SubClusterRuntime,
+{
     /// Proposal router for submitting operations
     proposal_router: Arc<ProposalRouter<ManagementStateMachine>>,
 
@@ -38,6 +41,9 @@ pub struct ManagementRuntime<R> {
     /// Active sub-cluster runtimes managed by this node
     sub_clusters: Arc<Mutex<HashMap<u32, Arc<R>>>>,
 
+    /// Shared registry for sub-cluster runtimes
+    registry: Arc<Mutex<R::Registry>>,
+
     /// Node ID
     node_id: u64,
 
@@ -51,7 +57,10 @@ pub struct ManagementRuntime<R> {
     _phantom: PhantomData<R>,
 }
 
-impl<R> ManagementRuntime<R> {
+impl<R> ManagementRuntime<R>
+where
+    R: SubClusterRuntime,
+{
     /// Create a new Management runtime
     ///
     /// # Arguments
@@ -59,6 +68,7 @@ impl<R> ManagementRuntime<R> {
     /// * `transport` - Transport layer for network communication
     /// * `mailbox_rx` - Mailbox receiver for Raft messages
     /// * `cluster_router` - Cluster router for registering sub-clusters
+    /// * `registry` - Shared registry for sub-cluster runtimes
     /// * `logger` - Logger instance
     ///
     /// # Returns
@@ -68,6 +78,7 @@ impl<R> ManagementRuntime<R> {
         transport: Arc<dyn Transport>,
         mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
         cluster_router: Arc<ClusterRouter>,
+        registry: Arc<Mutex<R::Registry>>,
         logger: Logger,
     ) -> Result<
         (
@@ -120,6 +131,7 @@ impl<R> ManagementRuntime<R> {
             cluster_router,
             transport,
             sub_clusters: Arc::new(Mutex::new(HashMap::new())),
+            registry,
             node_id: config.node_id,
             cluster_id: config.cluster_id,
             logger: logger.clone(),
@@ -143,6 +155,7 @@ impl<R> ManagementRuntime<R> {
     /// * `mailbox_rx` - Mailbox receiver for Raft messages
     /// * `initial_voters` - IDs of all nodes in the cluster (including this node)
     /// * `cluster_router` - Cluster router for registering sub-clusters
+    /// * `registry` - Shared registry for sub-cluster runtimes
     /// * `logger` - Logger instance
     ///
     /// # Returns
@@ -153,6 +166,7 @@ impl<R> ManagementRuntime<R> {
         mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
         initial_voters: Vec<u64>,
         cluster_router: Arc<ClusterRouter>,
+        registry: Arc<Mutex<R::Registry>>,
         logger: Logger,
     ) -> Result<
         (
@@ -207,6 +221,7 @@ impl<R> ManagementRuntime<R> {
             cluster_router,
             transport,
             sub_clusters: Arc::new(Mutex::new(HashMap::new())),
+            registry,
             node_id: config.node_id,
             cluster_id: config.cluster_id,
             logger: logger.clone(),
@@ -597,6 +612,7 @@ impl<R> ManagementRuntime<R> {
                                     config,
                                     self.transport.clone(),
                                     mailbox_rx,
+                                    self.registry.clone(),
                                     self.logger.clone(),
                                 ) {
                                     Ok(pair) => pair,
@@ -619,6 +635,7 @@ impl<R> ManagementRuntime<R> {
                                     self.transport.clone(),
                                     mailbox_rx,
                                     node_ids.clone(),
+                                    self.registry.clone(),
                                     self.logger.clone(),
                                 ) {
                                     Ok(pair) => pair,
@@ -714,14 +731,19 @@ mod tests {
     use crate::raft::generic2::errors::TransportError;
     use crate::raft::generic2::StateMachine;
 
+    // Dummy registry for testing
+    pub struct DummyRegistry;
+
     // Dummy implementation for testing
     impl SubClusterRuntime for () {
         type StateMachine = DummyStateMachine;
+        type Registry = DummyRegistry;
 
         fn new_single_node(
             _config: RaftNodeConfig,
             _transport: Arc<dyn crate::raft::generic2::Transport>,
             _mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
+            _registry: Arc<Mutex<Self::Registry>>,
             _logger: Logger,
         ) -> Result<(Self, Arc<Mutex<RaftNode<Self::StateMachine>>>), Box<dyn std::error::Error>> {
             unimplemented!("Dummy implementation for testing")
@@ -732,6 +754,7 @@ mod tests {
             _transport: Arc<dyn crate::raft::generic2::Transport>,
             _mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
             _initial_voters: Vec<u64>,
+            _registry: Arc<Mutex<Self::Registry>>,
             _logger: Logger,
         ) -> Result<(Self, Arc<Mutex<RaftNode<Self::StateMachine>>>), Box<dyn std::error::Error>> {
             unimplemented!("Dummy implementation for testing")
@@ -814,9 +837,12 @@ mod tests {
             })
             .await;
 
+        // Create shared dummy registry
+        let registry = Arc::new(Mutex::new(DummyRegistry));
+
         // Use () as placeholder for sub-cluster type since we're not instantiating any
         let (runtime, node) =
-            ManagementRuntime::<()>::new(config, transport, rx, cluster_router, logger).unwrap();
+            ManagementRuntime::<()>::new(config, transport, rx, cluster_router, registry, logger).unwrap();
 
         // Campaign to become leader
         node.lock()
@@ -938,9 +964,12 @@ mod tests {
             })
             .await;
 
+        // Create shared KV registry
+        let registry = Arc::new(Mutex::new(crate::kv::runtime::KvRegistry));
+
         // Create ManagementRuntime typed to manage KvRuntime sub-clusters
         let (runtime, node) =
-            ManagementRuntime::<KvRuntime>::new(config, transport, rx, cluster_router, logger).unwrap();
+            ManagementRuntime::<KvRuntime>::new(config, transport, rx, cluster_router, registry, logger).unwrap();
 
         // Campaign to become leader
         node.lock()

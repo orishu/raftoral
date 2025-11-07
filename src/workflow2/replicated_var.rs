@@ -189,7 +189,10 @@ mod tests {
             ..Default::default()
         };
 
-        let (runtime, node) = WorkflowRuntime::new(config, transport, rx, logger).unwrap();
+        // Create shared registry
+        let registry = Arc::new(tokio::sync::Mutex::new(crate::workflow2::WorkflowRegistry::new()));
+
+        let (runtime, node) = WorkflowRuntime::new(config, transport, rx, registry, logger).unwrap();
         let runtime = Arc::new(runtime);
 
         // Campaign to become leader
@@ -254,7 +257,10 @@ mod tests {
             ..Default::default()
         };
 
-        let (runtime, node) = WorkflowRuntime::new(config, transport, rx, logger).unwrap();
+        // Create shared registry
+        let registry = Arc::new(tokio::sync::Mutex::new(crate::workflow2::WorkflowRegistry::new()));
+
+        let (runtime, node) = WorkflowRuntime::new(config, transport, rx, registry, logger).unwrap();
         let runtime = Arc::new(runtime);
 
         // Campaign to become leader
