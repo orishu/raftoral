@@ -1100,12 +1100,16 @@ mod tests {
 
         let (runtime2, node2) = WorkflowRuntime::new_joining_node(
             config2,
-            transport2,
+            transport2.clone(),
             rx2,
-            vec![1, 2],  // Initial voters
+            vec![],  // Empty initial voters - will be populated via snapshot from node 1
             logger.clone(),
         ).unwrap();
         let runtime2 = Arc::new(runtime2);
+
+        // Add peers to both transports for bidirectional communication
+        transport1.add_peer(2, "node2".to_string()).await;
+        transport2.add_peer(1, "node1".to_string()).await;
 
         // Run node 2 in background
         let node2_clone = node2.clone();
@@ -1114,8 +1118,11 @@ mod tests {
             let _ = RaftNode::run_from_arc(node2_clone).await;
         });
 
+        // Give node 2 a moment to start up
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
         // Add node 2 to the cluster
-        let rx = runtime1.add_node(2, "127.0.0.1:7002".to_string()).await
+        let rx = runtime1.add_node(2, "node2".to_string()).await
             .expect("Add node should succeed");
         rx.await.expect("Add node receiver should work")
             .expect("Add node should complete");
