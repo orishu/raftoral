@@ -388,7 +388,9 @@ impl WorkflowRuntime {
 
         match owner_node_id {
             Some(owner) => owner == self.node_id,
-            None => false,
+            // If no owner is registered, treat this node as owner
+            // This handles edge cases like testing and pre-workflow checkpoints
+            None => true,
         }
     }
 
@@ -541,11 +543,40 @@ impl WorkflowRuntime {
         self.cluster_id
     }
 
+    /// Try to dequeue a checkpoint from the transient queue
+    ///
+    /// This is used by ALL nodes (owner and followers) to check if a checkpoint value
+    /// has already been enqueued by the state machine before waiting for events.
+    /// Uses simple FIFO queue semantics: pop once from front.
+    /// Deterministic execution guarantees the queue order matches execution order.
+    async fn try_dequeue_checkpoint<T>(
+        &self,
+        workflow_id: &str,
+        key: &str,
+    ) -> Result<Option<T>, WorkflowError>
+    where
+        T: serde::Serialize + for<'de> serde::Deserialize<'de> + Clone + Send + Sync + 'static,
+    {
+        let node_arc = self.proposal_router.node();
+        let node = node_arc.lock().await;
+        let sm = node.state_machine().clone();
+        drop(node);
+
+        let mut sm_guard = sm.lock().await;
+        if let Some(serialized_value) = sm_guard.pop_queued_checkpoint(workflow_id, key) {
+            let deserialized = serde_json::from_slice::<T>(&serialized_value)
+                .map_err(|e| WorkflowError::SerializationError(format!("Deserialization error: {}", e)))?;
+            return Ok(Some(deserialized));
+        }
+
+        Ok(None)
+    }
+
     /// Set a replicated variable (checkpoint)
     ///
-    /// Uses the owner-or-wait pattern: if this node owns the workflow, it proposes
-    /// the SetCheckpoint command. Otherwise, it waits for the CheckpointSet event
-    /// from the owner.
+    /// Always checks the transient queue first (for late followers and faster owners).
+    /// If queue is empty, uses the owner-or-wait pattern: owner proposes SetCheckpoint,
+    /// followers wait for the CheckpointSet event.
     pub async fn set_checkpoint<T>(
         &self,
         workflow_id: &str,
@@ -555,6 +586,14 @@ impl WorkflowRuntime {
     where
         T: serde::Serialize + for<'de> serde::Deserialize<'de> + Clone + Send + Sync + 'static,
     {
+        // Always check the transient queue first (for late followers)
+        // This handles the case where the owner has already enqueued the checkpoint
+        // before the follower reaches this point in execution
+        if let Some(queued_value) = self.try_dequeue_checkpoint(workflow_id, key).await? {
+            return Ok(queued_value);
+        }
+
+        // No queued value - proceed with normal consensus-based flow
         // Serialize value once (used by both owner and non-owner paths)
         let value_bytes = serde_json::to_vec(&value)
             .map_err(|e| WorkflowError::SerializationError(e.to_string()))?;
@@ -580,8 +619,8 @@ impl WorkflowRuntime {
                 async move {
                     // Owner operation: Propose SetCheckpoint command
                     let command = WorkflowCommand::SetCheckpoint {
-                        workflow_id: workflow_id_clone,
-                        key: key_clone,
+                        workflow_id: workflow_id_clone.clone(),
+                        key: key_clone.clone(),
                         value: value_bytes_clone2,
                     };
 
@@ -589,6 +628,16 @@ impl WorkflowRuntime {
                         .propose_and_wait(command)
                         .await
                         .map_err(|e| WorkflowError::ClusterError(format!("{}", e)))?;
+
+                    // Pop the value we just enqueued (during apply in propose_and_wait)
+                    // This prevents owner's own execution from consuming its proposed values
+                    let node_arc = proposal_router_clone.node();
+                    let node = node_arc.lock().await;
+                    let sm = node.state_machine().clone();
+                    drop(node);
+
+                    let mut sm_guard = sm.lock().await;
+                    sm_guard.pop_queued_checkpoint(&workflow_id_clone, &key_clone);
 
                     Ok(value_clone)
                 }

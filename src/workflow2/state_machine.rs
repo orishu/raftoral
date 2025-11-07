@@ -69,10 +69,17 @@ pub struct WorkflowStateMachine {
     /// Store workflow results (serialized) by ID for retrieval after completion
     results: HashMap<String, Vec<u8>>,
 
-    /// Queue of checkpoint values that arrived before execution reached them
+    /// Transient queue for checkpoint values awaiting consumption by followers
     /// Key: "workflow_id:checkpoint_key", Value: Queue of serialized values
-    /// This enables late followers to catch up without blocking on consensus
+    /// This enables followers to consume values that arrived before they reached that execution point
+    /// Owner pops its own values from this queue after proposing
     checkpoint_queues: HashMap<String, VecDeque<Vec<u8>>>,
+
+    /// Complete history of checkpoints for snapshot/recovery
+    /// Key: "workflow_id:checkpoint_key", Value: Queue of all historical values
+    /// Never popped, only appended. Cleaned up on workflow completion.
+    /// Used for new nodes joining and restoring from snapshots
+    checkpoint_history: HashMap<String, VecDeque<Vec<u8>>>,
 
     /// Workflow ownership map (workflow_id → owner_node_id)
     ownership: HashMap<String, u64>,
@@ -86,6 +93,7 @@ impl WorkflowStateMachine {
             inputs: HashMap::new(),
             results: HashMap::new(),
             checkpoint_queues: HashMap::new(),
+            checkpoint_history: HashMap::new(),
             ownership: HashMap::new(),
         }
     }
@@ -190,9 +198,11 @@ impl StateMachine for WorkflowStateMachine {
                 // Clean up input (no longer needed)
                 self.inputs.remove(workflow_id);
 
-                // Clean up checkpoint queues for this workflow
+                // Clean up both checkpoint queues and history for this workflow
                 let prefix = format!("{}:", workflow_id);
                 self.checkpoint_queues
+                    .retain(|k, _| !k.starts_with(&prefix));
+                self.checkpoint_history
                     .retain(|k, _| !k.starts_with(&prefix));
 
                 // Keep ownership for result retrieval
@@ -208,9 +218,16 @@ impl StateMachine for WorkflowStateMachine {
                 key,
                 value,
             } => {
-                // Queue the checkpoint value for late followers
                 let queue_key = make_queue_key(workflow_id, key);
+
+                // Push to transient queue (for active follower coordination)
                 self.checkpoint_queues
+                    .entry(queue_key.clone())
+                    .or_insert_with(VecDeque::new)
+                    .push_back(value.clone());
+
+                // Push to history (for snapshots and new nodes)
+                self.checkpoint_history
                     .entry(queue_key)
                     .or_insert_with(VecDeque::new)
                     .push_back(value.clone());
@@ -247,7 +264,7 @@ impl StateMachine for WorkflowStateMachine {
             workflows: HashMap<String, WorkflowStatus>,
             inputs: HashMap<String, Vec<u8>>,
             results: HashMap<String, Vec<u8>>,
-            checkpoint_queues: HashMap<String, VecDeque<Vec<u8>>>,
+            checkpoint_history: HashMap<String, VecDeque<Vec<u8>>>,
             ownership: HashMap<String, u64>,
         }
 
@@ -255,7 +272,7 @@ impl StateMachine for WorkflowStateMachine {
             workflows: self.workflows.clone(),
             inputs: self.inputs.clone(),
             results: self.results.clone(),
-            checkpoint_queues: self.checkpoint_queues.clone(),
+            checkpoint_history: self.checkpoint_history.clone(),
             ownership: self.ownership.clone(),
         };
 
@@ -269,7 +286,7 @@ impl StateMachine for WorkflowStateMachine {
             workflows: HashMap<String, WorkflowStatus>,
             inputs: HashMap<String, Vec<u8>>,
             results: HashMap<String, Vec<u8>>,
-            checkpoint_queues: HashMap<String, VecDeque<Vec<u8>>>,
+            checkpoint_history: HashMap<String, VecDeque<Vec<u8>>>,
             ownership: HashMap<String, u64>,
         }
 
@@ -277,8 +294,20 @@ impl StateMachine for WorkflowStateMachine {
         self.workflows = snapshot.workflows;
         self.inputs = snapshot.inputs;
         self.results = snapshot.results;
-        self.checkpoint_queues = snapshot.checkpoint_queues;
+        self.checkpoint_history = snapshot.checkpoint_history.clone();
         self.ownership = snapshot.ownership;
+
+        // Build transient checkpoint_queues from history
+        // New node needs queues populated for when execution starts
+        self.checkpoint_queues.clear();
+        for (composite_key, history) in snapshot.checkpoint_history {
+            let mut queue = VecDeque::new();
+            // Add all historical values to queue (in order)
+            for value in history {
+                queue.push_back(value);
+            }
+            self.checkpoint_queues.insert(composite_key, queue);
+        }
 
         Ok(())
     }
