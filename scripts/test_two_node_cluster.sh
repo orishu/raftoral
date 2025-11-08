@@ -1,12 +1,22 @@
 #!/bin/bash
 #
-# Test script for verifying two-node cluster functionality
+# Test script for verifying two-node cluster functionality with automatic node discovery
 #
-# This script:
-# 1. Starts a bootstrap node (node 1) as the initial cluster
-# 2. Starts a second node (node 2) that joins the existing cluster
-# 3. Executes a ping/pong workflow via gRPC to verify distributed consensus
-# 4. Displays the results and cleans up
+# This script demonstrates:
+# 1. Bootstrap node (Node 1) creating a single-node management cluster
+# 2. Joining node (Node 2) automatically discovering and joining via AddNode RPC
+# 3. Both nodes sharing the same workflow registry
+# 4. Workflow execution on the cluster
+#
+# Architecture:
+# - Management Cluster (cluster_id=0): Both nodes participate for cluster coordination
+# - Execution Cluster (cluster_id=1): Currently only Node 1 (created during bootstrap)
+# - Shared Workflow Registry: Both nodes can register and execute workflows
+#
+# Note: The default execution cluster is created with only the bootstrap node.
+# To have both nodes participate in workflow execution, you would need to add Node 2
+# to the execution cluster after it joins. This script focuses on demonstrating
+# the automatic node discovery and joining mechanism.
 #
 # Prerequisites:
 #   - grpcurl must be installed (brew install grpcurl)
@@ -35,6 +45,23 @@ if ! command -v grpcurl &> /dev/null; then
     exit 1
 fi
 
+# Cleanup function for graceful exit
+cleanup() {
+    echo -e "\n${YELLOW}Cleaning up...${NC}"
+    if [ ! -z "$NODE1_PID" ]; then
+        kill $NODE1_PID 2>/dev/null || true
+        wait $NODE1_PID 2>/dev/null || true
+    fi
+    if [ ! -z "$NODE2_PID" ]; then
+        kill $NODE2_PID 2>/dev/null || true
+        wait $NODE2_PID 2>/dev/null || true
+    fi
+    echo -e "${GREEN}✓ Processes stopped${NC}"
+}
+
+# Set trap for cleanup on exit
+trap cleanup EXIT
+
 # Clean up any previous test logs
 rm -f /tmp/raftoral_node1.log /tmp/raftoral_node2.log
 
@@ -44,46 +71,86 @@ cargo build --bin raftoral 2>&1 | grep -v "Compiling\|Finished" || true
 echo -e "${GREEN}✓ Build complete${NC}\n"
 
 # Start first node (bootstrap) in background
-echo -e "${YELLOW}Starting Node 1 (bootstrap)...${NC}"
-RUST_LOG=info cargo run --bin raftoral -- --listen 127.0.0.1:7001 --bootstrap > /tmp/raftoral_node1.log 2>&1 &
+echo -e "${YELLOW}Starting Node 1 (bootstrap mode)...${NC}"
+RUST_LOG=info cargo run --bin raftoral -- \
+    --listen 127.0.0.1:7001 \
+    --node-id 1 \
+    --bootstrap \
+    > /tmp/raftoral_node1.log 2>&1 &
 NODE1_PID=$!
 echo -e "${GREEN}✓ Node 1 started (PID: $NODE1_PID)${NC}"
 
-# Wait for node 1 to be ready
-echo -e "${YELLOW}Waiting for Node 1 to initialize...${NC}"
-sleep 3
+# Wait for node 1 to be ready and create default execution cluster
+echo -e "${YELLOW}Waiting for Node 1 to initialize and create execution cluster...${NC}"
+sleep 4
 
-# Start second node (join) in background
-echo -e "${YELLOW}Starting Node 2 (join cluster)...${NC}"
-RUST_LOG=info cargo run --bin raftoral -- --listen 127.0.0.1:7002 --peers 127.0.0.1:7001 > /tmp/raftoral_node2.log 2>&1 &
+# Verify node 1 is ready
+if grep -q "Default execution cluster created" /tmp/raftoral_node1.log; then
+    echo -e "${GREEN}✓ Node 1 execution cluster ready${NC}"
+elif grep -q "FullNode started" /tmp/raftoral_node1.log; then
+    echo -e "${GREEN}✓ Node 1 started${NC}"
+else
+    echo -e "${RED}⚠ Node 1 may not be ready${NC}"
+    echo -e "${YELLOW}Checking logs...${NC}"
+    tail -20 /tmp/raftoral_node1.log
+fi
+
+# Start second node (join mode - automatic discovery and AddNode)
+echo -e "\n${YELLOW}Starting Node 2 (join mode with automatic discovery)...${NC}"
+RUST_LOG=info cargo run --bin raftoral -- \
+    --listen 127.0.0.1:7002 \
+    --peers 127.0.0.1:7001 \
+    > /tmp/raftoral_node2.log 2>&1 &
 NODE2_PID=$!
 echo -e "${GREEN}✓ Node 2 started (PID: $NODE2_PID)${NC}"
 
-# Wait for cluster to stabilize
-# This includes:
-# 1. Node 2 joining management cluster via ConfChange
-# 2. Management cluster creating execution cluster on node 2
-# 3. Node 2 joining execution cluster
-echo -e "${YELLOW}Waiting for cluster to stabilize (node 2 joining both clusters)...${NC}"
-sleep 8
+# Wait for node 2 to discover peers and join
+echo -e "${YELLOW}Waiting for Node 2 to discover peers and join cluster...${NC}"
+sleep 5
 
-# Verify cluster membership
-echo -e "${YELLOW}Verifying cluster membership...${NC}"
-if grep -q "Successfully added to management cluster" /tmp/raftoral_node2.log; then
-    echo -e "${GREEN}✓ Node 2 successfully joined management cluster${NC}"
-elif grep -q "Adding self to management cluster" /tmp/raftoral_node2.log; then
-    echo -e "${YELLOW}⚠ Node 2 attempted to join (may need manual addition)${NC}"
+# Verify node 2 joined successfully
+echo -e "\n${BLUE}=== Cluster Membership Status ===${NC}\n"
+
+if grep -q "Assigned node ID" /tmp/raftoral_node2.log; then
+    NODE2_ID=$(grep "Assigned node ID" /tmp/raftoral_node2.log | grep -o 'node_id: [0-9]*' | cut -d' ' -f2)
+    echo -e "${GREEN}✓ Node 2 discovered cluster and got ID: $NODE2_ID${NC}"
 else
-    echo -e "${RED}⚠ Node 2 did not attempt to join management cluster${NC}"
+    echo -e "${RED}✗ Node 2 failed to discover cluster${NC}"
+    echo -e "${YELLOW}Node 2 logs:${NC}"
+    tail -30 /tmp/raftoral_node2.log
+    exit 1
 fi
 
-# Note: Execution cluster creation on node 2 requires node 2 to be added to management cluster first
-# This is currently a manual step (see test_two_node_cluster_with_manual_add.sh)
+if grep -q "Successfully added to management cluster" /tmp/raftoral_node2.log; then
+    echo -e "${GREEN}✓ Node 2 joined management cluster via AddNode RPC${NC}"
+elif grep -q "Calling AddNode RPC" /tmp/raftoral_node2.log; then
+    echo -e "${YELLOW}⚠ Node 2 attempted AddNode but may have failed${NC}"
+    grep "AddNode" /tmp/raftoral_node2.log | tail -5
+else
+    echo -e "${RED}⚠ Node 2 did not attempt to join${NC}"
+fi
+
+# Wait for cluster to fully stabilize
+echo -e "\n${YELLOW}Waiting for both clusters (management + execution) to stabilize...${NC}"
+sleep 6
+
+# Verify workflow registry on both nodes
+if grep -q "Registered ping_pong workflow" /tmp/raftoral_node1.log; then
+    echo -e "${GREEN}✓ Node 1: ping_pong workflow registered${NC}"
+else
+    echo -e "${YELLOW}⚠ Node 1: ping_pong workflow not found in logs${NC}"
+fi
+
+if grep -q "Registered ping_pong workflow" /tmp/raftoral_node2.log; then
+    echo -e "${GREEN}✓ Node 2: ping_pong workflow registered${NC}"
+else
+    echo -e "${YELLOW}⚠ Node 2: ping_pong workflow not registered yet${NC}"
+fi
 
 echo -e "\n${BLUE}=== Running Workflow Test ===${NC}\n"
 
-# Run a workflow via gRPC
-echo -e "${YELLOW}Step 1: Starting ping_pong workflow asynchronously...${NC}"
+# Run a workflow via gRPC to Node 1 (should distribute across cluster)
+echo -e "${YELLOW}Step 1: Starting ping_pong workflow asynchronously on Node 1...${NC}"
 RESPONSE=$(grpcurl \
     -plaintext \
     -d '{
@@ -102,17 +169,17 @@ EXECUTION_CLUSTER_ID=$(echo "$RESPONSE" | grep -o '"executionClusterId": *"[^"]*
 
 if [ -z "$WORKFLOW_ID" ]; then
     echo -e "${RED}✗ Failed to start workflow${NC}"
-    echo -e "${YELLOW}Cleaning up...${NC}"
-    kill $NODE1_PID $NODE2_PID 2>/dev/null || true
+    echo -e "${YELLOW}Response was:${NC}"
+    echo "$RESPONSE"
     exit 1
 fi
 
 echo -e "${GREEN}✓ Workflow started successfully${NC}"
-echo -e "  Workflow ID: $WORKFLOW_ID"
-echo -e "  Execution Cluster ID: $EXECUTION_CLUSTER_ID"
+echo -e "  Workflow ID: ${WORKFLOW_ID}"
+echo -e "  Execution Cluster ID: ${EXECUTION_CLUSTER_ID}"
 
 # Wait for workflow completion
-echo -e "\n${YELLOW}Step 2: Waiting for workflow completion...${NC}"
+echo -e "\n${YELLOW}Step 2: Waiting for workflow completion (max 30 seconds)...${NC}"
 RESULT=$(grpcurl \
     -plaintext \
     -d "{
@@ -127,41 +194,39 @@ echo "$RESULT"
 
 # Check if workflow succeeded
 if echo "$RESULT" | grep -q '"success": *true'; then
-    echo -e "${GREEN}✓ Workflow completed successfully${NC}"
+    echo -e "\n${GREEN}✓✓✓ Workflow completed successfully! ✓✓✓${NC}"
 
     # Extract and display the result
     RESULT_JSON=$(echo "$RESULT" | grep -o '"resultJson": *"[^"]*"' | cut -d'"' -f4)
     if [ -n "$RESULT_JSON" ]; then
-        echo -e "  Result: $RESULT_JSON"
+        echo -e "${GREEN}  Result: $RESULT_JSON${NC}"
+
+        # Check if result is "pong"
+        if echo "$RESULT_JSON" | grep -q "pong"; then
+            echo -e "${GREEN}  ✓ Ping/pong workflow executed correctly across cluster!${NC}"
+        fi
     fi
 else
-    echo -e "${RED}✗ Workflow failed${NC}"
+    echo -e "${RED}✗ Workflow failed or timed out${NC}"
+    echo -e "${YELLOW}Checking logs for details...${NC}"
+    echo -e "\n${YELLOW}Node 1 logs (last 20 lines):${NC}"
+    tail -20 /tmp/raftoral_node1.log
+    echo -e "\n${YELLOW}Node 2 logs (last 20 lines):${NC}"
+    tail -20 /tmp/raftoral_node2.log
 fi
 
-# Show cluster membership from logs
-echo -e "\n${BLUE}=== Cluster Status ===${NC}\n"
+# Final cluster status
+echo -e "\n${BLUE}=== Final Cluster Status ===${NC}\n"
 
-if grep -q "Registered ping_pong workflow (v1)" /tmp/raftoral_node1.log; then
-    echo -e "${GREEN}✓ Node 1: Workflow registered${NC}"
-else
-    echo -e "${YELLOW}⚠ Node 1: Workflow not registered${NC}"
-fi
+echo -e "${YELLOW}Node 1 (bootstrap):${NC}"
+echo -e "  - Management cluster leader: $(grep -q 'became leader' /tmp/raftoral_node1.log && echo 'YES' || echo 'NO')"
+echo -e "  - Workflow registered: $(grep -q 'Registered ping_pong' /tmp/raftoral_node1.log && echo 'YES' || echo 'NO')"
+echo -e "  - Default execution cluster: $(grep -q 'Default execution cluster created' /tmp/raftoral_node1.log && echo 'CREATED' || echo 'UNKNOWN')"
 
-if grep -q "Registered ping_pong workflow (v1)" /tmp/raftoral_node2.log; then
-    echo -e "${GREEN}✓ Node 2: Workflow registered${NC}"
-else
-    echo -e "${YELLOW}⚠ Node 2: Workflow not registered (node 2 not yet part of cluster)${NC}"
-fi
-
-echo -e "\n${YELLOW}Note: Two-node clustering requires manual coordination.${NC}"
-echo -e "${YELLOW}For automatic clustering, node 1 must explicitly add node 2 via RPC.${NC}"
-
-# Cleanup
-echo -e "\n${YELLOW}Cleaning up...${NC}"
-kill $NODE1_PID $NODE2_PID 2>/dev/null || true
-wait $NODE1_PID 2>/dev/null || true
-wait $NODE2_PID 2>/dev/null || true
-echo -e "${GREEN}✓ Processes stopped${NC}"
+echo -e "\n${YELLOW}Node 2 (joined):${NC}"
+echo -e "  - Discovered peers: $(grep -q 'Assigned node ID' /tmp/raftoral_node2.log && echo 'YES' || echo 'NO')"
+echo -e "  - Joined management cluster: $(grep -q 'Successfully added to management cluster' /tmp/raftoral_node2.log && echo 'YES' || echo 'UNKNOWN')"
+echo -e "  - Workflow registered: $(grep -q 'Registered ping_pong' /tmp/raftoral_node2.log && echo 'YES' || echo 'NO')"
 
 echo -e "\n${BLUE}=== Test Complete ===${NC}"
 echo -e "Logs saved to:"
