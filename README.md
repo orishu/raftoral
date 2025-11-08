@@ -150,12 +150,14 @@ const result = await workflow.executeActivity('chargeCard', {
 
 #### Raftoral Replicated Variables
 ```rust
-// Deterministic computation with consensus-backed checkpoints
-let mut amount = ReplicatedVar::with_value("charge_amount", &ctx, 100).await?;
+use raftoral::{checkpoint, checkpoint_compute};
 
-let result = ReplicatedVar::with_computation("payment_result", &ctx, || async {
+// Deterministic computation with consensus-backed checkpoints (using macros)
+let mut amount = checkpoint!(ctx, "charge_amount", 100);
+
+let result = checkpoint_compute!(ctx, "payment_result", || async {
     charge_card(*amount).await  // External call executed once (owner only)
-}).await?;
+});
 ```
 
 **Key Differences:**
@@ -168,9 +170,9 @@ let result = ReplicatedVar::with_computation("payment_result", &ctx, || async {
 | **Network Overhead** | Every activity call | Only during checkpoint creation (owner-only) |
 | **Determinism** | Activities can be non-deterministic | Workflow code must be deterministic |
 
-**When to use `with_value()` vs `with_computation()`:**
-- **`ReplicatedVar::with_value("key", &ctx, value)`**: For deterministic state (counters, status, computed values)
-- **`ReplicatedVar::with_computation("key", &ctx, || async { ... })`**: For side effects (API calls, external services)
+**When to use `checkpoint!` vs `checkpoint_compute!`:**
+- **`checkpoint!(ctx, "key", value)`**: For deterministic state (counters, status, computed values)
+- **`checkpoint_compute!(ctx, "key", || async { ... })`**: For side effects (API calls, external services)
   - Executes the computation **once** (on the owner node only)
   - Result is replicated to all nodes via Raft
   - Non-owner nodes wait for the checkpoint event
@@ -178,21 +180,23 @@ let result = ReplicatedVar::with_computation("payment_result", &ctx, || async {
 
 **Example - Payment Processing:**
 ```rust
+use raftoral::{checkpoint, checkpoint_compute};
+
 runtime.register_workflow_closure("process_payment", 1,
     |input: PaymentInput, ctx: WorkflowContext| async move {
-        // Deterministic state
-        let order_id = ReplicatedVar::with_value("order_id", &ctx, input.order_id).await?;
-        let amount = ReplicatedVar::with_value("amount", &ctx, input.amount).await?;
+        // Deterministic state (using checkpoint! macro)
+        let order_id = checkpoint!(ctx, "order_id", input.order_id);
+        let amount = checkpoint!(ctx, "amount", input.amount);
 
         // Side effect: charge card once (owner-only execution)
-        let charge_result = ReplicatedVar::with_computation("charge", &ctx, || async {
+        let charge_result = checkpoint_compute!(ctx, "charge", || async {
             stripe::charge_card(*order_id, *amount).await
-        }).await?;
+        });
 
         // Update based on result
-        let mut status = ReplicatedVar::with_value("status", &ctx,
+        let mut status = checkpoint!(ctx, "status",
             if charge_result.is_ok() { "completed" } else { "failed" }
-        ).await?;
+        );
 
         Ok(PaymentOutput { status: status.get() })
     }
@@ -211,7 +215,8 @@ runtime.register_workflow_closure("process_payment", 1,
 ### Bootstrap a Cluster
 
 ```rust
-use raftoral::workflow2::{WorkflowRuntime, WorkflowContext, ReplicatedVar};
+use raftoral::workflow2::{WorkflowRuntime, WorkflowContext};
+use raftoral::{checkpoint, checkpoint_compute};
 use raftoral::raft::generic2::{RaftNodeConfig, TransportLayer, GrpcTransport};
 use tokio::signal;
 
@@ -236,21 +241,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (runtime, node) = WorkflowRuntime::new(config, transport, rx, logger)?;
     let runtime = Arc::new(runtime);
 
-    // 2. Register workflow with replicated variables
+    // 2. Register workflow with checkpoints (using macros for clean syntax)
     runtime.register_workflow_closure(
         "process_order", 1,
         |input: OrderInput, ctx: WorkflowContext| async move {
-            // Regular replicated variable for deterministic state
-            let mut status = ReplicatedVar::with_value("status", &ctx, "processing").await?;
+            // Regular checkpoint for deterministic state
+            let mut status = checkpoint!(ctx, "status", "processing");
 
-            // Computed replicated variable for side effects (API calls)
-            let inventory_check = ReplicatedVar::with_computation(
+            // Computed checkpoint for side effects (API calls)
+            let inventory_check = checkpoint_compute!(
+                ctx,
                 "inventory",
-                &ctx,
                 || async {
                     check_inventory_service(input.item_id).await
                 }
-            ).await?;
+            );
 
             if *inventory_check {
                 status.set("confirmed").await?;

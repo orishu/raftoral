@@ -46,6 +46,24 @@ impl WorkflowContext {
     {
         crate::workflow2::ReplicatedVar::with_value(key, self, value).await
     }
+
+    /// Create a replicated variable from a computed value (side effect)
+    ///
+    /// This executes the provided computation once and stores the result
+    /// in the Raft cluster. Useful for side effects like API calls or database queries
+    /// that should only be executed once and have their results replicated.
+    pub async fn create_replicated_var_with_computation<T, F, Fut>(
+        &self,
+        key: &str,
+        compute: F,
+    ) -> Result<crate::workflow2::ReplicatedVar<T>, WorkflowError>
+    where
+        T: serde::Serialize + for<'de> serde::Deserialize<'de> + Clone + Send + Sync + 'static,
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = T> + Send + 'static,
+    {
+        crate::workflow2::ReplicatedVar::with_computation(key, self, compute).await
+    }
 }
 
 impl std::fmt::Debug for WorkflowContext {

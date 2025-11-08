@@ -158,6 +158,7 @@ mod tests {
     use super::*;
     use crate::raft::generic2::{InProcessNetwork, InProcessNetworkSender, TransportLayer, RaftNodeConfig};
     use crate::workflow2::WorkflowRuntime;
+    use crate::{checkpoint, checkpoint_compute};
     use std::sync::Arc;
     use tokio::sync::mpsc;
 

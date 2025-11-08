@@ -870,6 +870,7 @@ mod tests {
     use super::*;
     use crate::raft::generic2::{InProcessNetwork, InProcessNetworkSender, TransportLayer, RaftNodeConfig};
     use crate::workflow2::ReplicatedVar;
+    use crate::{checkpoint, checkpoint_compute};
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -944,9 +945,9 @@ mod tests {
                         return Ok(FibonacciOutput { result: 1 });
                     }
 
-                    // Use replicated variables for state
-                    let mut a = ReplicatedVar::with_value("a", &ctx, 0u64).await?;
-                    let mut b = ReplicatedVar::with_value("b", &ctx, 1u64).await?;
+                    // Use replicated variables for state (using macros)
+                    let mut a = checkpoint!(ctx, "a", 0u64);
+                    let mut b = checkpoint!(ctx, "b", 1u64);
 
                     for _ in 2..=input.n {
                         let next = a.get() + b.get();
@@ -1151,8 +1152,8 @@ mod tests {
                 "checkpoint_test",
                 1,
                 |input: FibonacciInput, ctx: WorkflowContext| async move {
-                    // Create multiple checkpoints to test owner/wait pattern
-                    let mut counter = ReplicatedVar::with_value("counter", &ctx, 0u64).await?;
+                    // Create multiple checkpoints to test owner/wait pattern (using macros)
+                    let mut counter = checkpoint!(ctx, "counter", 0u64);
 
                     for i in 1..=input.n {
                         counter.set(i as u64).await?;
