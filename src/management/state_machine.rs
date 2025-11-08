@@ -48,6 +48,12 @@ pub enum ManagementCommand {
         cluster_id: u32,
         key: String,
     },
+
+    /// Register a node's network address (for later use when adding to sub-clusters)
+    RegisterNodeAddress {
+        node_id: u64,
+        address: String,
+    },
 }
 
 /// Metadata for a sub-cluster
@@ -68,6 +74,9 @@ pub struct ManagementStateMachine {
 
     /// Next cluster ID to assign (starts at 1, 0 is reserved for management cluster)
     next_cluster_id: u32,
+
+    /// Node ID → network address mapping (for adding nodes to sub-clusters)
+    node_addresses: HashMap<u64, String>,
 }
 
 impl ManagementStateMachine {
@@ -76,6 +85,7 @@ impl ManagementStateMachine {
         Self {
             sub_clusters: HashMap::new(),
             next_cluster_id: 1, // Start at 1, 0 is reserved for management
+            node_addresses: HashMap::new(),
         }
     }
 
@@ -92,6 +102,11 @@ impl ManagementStateMachine {
     /// Get all sub-cluster metadata
     pub fn get_all_sub_clusters(&self) -> &HashMap<u32, SubClusterMetadata> {
         &self.sub_clusters
+    }
+
+    /// Get a node's network address
+    pub fn get_node_address(&self, node_id: &u64) -> Option<&String> {
+        self.node_addresses.get(node_id)
     }
 }
 
@@ -183,6 +198,12 @@ impl StateMachine for ManagementStateMachine {
                     Err(format!("Sub-cluster {} not found", cluster_id).into())
                 }
             }
+
+            ManagementCommand::RegisterNodeAddress { node_id, address } => {
+                self.node_addresses.insert(*node_id, address.clone());
+                // No event emitted for address registration (internal bookkeeping only)
+                Ok(vec![])
+            }
         }
     }
 
@@ -191,11 +212,13 @@ impl StateMachine for ManagementStateMachine {
         struct Snapshot {
             sub_clusters: HashMap<u32, SubClusterMetadata>,
             next_cluster_id: u32,
+            node_addresses: HashMap<u64, String>,
         }
 
         let snapshot = Snapshot {
             sub_clusters: self.sub_clusters.clone(),
             next_cluster_id: self.next_cluster_id,
+            node_addresses: self.node_addresses.clone(),
         };
 
         let snapshot_data = serde_json::to_vec(&snapshot)?;
@@ -207,11 +230,14 @@ impl StateMachine for ManagementStateMachine {
         struct Snapshot {
             sub_clusters: HashMap<u32, SubClusterMetadata>,
             next_cluster_id: u32,
+            #[serde(default)]
+            node_addresses: HashMap<u64, String>,
         }
 
         let snapshot: Snapshot = serde_json::from_slice(snapshot)?;
         self.sub_clusters = snapshot.sub_clusters;
         self.next_cluster_id = snapshot.next_cluster_id;
+        self.node_addresses = snapshot.node_addresses;
         Ok(())
     }
 }

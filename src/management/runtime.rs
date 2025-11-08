@@ -526,7 +526,31 @@ where
         address: String,
     ) -> Result<oneshot::Receiver<Result<(), String>>, String> {
         info!(self.logger, "Adding node to management cluster"; "node_id" => node_id, "address" => &address);
-        self.proposal_router.add_node(node_id, address).await
+
+        // Register the node's address for later use when adding to sub-clusters
+        let register_cmd = crate::management::state_machine::ManagementCommand::RegisterNodeAddress {
+            node_id,
+            address: address.clone(),
+        };
+
+        // Propose the address registration (fire and forget, no need to wait)
+        let _ = self.proposal_router.propose(register_cmd).await;
+
+        // Add the node to the management cluster's Raft configuration
+        let result = self.proposal_router.add_node(node_id, address).await;
+
+        // Also add the node to the default execution cluster (cluster_id=1)
+        // This will trigger a NodeAddedToSubCluster event, which will cause
+        // the owner of the execution cluster to add the node to its Raft configuration
+        info!(self.logger, "Proposing add node to default execution cluster"; "node_id" => node_id, "cluster_id" => 1);
+        let add_to_cluster_cmd = crate::management::state_machine::ManagementCommand::AddNodeToSubCluster {
+            cluster_id: 1,
+            node_id,
+        };
+        // Fire and forget - the event handler will take care of the actual Raft add
+        let _ = self.proposal_router.propose(add_to_cluster_cmd).await;
+
+        result
     }
 
     /// Remove a node from the management cluster
@@ -672,9 +696,132 @@ where
                                 "node_id" => node_id
                             );
 
-                            // TODO: Implement node addition to existing sub-cluster
-                            // If this is this node, we need to join
-                            // If we own the cluster, we need to add the node via proposal router
+                            // Case 1: If we own this sub-cluster, add the node to the Raft configuration
+                            if let Some(sub_cluster) = self.sub_clusters.lock().await.get(&cluster_id).cloned() {
+                                // Check if we're the owner of this sub-cluster
+                                if sub_cluster.node_id() == self.node_id {
+                                    // Owner responsibilities: add the node to the sub-cluster's Raft configuration
+                                    info!(self.logger, "This node owns sub-cluster, checking if leader";
+                                        "cluster_id" => cluster_id,
+                                        "owner_node_id" => sub_cluster.node_id()
+                                    );
+
+                                    // Get the node's address from the management state machine
+                                    let node_arc = self.proposal_router.node();
+                                    let node_guard = node_arc.lock().await;
+                                    let sm = node_guard.state_machine().clone();
+                                    drop(node_guard);
+
+                                    if let Some(address) = sm.lock().await.get_node_address(&node_id).cloned() {
+                                        info!(self.logger, "Adding node to sub-cluster Raft configuration";
+                                            "cluster_id" => cluster_id,
+                                            "node_id" => node_id,
+                                            "address" => &address
+                                        );
+
+                                        // Add the node to the sub-cluster (spawned to avoid blocking)
+                                        let sub_cluster_clone = sub_cluster.clone();
+                                        let logger_clone = self.logger.clone();
+                                        tokio::spawn(async move {
+                                            match sub_cluster_clone.add_node(node_id, address).await {
+                                                Ok(_rx) => {
+                                                    info!(logger_clone, "Successfully added node to sub-cluster";
+                                                        "cluster_id" => cluster_id,
+                                                        "node_id" => node_id
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    slog::error!(logger_clone, "Failed to add node to sub-cluster";
+                                                        "cluster_id" => cluster_id,
+                                                        "node_id" => node_id,
+                                                        "error" => e
+                                                    );
+                                                }
+                                            }
+                                        });
+                                    } else {
+                                        slog::error!(self.logger, "Node address not found in management state";
+                                            "node_id" => node_id
+                                        );
+                                    }
+                                }
+                            }
+                            // Case 2: If THIS node is the one being added, join the sub-cluster
+                            else if node_id == self.node_id {
+                                info!(self.logger, "This node is being added to sub-cluster, joining as new member";
+                                    "cluster_id" => cluster_id,
+                                    "node_id" => node_id
+                                );
+
+                                // Get the sub-cluster metadata to find all member nodes
+                                let node_arc = self.proposal_router.node();
+                                let node_guard = node_arc.lock().await;
+                                let sm = node_guard.state_machine().clone();
+                                drop(node_guard);
+
+                                if let Some(metadata) = sm.lock().await.get_sub_cluster(&cluster_id) {
+                                    info!(self.logger, "Joining multi-node sub-cluster";
+                                        "cluster_id" => cluster_id,
+                                        "node_ids" => ?metadata.node_ids
+                                    );
+
+                                    // Create a new mailbox for this sub-cluster
+                                    let (mailbox_tx, mailbox_rx) = mpsc::channel(100);
+
+                                    // Validate cluster_id (0 is reserved for management)
+                                    if cluster_id == 0 {
+                                        error!(self.logger, "Invalid cluster_id (cannot be 0)");
+                                        continue;
+                                    }
+
+                                    // Register cluster in cluster router
+                                    self.cluster_router.register_cluster(cluster_id, mailbox_tx).await;
+
+                                    // Create config for sub-cluster
+                                    let config = RaftNodeConfig {
+                                        node_id: self.node_id,
+                                        cluster_id,
+                                        snapshot_interval: 100,
+                                        ..Default::default()
+                                    };
+
+                                    // Create runtime joining existing cluster
+                                    let (runtime, node) = match R::new_joining_node(
+                                        config,
+                                        self.transport.clone(),
+                                        mailbox_rx,
+                                        metadata.node_ids.clone(),
+                                        self.shared_config.clone(),
+                                        self.logger.clone(),
+                                    ) {
+                                        Ok(pair) => pair,
+                                        Err(e) => {
+                                            let error_msg = e.to_string();
+                                            error!(self.logger, "Failed to create joining sub-cluster runtime";
+                                                "cluster_id" => cluster_id,
+                                                "error" => error_msg
+                                            );
+                                            continue;
+                                        }
+                                    };
+
+                                    // Store runtime
+                                    self.sub_clusters.lock().await.insert(cluster_id, Arc::new(runtime));
+
+                                    // Run node in background
+                                    tokio::spawn(async move {
+                                        let _ = RaftNode::run_from_arc(node).await;
+                                    });
+
+                                    info!(self.logger, "Sub-cluster runtime created successfully (joined existing cluster)";
+                                        "cluster_id" => cluster_id
+                                    );
+                                } else {
+                                    slog::error!(self.logger, "Sub-cluster metadata not found";
+                                        "cluster_id" => cluster_id
+                                    );
+                                }
+                            }
                         }
 
                         ManagementEvent::NodeRemovedFromSubCluster {

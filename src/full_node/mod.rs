@@ -343,6 +343,7 @@ impl FullNode {
                         let resp = response.into_inner();
                         if resp.success {
                             info!(logger, "Successfully added to management cluster via RPC");
+                            // The management cluster will automatically add us to the default execution cluster
                         } else {
                             info!(logger, "AddNode RPC returned error"; "error" => &resp.error);
                         }
