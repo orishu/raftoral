@@ -433,7 +433,7 @@ mod tests {
             .create_sub_cluster(vec![1, 2, 3])
             .await
             .expect("Create sub-cluster should succeed");
-        assert_eq!(cluster_id, 1); // First cluster should get ID 1
+        assert_eq!(cluster_id, 2); // Should get ID 2 (ID 1 is the default execution cluster)
 
         // Set metadata using the management runtime
         node.runtime()
@@ -543,7 +543,7 @@ mod tests {
             .expect("Create sub-cluster should succeed");
 
         println!("✓ Sub-cluster created with ID: {}", cluster_id);
-        assert_eq!(cluster_id, 1, "First sub-cluster should have ID 1");
+        assert_eq!(cluster_id, 2, "Sub-cluster should have ID 2 (ID 1 is the default execution cluster)");
 
         // Wait for both nodes to observe the sub-cluster creation event
         println!("\nWaiting for both nodes to observe sub-cluster creation...");
