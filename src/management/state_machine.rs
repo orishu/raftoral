@@ -108,6 +108,12 @@ impl ManagementStateMachine {
     pub fn get_node_address(&self, node_id: &u64) -> Option<&String> {
         self.node_addresses.get(node_id)
     }
+
+    /// Get mutable access to all sub-cluster metadata (for testing)
+    #[cfg(test)]
+    pub fn get_all_sub_clusters_mut(&mut self) -> &mut HashMap<u32, SubClusterMetadata> {
+        &mut self.sub_clusters
+    }
 }
 
 impl Default for ManagementStateMachine {
