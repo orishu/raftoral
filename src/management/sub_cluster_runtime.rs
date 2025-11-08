@@ -17,9 +17,9 @@ pub trait SubClusterRuntime: Send + Sync + 'static {
     /// The state machine type used by this runtime
     type StateMachine: crate::raft::generic2::StateMachine + Send + Sync + 'static;
 
-    /// The registry type used by this runtime (e.g., WorkflowRegistry for WorkflowRuntime)
-    /// This allows sharing registries across multiple runtime instances
-    type Registry: Send + Sync + 'static;
+    /// Shared configuration type for this runtime (e.g., WorkflowRegistry for WorkflowRuntime)
+    /// This allows sharing configuration/state across multiple runtime instances of the same type
+    type SharedConfig: Send + Sync + 'static;
 
     /// Create a new single-node cluster runtime
     ///
@@ -29,7 +29,7 @@ pub trait SubClusterRuntime: Send + Sync + 'static {
     /// * `config` - Raft node configuration
     /// * `transport` - Transport layer for network communication
     /// * `mailbox_rx` - Mailbox receiver for Raft messages
-    /// * `registry` - Shared registry for this runtime type
+    /// * `shared_config` - Shared configuration for this runtime type
     /// * `logger` - Logger instance
     ///
     /// # Returns
@@ -38,7 +38,7 @@ pub trait SubClusterRuntime: Send + Sync + 'static {
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
         mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
-        registry: Arc<Mutex<Self::Registry>>,
+        shared_config: Arc<Mutex<Self::SharedConfig>>,
         logger: Logger,
     ) -> Result<
         (Self, Arc<Mutex<RaftNode<Self::StateMachine>>>),
@@ -56,7 +56,7 @@ pub trait SubClusterRuntime: Send + Sync + 'static {
     /// * `transport` - Transport layer for network communication
     /// * `mailbox_rx` - Mailbox receiver for Raft messages
     /// * `initial_voters` - IDs of all nodes in the cluster (including this node)
-    /// * `registry` - Shared registry for this runtime type
+    /// * `shared_config` - Shared configuration for this runtime type
     /// * `logger` - Logger instance
     ///
     /// # Returns
@@ -66,7 +66,7 @@ pub trait SubClusterRuntime: Send + Sync + 'static {
         transport: Arc<dyn Transport>,
         mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
         initial_voters: Vec<u64>,
-        registry: Arc<Mutex<Self::Registry>>,
+        shared_config: Arc<Mutex<Self::SharedConfig>>,
         logger: Logger,
     ) -> Result<
         (Self, Arc<Mutex<RaftNode<Self::StateMachine>>>),

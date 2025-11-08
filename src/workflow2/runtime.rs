@@ -1218,19 +1218,19 @@ mod tests {
 // Implement SubClusterRuntime trait for WorkflowRuntime
 impl crate::management::SubClusterRuntime for WorkflowRuntime {
     type StateMachine = WorkflowStateMachine;
-    type Registry = WorkflowRegistry;
+    type SharedConfig = WorkflowRegistry;
 
     fn new_single_node(
         config: RaftNodeConfig,
         transport: Arc<dyn crate::raft::generic2::Transport>,
         mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
-        registry: Arc<Mutex<Self::Registry>>,
+        shared_config: Arc<Mutex<Self::SharedConfig>>,
         logger: slog::Logger,
     ) -> Result<
         (Self, Arc<Mutex<RaftNode<Self::StateMachine>>>),
         Box<dyn std::error::Error>,
     > {
-        WorkflowRuntime::new(config, transport, mailbox_rx, registry, logger)
+        WorkflowRuntime::new(config, transport, mailbox_rx, shared_config, logger)
     }
 
     fn new_joining_node(
@@ -1238,13 +1238,13 @@ impl crate::management::SubClusterRuntime for WorkflowRuntime {
         transport: Arc<dyn crate::raft::generic2::Transport>,
         mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
         initial_voters: Vec<u64>,
-        registry: Arc<Mutex<Self::Registry>>,
+        shared_config: Arc<Mutex<Self::SharedConfig>>,
         logger: slog::Logger,
     ) -> Result<
         (Self, Arc<Mutex<RaftNode<Self::StateMachine>>>),
         Box<dyn std::error::Error>,
     > {
-        WorkflowRuntime::new_joining_node(config, transport, mailbox_rx, initial_voters, registry, logger)
+        WorkflowRuntime::new_joining_node(config, transport, mailbox_rx, initial_voters, shared_config, logger)
     }
 
     async fn add_node(
