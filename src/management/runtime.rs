@@ -3,7 +3,10 @@
 //! Provides a high-level application interface for managing sub-cluster metadata
 //! built on the generic2 Raft infrastructure.
 
-use crate::management::{ManagementEvent, ManagementStateMachine, SubClusterRuntime};
+use crate::management::{
+    ClusterAction, ClusterManager, ClusterManagerConfig, ManagementEvent, ManagementStateMachine,
+    SubClusterRuntime,
+};
 use crate::raft::generic2::{ClusterRouter, EventBus, ProposalRouter, RaftNode, RaftNodeConfig, Transport};
 use slog::{info, Logger};
 use std::collections::HashMap;
@@ -43,6 +46,9 @@ where
 
     /// Shared configuration for sub-cluster runtimes
     shared_config: Arc<Mutex<R::SharedConfig>>,
+
+    /// Cluster manager for automatic topology decisions
+    cluster_manager: ClusterManager,
 
     /// Node ID
     node_id: u64,
@@ -132,6 +138,7 @@ where
             transport,
             sub_clusters: Arc::new(Mutex::new(HashMap::new())),
             shared_config,
+            cluster_manager: ClusterManager::new(ClusterManagerConfig::default()),
             node_id: config.node_id,
             cluster_id: config.cluster_id,
             logger: logger.clone(),
@@ -222,6 +229,7 @@ where
             transport,
             sub_clusters: Arc::new(Mutex::new(HashMap::new())),
             shared_config,
+            cluster_manager: ClusterManager::new(ClusterManagerConfig::default()),
             node_id: config.node_id,
             cluster_id: config.cluster_id,
             logger: logger.clone(),
@@ -326,10 +334,27 @@ where
                 node_id,
             };
 
-        self.proposal_router
+        let result = self
+            .proposal_router
             .propose_and_wait(command)
             .await
-            .map_err(|e| format!("{}", e))
+            .map_err(|e| format!("{}", e));
+
+        // After successful addition, check if any clusters need splitting
+        if result.is_ok() {
+            info!(self.logger, "Node added to sub-cluster, invoking ClusterManager to check for splits";
+                "cluster_id" => cluster_id,
+                "node_id" => node_id
+            );
+
+            let state = self.get_state_snapshot().await;
+            let actions = self.cluster_manager.decide_splits(&state);
+
+            // Execute any split actions
+            self.execute_actions(actions).await;
+        }
+
+        result
     }
 
     /// Remove a node from a sub-cluster
@@ -357,10 +382,27 @@ where
                 node_id,
             };
 
-        self.proposal_router
+        let result = self
+            .proposal_router
             .propose_and_wait(command)
             .await
-            .map_err(|e| format!("{}", e))
+            .map_err(|e| format!("{}", e));
+
+        // After successful removal, check if consolidation is needed
+        if result.is_ok() {
+            info!(self.logger, "Node removed from sub-cluster, invoking ClusterManager to check for consolidation";
+                "cluster_id" => cluster_id,
+                "node_id" => node_id
+            );
+
+            let state = self.get_state_snapshot().await;
+            let actions = self.cluster_manager.decide_consolidation(&state);
+
+            // Execute any consolidation actions
+            self.execute_actions(actions).await;
+        }
+
+        result
     }
 
     /// Set metadata for a sub-cluster
@@ -512,6 +554,106 @@ where
         self.cluster_id
     }
 
+    /// Get a snapshot of the current management state
+    ///
+    /// This is used by ClusterManager to make decisions based on current state.
+    async fn get_state_snapshot(&self) -> ManagementStateMachine {
+        let node = self.proposal_router.node();
+        let node_guard = node.lock().await;
+        let state = node_guard.state_machine().clone();
+        drop(node_guard);
+        let snapshot = state.lock().await.clone();
+        snapshot
+    }
+
+    /// Execute cluster actions by proposing corresponding commands
+    ///
+    /// This helper translates ClusterActions from ClusterManager into
+    /// ManagementCommands that are proposed via Raft.
+    async fn execute_actions(&self, actions: Vec<ClusterAction>) {
+        Self::execute_actions_static(
+            self.proposal_router.clone(),
+            self.logger.clone(),
+            actions,
+        )
+        .await
+    }
+
+    /// Static helper to execute cluster actions
+    ///
+    /// This is a standalone function that can be called from spawned tasks
+    /// without requiring a reference to ManagementRuntime.
+    async fn execute_actions_static(
+        proposal_router: Arc<ProposalRouter<ManagementStateMachine>>,
+        logger: Logger,
+        actions: Vec<ClusterAction>,
+    ) {
+        use slog::info;
+
+        for action in actions {
+            match action {
+                ClusterAction::AddNodeToCluster { cluster_id, node_id } => {
+                    info!(logger, "ClusterManager action: AddNodeToCluster";
+                        "cluster_id" => cluster_id,
+                        "node_id" => node_id
+                    );
+                    let command = crate::management::state_machine::ManagementCommand::AddNodeToSubCluster {
+                        cluster_id,
+                        node_id,
+                    };
+                    let _ = proposal_router.propose(command).await;
+                }
+
+                ClusterAction::CreateCluster { node_ids } => {
+                    info!(logger, "ClusterManager action: CreateCluster";
+                        "node_ids" => ?node_ids
+                    );
+                    let command = crate::management::state_machine::ManagementCommand::CreateSubCluster {
+                        node_ids,
+                    };
+                    let _ = proposal_router.propose(command).await;
+                }
+
+                ClusterAction::RemoveNodesFromCluster { cluster_id, node_ids } => {
+                    info!(logger, "ClusterManager action: RemoveNodesFromCluster";
+                        "cluster_id" => cluster_id,
+                        "node_ids" => ?node_ids
+                    );
+                    // Propose multiple RemoveNodeFromSubCluster commands
+                    for node_id in node_ids {
+                        let cmd = crate::management::state_machine::ManagementCommand::RemoveNodeFromSubCluster {
+                            cluster_id,
+                            node_id,
+                        };
+                        let _ = proposal_router.propose(cmd).await;
+                    }
+                }
+
+                ClusterAction::DrainCluster { cluster_id } => {
+                    info!(logger, "ClusterManager action: DrainCluster";
+                        "cluster_id" => cluster_id
+                    );
+                    let command = crate::management::state_machine::ManagementCommand::SetMetadata {
+                        cluster_id,
+                        key: "draining".to_string(),
+                        value: "true".to_string(),
+                    };
+                    let _ = proposal_router.propose(command).await;
+                }
+
+                ClusterAction::DestroyCluster { cluster_id } => {
+                    info!(logger, "ClusterManager action: DestroyCluster";
+                        "cluster_id" => cluster_id
+                    );
+                    let command = crate::management::state_machine::ManagementCommand::DeleteSubCluster {
+                        cluster_id,
+                    };
+                    let _ = proposal_router.propose(command).await;
+                }
+            }
+        }
+    }
+
     /// Add a node to the management cluster
     ///
     /// # Arguments
@@ -539,16 +681,34 @@ where
         // Add the node to the management cluster's Raft configuration
         let result = self.proposal_router.add_node(node_id, address).await;
 
-        // Also add the node to the default execution cluster (cluster_id=1)
-        // This will trigger a NodeAddedToSubCluster event, which will cause
-        // the owner of the execution cluster to add the node to its Raft configuration
-        info!(self.logger, "Proposing add node to default execution cluster"; "node_id" => node_id, "cluster_id" => 1);
-        let add_to_cluster_cmd = crate::management::state_machine::ManagementCommand::AddNodeToSubCluster {
-            cluster_id: 1,
-            node_id,
-        };
-        // Fire and forget - the event handler will take care of the actual Raft add
-        let _ = self.proposal_router.propose(add_to_cluster_cmd).await;
+        // Spawn background task to invoke ClusterManager after Raft operation completes
+        if result.is_ok() {
+            let proposal_router = self.proposal_router.clone();
+            let cluster_manager = self.cluster_manager.clone();
+            let logger = self.logger.clone();
+
+            tokio::spawn(async move {
+                // Wait briefly for the Raft operation to be applied
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+                info!(logger, "Node added to management cluster, invoking ClusterManager for placement decision"; "node_id" => node_id);
+
+                // Get state snapshot and decide placement
+                let state = {
+                    let node = proposal_router.node();
+                    let node_guard = node.lock().await;
+                    let state = node_guard.state_machine().clone();
+                    drop(node_guard);
+                    let snapshot = state.lock().await.clone();
+                    snapshot
+                };
+
+                let actions = cluster_manager.decide_node_placement(&state, node_id);
+
+                // Execute the placement actions
+                ManagementRuntime::<R>::execute_actions_static(proposal_router, logger, actions).await;
+            });
+        }
 
         result
     }
@@ -565,7 +725,38 @@ where
         node_id: u64,
     ) -> Result<oneshot::Receiver<Result<(), String>>, String> {
         info!(self.logger, "Removing node from management cluster"; "node_id" => node_id);
-        self.proposal_router.remove_node(node_id).await
+        let result = self.proposal_router.remove_node(node_id).await;
+
+        // Spawn background task to invoke ClusterManager after Raft operation completes
+        if result.is_ok() {
+            let proposal_router = self.proposal_router.clone();
+            let cluster_manager = self.cluster_manager.clone();
+            let logger = self.logger.clone();
+
+            tokio::spawn(async move {
+                // Wait briefly for the Raft operation to be applied
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+                info!(logger, "Node removed from management cluster, invoking ClusterManager for rebalancing decision"; "node_id" => node_id);
+
+                // Get state snapshot and decide rebalancing
+                let state = {
+                    let node = proposal_router.node();
+                    let node_guard = node.lock().await;
+                    let state = node_guard.state_machine().clone();
+                    drop(node_guard);
+                    let snapshot = state.lock().await.clone();
+                    snapshot
+                };
+
+                let actions = cluster_manager.decide_rebalancing(&state, node_id);
+
+                // Execute the rebalancing actions
+                ManagementRuntime::<R>::execute_actions_static(proposal_router, logger, actions).await;
+            });
+        }
+
+        result
     }
 
     /// Run event observer for dynamic sub-cluster management (private background task)

@@ -67,7 +67,7 @@ pub struct SubClusterMetadata {
 }
 
 /// Management state machine that tracks sub-cluster metadata
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ManagementStateMachine {
     /// Sub-cluster ID → metadata
     sub_clusters: HashMap<u32, SubClusterMetadata>,

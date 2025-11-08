@@ -5,7 +5,6 @@
 //! snapshots and returning action lists.
 
 use crate::management::state_machine::{ManagementStateMachine, SubClusterMetadata};
-use std::collections::HashMap;
 
 /// Policy configuration for cluster management
 #[derive(Debug, Clone)]
@@ -64,6 +63,7 @@ pub enum ClusterAction {
 }
 
 /// Pure logic cluster manager
+#[derive(Clone)]
 pub struct ClusterManager {
     config: ClusterManagerConfig,
 }
@@ -178,7 +178,7 @@ impl ClusterManager {
         let mut actions = Vec::new();
 
         // Find undersized non-draining clusters
-        let mut undersized: Vec<_> = clusters
+        let undersized: Vec<_> = clusters
             .iter()
             .filter(|(_, meta)| {
                 !Self::is_draining(meta) && meta.node_ids.len() < self.config.min_cluster_size
@@ -198,7 +198,7 @@ impl ClusterManager {
 
         // For each undersized cluster, try to add a node from an oversized cluster
         for (undersized_cluster_id, _) in undersized {
-            if let Some((source_cluster_id, source_metadata)) = oversized.first() {
+            if let Some((_source_cluster_id, source_metadata)) = oversized.first() {
                 // Pick first node from source cluster (deterministic)
                 if let Some(&node_id) = source_metadata.node_ids.first() {
                     actions.push(ClusterAction::AddNodeToCluster {
@@ -289,6 +289,7 @@ impl ClusterManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     // Helper to create state with clusters
     fn create_state_with_clusters(clusters: Vec<(u32, Vec<u64>)>) -> ManagementStateMachine {
