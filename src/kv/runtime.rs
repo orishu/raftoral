@@ -128,14 +128,18 @@ impl KvRuntime {
             "initial_voters" => ?initial_voters
         );
 
+        // Create ConfState with all nodes as voters
+        use raft::prelude::ConfState;
+        let conf_state = ConfState::from((initial_voters, vec![]));
+
         // Create RaftNode for joining a multi-node cluster with known peers
-        let node = RaftNode::new_multi_node_with_peers(
+        let node = RaftNode::new_with_conf_state(
             config.clone(),
             transport.clone(),
             mailbox_rx,
             state_machine,
             event_bus.clone(),
-            initial_voters,
+            conf_state,
             logger.clone(),
         )?;
 

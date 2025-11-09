@@ -154,6 +154,65 @@ where
         Ok((runtime, node_arc))
     }
 
+    /// Common helper for creating a Management runtime from an already-constructed RaftNode
+    ///
+    /// This private function contains the shared logic for wrapping a RaftNode in a
+    /// ManagementRuntime with ProposalRouter and event observer.
+    fn new_from_node(
+        config: RaftNodeConfig,
+        transport: Arc<dyn Transport>,
+        cluster_router: Arc<ClusterRouter>,
+        shared_config: Arc<Mutex<R::SharedConfig>>,
+        node: RaftNode<ManagementStateMachine>,
+        event_bus: Arc<EventBus<ManagementEvent>>,
+        logger: Logger,
+    ) -> (
+        Arc<Self>,
+        Arc<Mutex<RaftNode<ManagementStateMachine>>>,
+    )
+    where
+        R: SubClusterRuntime,
+    {
+        let node_arc = Arc::new(Mutex::new(node));
+
+        // Create ProposalRouter
+        let proposal_router = Arc::new(ProposalRouter::new(
+            node_arc.clone(),
+            transport.clone(),
+            config.cluster_id,
+            config.node_id,
+            logger.clone(),
+        ));
+
+        // Start leader tracker in background
+        let router_clone = proposal_router.clone();
+        tokio::spawn(async move {
+            router_clone.run_leader_tracker().await;
+        });
+
+        let runtime = Arc::new(Self {
+            proposal_router,
+            event_bus: event_bus.clone(),
+            cluster_router,
+            transport,
+            sub_clusters: Arc::new(Mutex::new(HashMap::new())),
+            shared_config,
+            cluster_manager: ClusterManager::new(ClusterManagerConfig::default()),
+            node_id: config.node_id,
+            cluster_id: config.cluster_id,
+            logger: logger.clone(),
+            _phantom: PhantomData,
+        });
+
+        // Start event observer in background
+        let runtime_clone = runtime.clone();
+        tokio::spawn(async move {
+            runtime_clone.run_event_observer().await;
+        });
+
+        (runtime, node_arc)
+    }
+
     /// Create a new Management runtime for a node joining an existing cluster
     ///
     /// # Arguments
@@ -194,55 +253,30 @@ where
             "initial_voters" => ?initial_voters
         );
 
+        // Create ConfState with all nodes as voters
+        use raft::prelude::ConfState;
+        let conf_state = ConfState::from((initial_voters, vec![]));
+
         // Create RaftNode for joining a multi-node cluster with known peers
-        let node = RaftNode::new_multi_node_with_peers(
+        let node = RaftNode::new_with_conf_state(
             config.clone(),
             transport.clone(),
             mailbox_rx,
             state_machine,
             event_bus.clone(),
-            initial_voters,
+            conf_state,
             logger.clone(),
         )?;
 
-        let node_arc = Arc::new(Mutex::new(node));
-
-        // Create ProposalRouter
-        let proposal_router = Arc::new(ProposalRouter::new(
-            node_arc.clone(),
-            transport.clone(),
-            config.cluster_id,
-            config.node_id,
-            logger.clone(),
-        ));
-
-        // Start leader tracker in background
-        let router_clone = proposal_router.clone();
-        tokio::spawn(async move {
-            router_clone.run_leader_tracker().await;
-        });
-
-        let runtime = Arc::new(Self {
-            proposal_router,
-            event_bus: event_bus.clone(),
-            cluster_router,
+        Ok(Self::new_from_node(
+            config,
             transport,
-            sub_clusters: Arc::new(Mutex::new(HashMap::new())),
+            cluster_router,
             shared_config,
-            cluster_manager: ClusterManager::new(ClusterManagerConfig::default()),
-            node_id: config.node_id,
-            cluster_id: config.cluster_id,
-            logger: logger.clone(),
-            _phantom: PhantomData,
-        });
-
-        // Start event observer in background
-        let runtime_clone = runtime.clone();
-        tokio::spawn(async move {
-            runtime_clone.run_event_observer().await;
-        });
-
-        Ok((runtime, node_arc))
+            node,
+            event_bus,
+            logger,
+        ))
     }
 
     /// Create a new Management runtime for a node joining an existing cluster as a LEARNER
@@ -323,44 +357,15 @@ where
             logger.clone(),
         )?;
 
-        let node_arc = Arc::new(Mutex::new(node));
-
-        // Create ProposalRouter
-        let proposal_router = Arc::new(ProposalRouter::new(
-            node_arc.clone(),
-            transport.clone(),
-            config.cluster_id,
-            config.node_id,
-            logger.clone(),
-        ));
-
-        // Start leader tracker in background
-        let router_clone = proposal_router.clone();
-        tokio::spawn(async move {
-            router_clone.run_leader_tracker().await;
-        });
-
-        let runtime = Arc::new(Self {
-            proposal_router,
-            event_bus: event_bus.clone(),
-            cluster_router,
+        Ok(Self::new_from_node(
+            config,
             transport,
-            sub_clusters: Arc::new(Mutex::new(HashMap::new())),
+            cluster_router,
             shared_config,
-            cluster_manager: ClusterManager::new(ClusterManagerConfig::default()),
-            node_id: config.node_id,
-            cluster_id: config.cluster_id,
-            logger: logger.clone(),
-            _phantom: PhantomData,
-        });
-
-        // Start event observer in background
-        let runtime_clone = runtime.clone();
-        tokio::spawn(async move {
-            runtime_clone.run_event_observer().await;
-        });
-
-        Ok((runtime, node_arc))
+            node,
+            event_bus,
+            logger,
+        ))
     }
 
     /// Create a new sub-cluster

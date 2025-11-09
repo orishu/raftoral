@@ -194,66 +194,7 @@ impl<SM: StateMachine> RaftNode<SM> {
         event_bus: Arc<EventBus<SM::Event>>,
         logger: Logger,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::new_multi_node_with_peers(config, transport, message_rx, state_machine, event_bus, vec![], logger)
-    }
-
-    /// Create a new RaftNode for multi-node cluster with specified initial peers
-    ///
-    /// This allows a node to start with knowledge of other nodes in the cluster.
-    /// Use this when a node is joining an existing cluster where the membership is known.
-    ///
-    /// # Arguments
-    /// * `initial_voters` - IDs of all nodes that should be voters (including this node)
-    pub fn new_multi_node_with_peers(
-        config: RaftNodeConfig,
-        transport: Arc<dyn Transport>,
-        message_rx: mpsc::Receiver<GenericMessage>,
-        state_machine: SM,
-        event_bus: Arc<EventBus<SM::Event>>,
-        initial_voters: Vec<u64>,
-        logger: Logger,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let storage = if initial_voters.is_empty() {
-            MemStorageWithSnapshot::default()
-        } else {
-            MemStorageWithSnapshot::new_with_conf_state(ConfState::from((initial_voters.clone(), vec![])))
-        };
-
-        let raft_config = Config {
-            id: config.node_id,
-            election_tick: config.election_tick,
-            heartbeat_tick: config.heartbeat_tick,
-            check_quorum: config.check_quorum,
-            pre_vote: config.pre_vote,
-            ..Default::default()
-        };
-
-        let raw_node = RawNode::new(&raft_config, storage, &logger)?;
-        let (role_change_tx, _) = broadcast::channel(16);
-
-        let initial_conf_state = if initial_voters.is_empty() {
-            ConfState::default()
-        } else {
-            ConfState::from((initial_voters, vec![]))
-        };
-
-        Ok(Self {
-            node_id: config.node_id,
-            cluster_id: config.cluster_id,
-            raw_node,
-            transport,
-            message_rx,
-            state_machine: Arc::new(Mutex::new(state_machine)),
-            event_bus,
-            current_role: Arc::new(Mutex::new(StateRole::Follower)),
-            role_change_tx,
-            committed_index: Arc::new(Mutex::new(0)),
-            cached_conf_state: Arc::new(Mutex::new(initial_conf_state)),
-            pending_proposals: Arc::new(Mutex::new(HashMap::new())),
-            snapshot_interval: config.snapshot_interval,
-            last_snapshot_index: Arc::new(Mutex::new(0)),
-            logger,
-        })
+        Self::new_with_conf_state(config, transport, message_rx, state_machine, event_bus, ConfState::default(), logger)
     }
 
     /// Create a new RaftNode with explicit ConfState (supports learners)
