@@ -10,13 +10,13 @@
 #
 # Architecture:
 # - Management Cluster (cluster_id=0): Both nodes participate for cluster coordination
-# - Execution Cluster (cluster_id=1): Currently only Node 1 (created during bootstrap)
+# - Execution Cluster (cluster_id=1): Automatically created and managed by ClusterManager
 # - Shared Workflow Registry: Both nodes can register and execute workflows
 #
-# Note: The default execution cluster is created with only the bootstrap node.
-# To have both nodes participate in workflow execution, you would need to add Node 2
-# to the execution cluster after it joins. This script focuses on demonstrating
-# the automatic node discovery and joining mechanism.
+# Note: ClusterManager automatically creates execution clusters and assigns nodes to them.
+# The bootstrap node triggers cluster creation when it adds itself to the management cluster.
+# Joining nodes are automatically added to existing clusters based on ClusterManager's
+# placement policy (prefers adding to clusters below target size before creating new ones).
 #
 # Prerequisites:
 #   - grpcurl must be installed (brew install grpcurl)
@@ -80,13 +80,13 @@ RUST_LOG=info cargo run --bin raftoral -- \
 NODE1_PID=$!
 echo -e "${GREEN}✓ Node 1 started (PID: $NODE1_PID)${NC}"
 
-# Wait for node 1 to be ready and create default execution cluster
-echo -e "${YELLOW}Waiting for Node 1 to initialize and create execution cluster...${NC}"
+# Wait for node 1 to be ready and for ClusterManager to create execution cluster
+echo -e "${YELLOW}Waiting for Node 1 to initialize and ClusterManager to create execution cluster...${NC}"
 sleep 4
 
 # Verify node 1 is ready
-if grep -q "Default execution cluster created" /tmp/raftoral_node1.log; then
-    echo -e "${GREEN}✓ Node 1 execution cluster ready${NC}"
+if grep -q "ClusterManager action: CreateCluster" /tmp/raftoral_node1.log; then
+    echo -e "${GREEN}✓ Node 1 execution cluster created by ClusterManager${NC}"
 elif grep -q "FullNode started" /tmp/raftoral_node1.log; then
     echo -e "${GREEN}✓ Node 1 started${NC}"
 else
@@ -130,8 +130,8 @@ else
     echo -e "${RED}⚠ Node 2 did not attempt to join${NC}"
 fi
 
-# Wait for cluster to fully stabilize
-echo -e "\n${YELLOW}Waiting for both clusters (management + execution) to stabilize...${NC}"
+# Wait for cluster to fully stabilize and for ClusterManager to add Node 2 to execution cluster
+echo -e "\n${YELLOW}Waiting for clusters to stabilize and ClusterManager to assign Node 2...${NC}"
 sleep 6
 
 # Verify workflow registry on both nodes
@@ -221,11 +221,12 @@ echo -e "\n${BLUE}=== Final Cluster Status ===${NC}\n"
 echo -e "${YELLOW}Node 1 (bootstrap):${NC}"
 echo -e "  - Management cluster leader: $(grep -q 'became leader' /tmp/raftoral_node1.log && echo 'YES' || echo 'NO')"
 echo -e "  - Workflow registered: $(grep -q 'Registered ping_pong' /tmp/raftoral_node1.log && echo 'YES' || echo 'NO')"
-echo -e "  - Default execution cluster: $(grep -q 'Default execution cluster created' /tmp/raftoral_node1.log && echo 'CREATED' || echo 'UNKNOWN')"
+echo -e "  - Execution cluster (ClusterManager): $(grep -q 'ClusterManager action: CreateCluster' /tmp/raftoral_node1.log && echo 'CREATED' || echo 'UNKNOWN')"
 
 echo -e "\n${YELLOW}Node 2 (joined):${NC}"
 echo -e "  - Discovered peers: $(grep -q 'Assigned node ID' /tmp/raftoral_node2.log && echo 'YES' || echo 'NO')"
 echo -e "  - Joined management cluster: $(grep -q 'Successfully added to management cluster' /tmp/raftoral_node2.log && echo 'YES' || echo 'UNKNOWN')"
+echo -e "  - Added to execution cluster: $(grep -q 'ClusterManager action: AddNodeToCluster' /tmp/raftoral_node1.log && echo 'YES (by ClusterManager)' || echo 'UNKNOWN')"
 echo -e "  - Workflow registered: $(grep -q 'Registered ping_pong' /tmp/raftoral_node2.log && echo 'YES' || echo 'NO')"
 
 echo -e "\n${BLUE}=== Test Complete ===${NC}"

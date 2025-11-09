@@ -112,11 +112,17 @@ impl FullNode {
         // Wait for leader election to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
 
-        // Create default execution cluster (cluster_id=1) with this node
-        info!(logger, "Creating default execution cluster");
-        let _cluster_id = runtime.create_sub_cluster(vec![node_id]).await
-            .map_err(|e| format!("Failed to create default execution cluster: {}", e))?;
-        info!(logger, "Default execution cluster created"; "cluster_id" => 1);
+        // Bootstrap node should add itself to trigger ClusterManager
+        // This creates the first execution cluster with this node
+        info!(logger, "Bootstrap node adding itself to management cluster to trigger ClusterManager");
+        let add_rx = runtime.add_node(node_id, address.clone()).await?;
+
+        // Wait for the operation to complete
+        match add_rx.await {
+            Ok(Ok(_)) => info!(logger, "Bootstrap node successfully added to management cluster"),
+            Ok(Err(e)) => return Err(format!("Failed to add bootstrap node: {}", e).into()),
+            Err(e) => return Err(format!("Add node oneshot error: {}", e).into()),
+        }
 
         // Layer 0: Start gRPC server
         let grpc_server = Arc::new(GrpcServer::new(
@@ -343,7 +349,7 @@ impl FullNode {
                         let resp = response.into_inner();
                         if resp.success {
                             info!(logger, "Successfully added to management cluster via RPC");
-                            // The management cluster will automatically add us to the default execution cluster
+                            // ClusterManager will automatically assign us to an execution cluster
                         } else {
                             info!(logger, "AddNode RPC returned error"; "error" => &resp.error);
                         }
@@ -424,16 +430,19 @@ mod tests {
         .await
         .expect("Failed to create FullNode");
 
-        // Wait for node to become leader
+        // Wait for node to become leader and bootstrap to complete
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         assert!(node.is_leader().await, "Node should be leader");
+
+        // Note: ClusterManager automatically created cluster_id=1 during bootstrap
+        // when the node added itself to the management cluster
 
         // Create a sub-cluster using the management runtime
         let cluster_id = node.runtime()
             .create_sub_cluster(vec![1, 2, 3])
             .await
             .expect("Create sub-cluster should succeed");
-        assert_eq!(cluster_id, 2); // Should get ID 2 (ID 1 is the default execution cluster)
+        assert_eq!(cluster_id, 2); // Should get ID 2 (ID 1 was auto-created by ClusterManager)
 
         // Set metadata using the management runtime
         node.runtime()
@@ -531,43 +540,47 @@ mod tests {
             Err(e) => println!("⚠ Add node oneshot error: {}", e),
         }
 
-        // Wait for cluster to stabilize
-        println!("\nWaiting for cluster to stabilize...");
+        // Wait for ClusterManager to automatically create/assign execution clusters
+        println!("\nWaiting for ClusterManager to create execution clusters...");
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-        // Create a sub-cluster from node 1 (the leader)
-        println!("\nCreating sub-cluster with nodes [1, 2] via Node 1...");
-        let cluster_id = node1.runtime()
-            .create_sub_cluster(vec![1, 2])
-            .await
-            .expect("Create sub-cluster should succeed");
+        // Verify that ClusterManager automatically created execution cluster(s)
+        println!("\nVerifying ClusterManager created execution clusters...");
+        let all_clusters = node1.runtime()
+            .list_sub_clusters()
+            .await;
 
-        println!("✓ Sub-cluster created with ID: {}", cluster_id);
-        assert_eq!(cluster_id, 2, "Sub-cluster should have ID 2 (ID 1 is the default execution cluster)");
+        println!("✓ ClusterManager created {} execution cluster(s): {:?}",
+                 all_clusters.len(), all_clusters);
 
-        // Wait for both nodes to observe the sub-cluster creation event
-        println!("\nWaiting for both nodes to observe sub-cluster creation...");
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        // ClusterManager should have created at least one cluster
+        assert!(!all_clusters.is_empty(), "ClusterManager should have created at least one execution cluster");
 
-        // Verify node 1 has the sub-cluster
-        println!("\nVerifying Node 1 observed sub-cluster...");
+        // Get the first cluster for verification
+        let cluster_id = all_clusters[0];
+
+        println!("\nVerifying cluster {} contains both nodes...", cluster_id);
         let metadata1 = node1.runtime()
             .get_sub_cluster(&cluster_id)
             .await
             .expect("Node 1 should have sub-cluster metadata");
-        println!("✓ Node 1 metadata: node_ids={:?}", metadata1.node_ids);
-        assert_eq!(metadata1.node_ids, vec![1, 2]);
+        println!("✓ Cluster {} nodes: {:?}", cluster_id, metadata1.node_ids);
 
-        // Verify node 2 has the sub-cluster
-        println!("\nVerifying Node 2 observed sub-cluster...");
+        // Both nodes should be in the same execution cluster (since cluster size 2 < target size 3)
+        assert_eq!(metadata1.node_ids.len(), 2, "Cluster should have both nodes");
+        assert!(metadata1.node_ids.contains(&1), "Cluster should contain node 1");
+        assert!(metadata1.node_ids.contains(&2), "Cluster should contain node 2");
+
+        // Verify node 2 can also see the clusters
+        println!("\nVerifying Node 2 observed clusters...");
         let metadata2 = node2.runtime()
             .get_sub_cluster(&cluster_id)
             .await
             .expect("Node 2 should have sub-cluster metadata");
         println!("✓ Node 2 metadata: node_ids={:?}", metadata2.node_ids);
-        assert_eq!(metadata2.node_ids, vec![1, 2]);
+        assert_eq!(metadata2.node_ids, metadata1.node_ids, "Both nodes should see the same cluster membership");
 
-        println!("\n✓ Both nodes successfully observed the sub-cluster creation!");
+        println!("\n✓ ClusterManager successfully created and assigned both nodes to the same execution cluster!");
 
         println!("\n=== Test complete - shutting down nodes ===");
 
