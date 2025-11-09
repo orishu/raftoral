@@ -20,6 +20,9 @@ pub mod server;
 pub mod state_machine;
 pub mod transport;
 
+#[cfg(feature = "persistent-storage")]
+pub mod rocksdb_storage;
+
 pub use cluster_router::ClusterRouter;
 pub use errors::{TransportError, RoutingError};
 pub use event_bus::EventBus;
