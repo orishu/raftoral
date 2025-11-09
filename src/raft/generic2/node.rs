@@ -256,6 +256,84 @@ impl<SM: StateMachine> RaftNode<SM> {
         })
     }
 
+    /// Create a new RaftNode with explicit ConfState (supports learners)
+    ///
+    /// This constructor allows creating a node with an explicit configuration
+    /// that includes both voters and learners. This is used when a node needs
+    /// to join as a learner in the management cluster.
+    ///
+    /// # Arguments
+    /// * `config` - Node configuration (ID, cluster ID, etc.)
+    /// * `transport` - Transport layer for network communication
+    /// * `message_rx` - Receiver for incoming Raft messages
+    /// * `state_machine` - State machine implementation
+    /// * `event_bus` - Event bus for state changes
+    /// * `conf_state` - Explicit configuration state with voters and learners
+    /// * `logger` - Logger instance
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use raftoral::raft::generic2::*;
+    /// # use raft::prelude::ConfState;
+    /// # use std::sync::Arc;
+    /// # use tokio::sync::mpsc;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let conf_state = ConfState {
+    ///     voters: vec![1, 2, 3],       // Existing voters
+    ///     learners: vec![4],            // This node joins as learner
+    ///     ..Default::default()
+    /// };
+    ///
+    /// // Node 4 joins as a learner
+    /// let (runtime, node) = ManagementRuntime::new_joining_learner(
+    ///     config, transport, mailbox_rx, conf_state, registry, logger
+    /// )?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new_with_conf_state(
+        config: RaftNodeConfig,
+        transport: Arc<dyn Transport>,
+        message_rx: mpsc::Receiver<GenericMessage>,
+        state_machine: SM,
+        event_bus: Arc<EventBus<SM::Event>>,
+        conf_state: ConfState,
+        logger: Logger,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Use the provided conf_state for storage initialization
+        let storage = MemStorageWithSnapshot::new_with_conf_state(conf_state.clone());
+
+        let raft_config = Config {
+            id: config.node_id,
+            election_tick: config.election_tick,
+            heartbeat_tick: config.heartbeat_tick,
+            check_quorum: config.check_quorum,
+            pre_vote: config.pre_vote,
+            ..Default::default()
+        };
+
+        let raw_node = RawNode::new(&raft_config, storage, &logger)?;
+        let (role_change_tx, _) = broadcast::channel(16);
+
+        Ok(Self {
+            node_id: config.node_id,
+            cluster_id: config.cluster_id,
+            raw_node,
+            transport,
+            message_rx,
+            state_machine: Arc::new(Mutex::new(state_machine)),
+            event_bus,
+            current_role: Arc::new(Mutex::new(StateRole::Follower)),
+            role_change_tx,
+            committed_index: Arc::new(Mutex::new(0)),
+            cached_conf_state: Arc::new(Mutex::new(conf_state)),
+            pending_proposals: Arc::new(Mutex::new(HashMap::new())),
+            snapshot_interval: config.snapshot_interval,
+            last_snapshot_index: Arc::new(Mutex::new(0)),
+            logger,
+        })
+    }
+
     /// Subscribe to role change notifications
     pub fn subscribe_role_changes(&self) -> broadcast::Receiver<RoleChange> {
         self.role_change_tx.subscribe()

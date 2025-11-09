@@ -526,6 +526,43 @@ where
         self.sub_clusters.lock().await.get(cluster_id).cloned()
     }
 
+    /// Check if a node is a voter in the management cluster
+    ///
+    /// # Arguments
+    /// * `node_id` - ID of the node to check
+    ///
+    /// # Returns
+    /// * `true` if the node is a voter
+    /// * `false` if the node is a learner or not in the cluster
+    pub async fn is_management_voter(&self, node_id: u64) -> bool {
+        let node = self.proposal_router.node();
+        let node_guard = node.lock().await;
+        let conf_state = node_guard.conf_state().await;
+        conf_state.voters.contains(&node_id)
+    }
+
+    /// Get all voters in the management cluster
+    ///
+    /// # Returns
+    /// Vector of node IDs that are voters in the management cluster
+    pub async fn get_management_voters(&self) -> Vec<u64> {
+        let node = self.proposal_router.node();
+        let node_guard = node.lock().await;
+        let conf_state = node_guard.conf_state().await;
+        conf_state.voters.clone()
+    }
+
+    /// Get all learners in the management cluster
+    ///
+    /// # Returns
+    /// Vector of node IDs that are learners in the management cluster
+    pub async fn get_management_learners(&self) -> Vec<u64> {
+        let node = self.proposal_router.node();
+        let node_guard = node.lock().await;
+        let conf_state = node_guard.conf_state().await;
+        conf_state.learners.clone()
+    }
+
     /// Subscribe to management events
     ///
     /// # Returns
