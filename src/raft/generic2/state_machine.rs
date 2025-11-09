@@ -36,6 +36,17 @@ pub trait StateMachine: Send + Sync {
     ///
     /// Called when Raft needs to restore from a snapshot (e.g., new node joining).
     fn restore(&mut self, snapshot: &[u8]) -> Result<(), Box<dyn std::error::Error>>;
+
+    /// Handle a failed follower node detection
+    ///
+    /// Called by RaftNode when it detects that a follower hasn't made progress
+    /// within the configured timeout. State machines can override this to emit
+    /// events for handling the failure (e.g., removing the node from sub-clusters).
+    ///
+    /// Default implementation returns no events (failure detection disabled).
+    fn on_follower_failed(&mut self, _node_id: u64) -> Vec<Self::Event> {
+        vec![] // Default: no failure detection events
+    }
 }
 
 // ============================================================================

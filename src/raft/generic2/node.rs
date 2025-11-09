@@ -46,6 +46,13 @@ pub struct RaftNodeConfig {
 
     /// Number of committed entries between snapshots (0 = disable snapshots)
     pub snapshot_interval: u64,
+
+    /// Timeout for detecting failed nodes (0 = disable automatic removal)
+    ///
+    /// If a follower doesn't make progress for this duration, it will be
+    /// considered failed and an event will be emitted for removal.
+    /// Only applies when this node is the leader.
+    pub failure_detection_timeout: Duration,
 }
 
 impl Default for RaftNodeConfig {
@@ -59,6 +66,7 @@ impl Default for RaftNodeConfig {
             pre_vote: true,
             tick_interval: Duration::from_millis(100),
             snapshot_interval: 1000, // Create snapshot every 1000 committed entries
+            failure_detection_timeout: Duration::from_secs(30), // 30 seconds default
         }
     }
 }
@@ -131,6 +139,13 @@ pub struct RaftNode<SM: StateMachine> {
     /// Last snapshot index
     last_snapshot_index: Arc<Mutex<u64>>,
 
+    /// Failure detection timeout (0 = disabled)
+    failure_detection_timeout: Duration,
+
+    /// Follower progress tracking: node_id -> (matched_index, last_update_time)
+    /// Used for detecting failed nodes that stop making progress
+    follower_progress: Arc<Mutex<HashMap<u64, (u64, time::Instant)>>>,
+
     /// Logger
     logger: Logger,
 }
@@ -179,6 +194,8 @@ impl<SM: StateMachine> RaftNode<SM> {
             pending_proposals: Arc::new(Mutex::new(HashMap::new())),
             snapshot_interval: config.snapshot_interval,
             last_snapshot_index: Arc::new(Mutex::new(0)),
+            failure_detection_timeout: config.failure_detection_timeout,
+            follower_progress: Arc::new(Mutex::new(HashMap::new())),
             logger,
         })
     }
@@ -271,6 +288,8 @@ impl<SM: StateMachine> RaftNode<SM> {
             pending_proposals: Arc::new(Mutex::new(HashMap::new())),
             snapshot_interval: config.snapshot_interval,
             last_snapshot_index: Arc::new(Mutex::new(0)),
+            failure_detection_timeout: config.failure_detection_timeout,
+            follower_progress: Arc::new(Mutex::new(HashMap::new())),
             logger,
         })
     }
@@ -877,6 +896,9 @@ impl<SM: StateMachine> RaftNode<SM> {
         // 13. Create periodic snapshots if needed
         self.maybe_create_snapshot().await?;
 
+        // 14. Check follower progress for failure detection
+        self.check_follower_progress().await?;
+
         Ok(())
     }
 
@@ -1027,6 +1049,85 @@ impl<SM: StateMachine> RaftNode<SM> {
         };
 
         self.transport.send_message(target_node, generic_msg).await
+    }
+
+    /// Check follower progress and detect failed nodes
+    ///
+    /// This is called periodically when this node is the leader. It tracks the
+    /// matched index for each follower and emits events when followers stop
+    /// making progress for longer than the configured timeout.
+    async fn check_follower_progress(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        // Skip if failure detection is disabled
+        if self.failure_detection_timeout.is_zero() {
+            return Ok(());
+        }
+
+        // Only check when we're the leader
+        if !self.is_leader().await {
+            return Ok(());
+        }
+
+        let now = time::Instant::now();
+        let mut progress_map = self.follower_progress.lock().await;
+        let mut failed_nodes = Vec::new();
+
+        // Check each peer's progress
+        let prs = self.raw_node.raft.prs();
+        for (&peer_id, progress) in prs.iter() {
+            // Skip ourselves
+            if peer_id == self.node_id {
+                continue;
+            }
+
+            let matched = progress.matched;
+
+            // Check if this peer made progress
+            if let Some((last_matched, last_update)) = progress_map.get(&peer_id) {
+                if matched > *last_matched {
+                    // Progress made, update tracking
+                    progress_map.insert(peer_id, (matched, now));
+                } else {
+                    // No progress, check if timeout exceeded
+                    let elapsed = now.duration_since(*last_update);
+                    if elapsed > self.failure_detection_timeout {
+                        warn!(self.logger, "Follower failed to make progress";
+                            "node_id" => peer_id,
+                            "matched" => matched,
+                            "timeout" => ?self.failure_detection_timeout,
+                            "elapsed" => ?elapsed
+                        );
+                        failed_nodes.push(peer_id);
+                    }
+                }
+            } else {
+                // First time seeing this peer, track it
+                progress_map.insert(peer_id, (matched, now));
+            }
+        }
+
+        drop(progress_map);
+
+        // Handle failed nodes
+        for node_id in failed_nodes {
+            // Call state machine to get failure events
+            let mut sm = self.state_machine.lock().await;
+            let events = sm.on_follower_failed(node_id);
+            drop(sm);
+
+            // Publish events
+            if !events.is_empty() {
+                let count = self.event_bus.publish_batch(events);
+                info!(self.logger, "Published follower failure events";
+                    "node_id" => node_id,
+                    "subscriber_count" => count
+                );
+            }
+
+            // Remove from progress tracking (we only emit event once)
+            self.follower_progress.lock().await.remove(&node_id);
+        }
+
+        Ok(())
     }
 }
 

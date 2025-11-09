@@ -919,6 +919,90 @@ where
         result
     }
 
+    /// Handle a failed node by removing it from all sub-clusters and then from the management cluster
+    ///
+    /// This method is called automatically when a node is detected as failed (no progress for timeout period).
+    /// It will:
+    /// 1. Remove the node from all sub-clusters it participates in
+    /// 2. Remove the node from the management cluster itself
+    ///
+    /// # Arguments
+    /// * `node_id` - ID of the failed node to remove
+    ///
+    /// # Returns
+    /// * `Ok(())` - Removal process initiated successfully
+    /// * `Err(String)` - Failed to initiate removal
+    pub async fn handle_failed_node(&self, node_id: u64) -> Result<(), String> {
+        use slog::warn;
+
+        info!(self.logger, "Handling failed node - will remove from all sub-clusters and management cluster";
+            "node_id" => node_id
+        );
+
+        // Get the current state to find which sub-clusters this node is in
+        let state = self.get_state_snapshot().await;
+
+        // Find all sub-clusters containing this node
+        let affected_clusters: Vec<u32> = state
+            .get_all_sub_clusters()
+            .iter()
+            .filter_map(|(cluster_id, metadata)| {
+                if metadata.node_ids.contains(&node_id) {
+                    Some(*cluster_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        info!(self.logger, "Removing failed node from sub-clusters";
+            "node_id" => node_id,
+            "affected_clusters" => ?affected_clusters
+        );
+
+        // Remove from each sub-cluster
+        for cluster_id in affected_clusters {
+            match self.remove_node_from_sub_cluster(cluster_id, node_id).await {
+                Ok(_) => {
+                    info!(self.logger, "Removed failed node from sub-cluster";
+                        "node_id" => node_id,
+                        "cluster_id" => cluster_id
+                    );
+                }
+                Err(e) => {
+                    warn!(self.logger, "Failed to remove node from sub-cluster";
+                        "node_id" => node_id,
+                        "cluster_id" => cluster_id,
+                        "error" => %e
+                    );
+                    // Continue with other clusters even if one fails
+                }
+            }
+        }
+
+        // Finally, remove from management cluster
+        info!(self.logger, "Removing failed node from management cluster";
+            "node_id" => node_id
+        );
+
+        match self.remove_node(node_id).await {
+            Ok(_rx) => {
+                // We don't need to wait for the result, just initiated the removal
+                info!(self.logger, "Failed node removal from management cluster initiated";
+                    "node_id" => node_id
+                );
+                Ok(())
+            }
+            Err(e) => {
+                warn!(self.logger, "Failed to remove node from management cluster";
+                    "node_id" => node_id,
+                    "error" => %e
+                );
+                Err(format!("Failed to remove node from management cluster: {}", e))
+            }
+        }
+    }
+
     /// Run event observer for dynamic sub-cluster management (private background task)
     ///
     /// This method observes management events and dynamically creates/manages sub-cluster runtimes:
@@ -1202,6 +1286,41 @@ where
 
                             // Shut down and remove the runtime
                             self.sub_clusters.lock().await.remove(&cluster_id);
+                        }
+
+                        ManagementEvent::FailedNodeDetected { node_id } => {
+                            info!(self.logger, "Failed node detected event - initiating automatic removal";
+                                "node_id" => node_id
+                            );
+
+                            // Only the leader should handle failed node removal
+                            if self.is_leader().await {
+                                info!(self.logger, "This node is leader, handling failed node removal";
+                                    "node_id" => node_id
+                                );
+
+                                // Clone self for async task
+                                let runtime = self.clone();
+                                tokio::spawn(async move {
+                                    match runtime.handle_failed_node(node_id).await {
+                                        Ok(_) => {
+                                            info!(runtime.logger, "Successfully handled failed node removal";
+                                                "node_id" => node_id
+                                            );
+                                        }
+                                        Err(e) => {
+                                            error!(runtime.logger, "Failed to handle failed node removal";
+                                                "node_id" => node_id,
+                                                "error" => %e
+                                            );
+                                        }
+                                    }
+                                });
+                            } else {
+                                info!(self.logger, "Not leader, skipping failed node removal";
+                                    "node_id" => node_id
+                                );
+                            }
                         }
 
                         _ => {

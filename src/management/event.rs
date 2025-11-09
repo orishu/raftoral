@@ -34,4 +34,14 @@ pub enum ManagementEvent {
         key: String,
         value: Option<String>, // None = deleted
     },
+
+    /// A node has been detected as failed (no progress for configured timeout)
+    ///
+    /// This event is emitted by the RaftNode's failure detection when it detects
+    /// that a follower node hasn't made progress within the configured timeout.
+    /// The ManagementRuntime should handle this by removing the node from all
+    /// sub-clusters and then from the management cluster itself.
+    FailedNodeDetected {
+        node_id: u64,
+    },
 }

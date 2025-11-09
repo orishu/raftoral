@@ -246,6 +246,13 @@ impl StateMachine for ManagementStateMachine {
         self.node_addresses = snapshot.node_addresses;
         Ok(())
     }
+
+    fn on_follower_failed(&mut self, node_id: u64) -> Vec<Self::Event> {
+        // Emit event for failed node detection
+        // The ManagementRuntime will handle this by removing the node from
+        // all sub-clusters and then from the management cluster
+        vec![ManagementEvent::FailedNodeDetected { node_id }]
+    }
 }
 
 #[cfg(test)]
