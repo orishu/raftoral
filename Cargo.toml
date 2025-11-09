@@ -33,7 +33,7 @@ ttl_cache = "0.5"
 rocksdb = { version = "0.22", optional = true }
 
 [features]
-default = []
+default = ["persistent-storage"]
 persistent-storage = ["rocksdb"]
 
 [dev-dependencies]

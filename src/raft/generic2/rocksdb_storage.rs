@@ -19,45 +19,27 @@
 //! - `snapshot_data` → Snapshot protobuf bytes
 //! - `snapshot_metadata` → SnapshotMetadata
 
-#[cfg(feature = "persistent-storage")]
 use rocksdb::{ColumnFamilyDescriptor, DB, Options, WriteBatch};
-#[cfg(feature = "persistent-storage")]
 use raft::prelude::*;
-#[cfg(feature = "persistent-storage")]
 use raft::{Error, Result, StorageError};
-#[cfg(feature = "persistent-storage")]
 use raft::GetEntriesContext;
-#[cfg(feature = "persistent-storage")]
 use std::path::Path;
-#[cfg(feature = "persistent-storage")]
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(feature = "persistent-storage")]
 use std::sync::{Arc, RwLock};
-#[cfg(feature = "persistent-storage")]
 use protobuf::Message as ProtobufMessage;
 
-#[cfg(feature = "persistent-storage")]
 const CF_ENTRIES: &str = "entries";
-#[cfg(feature = "persistent-storage")]
 const CF_METADATA: &str = "metadata";
-#[cfg(feature = "persistent-storage")]
 const CF_SNAPSHOT: &str = "snapshot";
 
-#[cfg(feature = "persistent-storage")]
 const KEY_HARD_STATE: &[u8] = b"hard_state";
-#[cfg(feature = "persistent-storage")]
 const KEY_CONF_STATE: &[u8] = b"conf_state";
-#[cfg(feature = "persistent-storage")]
 const KEY_FIRST_INDEX: &[u8] = b"first_index";
-#[cfg(feature = "persistent-storage")]
 const KEY_LAST_INDEX: &[u8] = b"last_index";
-#[cfg(feature = "persistent-storage")]
 const KEY_SNAPSHOT_DATA: &[u8] = b"snapshot_data";
-#[cfg(feature = "persistent-storage")]
 const KEY_SNAPSHOT_METADATA: &[u8] = b"snapshot_metadata";
 
 /// RocksDB-backed persistent Raft storage
-#[cfg(feature = "persistent-storage")]
 pub struct RocksDBStorage {
     /// RocksDB instance
     db: Arc<DB>,
@@ -73,7 +55,6 @@ pub struct RocksDBStorage {
     lock: Arc<RwLock<()>>,
 }
 
-#[cfg(feature = "persistent-storage")]
 impl RocksDBStorage {
     /// Create a new RocksDBStorage instance
     ///
@@ -437,7 +418,6 @@ impl RocksDBStorage {
     }
 }
 
-#[cfg(feature = "persistent-storage")]
 impl raft::Storage for RocksDBStorage {
     fn initial_state(&self) -> Result<RaftState> {
         let hard_state = self.load_hard_state()?;
