@@ -5,7 +5,10 @@
 //! - Methods: upper layer commands (propose, campaign, add_node, remove_node)
 
 use crate::grpc::server::raft_proto::{self, GenericMessage};
+#[cfg(not(feature = "persistent-storage"))]
 use crate::raft::generic::storage::MemStorageWithSnapshot;
+#[cfg(feature = "persistent-storage")]
+use crate::raft::generic2::rocksdb_storage::RocksDBStorage;
 use crate::raft::generic2::errors::TransportError;
 use crate::raft::generic2::{EventBus, StateMachine, Transport};
 use bytes::Bytes;
@@ -15,10 +18,18 @@ use raft::StateRole;
 use serde::{Deserialize, Serialize};
 use slog::{debug, info, warn, Logger};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, broadcast, Mutex, oneshot};
 use tokio::time;
+
+/// Storage type selection based on feature flag
+#[cfg(feature = "persistent-storage")]
+type RaftStorage = RocksDBStorage;
+
+#[cfg(not(feature = "persistent-storage"))]
+type RaftStorage = MemStorageWithSnapshot;
 
 /// Configuration for RaftNode initialization
 #[derive(Clone, Debug)]
@@ -53,6 +64,12 @@ pub struct RaftNodeConfig {
     /// considered failed and an event will be emitted for removal.
     /// Only applies when this node is the leader.
     pub failure_detection_timeout: Duration,
+
+    /// Path for persistent storage (None = in-memory storage)
+    ///
+    /// When set, RocksDB will be used for storage (requires persistent-storage feature).
+    /// When None, in-memory storage will be used (data lost on restart).
+    pub storage_path: Option<PathBuf>,
 }
 
 impl Default for RaftNodeConfig {
@@ -67,6 +84,7 @@ impl Default for RaftNodeConfig {
             tick_interval: Duration::from_millis(100),
             snapshot_interval: 1000, // Create snapshot every 1000 committed entries
             failure_detection_timeout: Duration::from_secs(30), // 30 seconds default
+            storage_path: None, // Default to in-memory storage
         }
     }
 }
@@ -104,7 +122,7 @@ pub struct RaftNode<SM: StateMachine> {
     cluster_id: u32,
 
     /// raft-rs RawNode
-    raw_node: RawNode<MemStorageWithSnapshot>,
+    raw_node: RawNode<RaftStorage>,
 
     /// Transport for sending messages to peers
     transport: Arc<dyn Transport>,
@@ -150,6 +168,38 @@ pub struct RaftNode<SM: StateMachine> {
     logger: Logger,
 }
 
+/// Helper function to create storage based on config and conf_state
+#[cfg(feature = "persistent-storage")]
+fn create_storage(
+    config: &RaftNodeConfig,
+    conf_state: ConfState,
+) -> Result<RaftStorage, Box<dyn std::error::Error>> {
+    match &config.storage_path {
+        Some(storage_path) => {
+            slog::info!(
+                slog::Logger::root(slog::Discard, slog::o!()),
+                "Creating RocksDB storage";
+                "path" => ?storage_path,
+                "node_id" => config.node_id,
+                "cluster_id" => config.cluster_id
+            );
+            Ok(RocksDBStorage::open_or_create(storage_path, conf_state)?)
+        }
+        None => {
+            Err("persistent-storage feature enabled but storage_path not provided".into())
+        }
+    }
+}
+
+#[cfg(not(feature = "persistent-storage"))]
+fn create_storage(
+    _config: &RaftNodeConfig,
+    conf_state: ConfState,
+) -> Result<RaftStorage, Box<dyn std::error::Error>> {
+    // Always use in-memory storage when feature is disabled
+    Ok(MemStorageWithSnapshot::new_with_conf_state(conf_state))
+}
+
 impl<SM: StateMachine> RaftNode<SM> {
     /// Create a new RaftNode with single-node bootstrap
     ///
@@ -162,10 +212,8 @@ impl<SM: StateMachine> RaftNode<SM> {
         event_bus: Arc<EventBus<SM::Event>>,
         logger: Logger,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let storage = MemStorageWithSnapshot::new_with_conf_state(ConfState::from((
-            vec![config.node_id],
-            vec![],
-        )));
+        let conf_state = ConfState::from((vec![config.node_id], vec![]));
+        let storage = create_storage(&config, conf_state)?;
 
         let raft_config = Config {
             id: config.node_id,
@@ -259,7 +307,7 @@ impl<SM: StateMachine> RaftNode<SM> {
         logger: Logger,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Use the provided conf_state for storage initialization
-        let storage = MemStorageWithSnapshot::new_with_conf_state(conf_state.clone());
+        let storage = create_storage(&config, conf_state.clone())?;
 
         let raft_config = Config {
             id: config.node_id,
@@ -802,7 +850,14 @@ impl<SM: StateMachine> RaftNode<SM> {
 
         // 9. Handle commit index from light ready
         if let Some(commit) = light_rd.commit_index() {
-            store.wl().mut_hard_state().set_commit(commit);
+            #[cfg(feature = "persistent-storage")]
+            {
+                store.update_commit(commit)?;
+            }
+            #[cfg(not(feature = "persistent-storage"))]
+            {
+                store.wl().mut_hard_state().set_commit(commit);
+            }
         }
 
         // 10. Send messages from light ready

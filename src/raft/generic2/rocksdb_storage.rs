@@ -416,6 +416,55 @@ impl RocksDBStorage {
             None => Ok(None),
         }
     }
+
+    /// Compatibility method: apply snapshot with data (matches MemStorageWithSnapshot API)
+    pub fn apply_snapshot_with_data(&self, snapshot: Snapshot) -> Result<()> {
+        self.apply_snapshot(snapshot)
+    }
+
+    /// Compatibility method: returns self for write operations (matches MemStorageWithSnapshot::wl())
+    pub fn wl(&self) -> &Self {
+        self
+    }
+
+    /// Compatibility method: returns self for read operations (matches MemStorageWithSnapshot::rl())
+    pub fn rl(&self) -> &Self {
+        self
+    }
+
+    /// Compatibility method: set hard state (matches MemStorageWithSnapshot write lock API)
+    pub fn set_hardstate(&self, hs: HardState) -> Result<()> {
+        self.store_hard_state(&hs)
+    }
+
+    /// Compatibility method: update commit index in hard state
+    pub fn update_commit(&self, commit: u64) -> Result<()> {
+        let mut hs = self.load_hard_state()?;
+        hs.set_commit(commit);
+        self.store_hard_state(&hs)
+    }
+
+    /// Compatibility method: get mutable hard state reference (not truly mutable for RocksDB)
+    /// Note: For RocksDB, mutations should use specific methods like update_commit()
+    pub fn mut_hard_state(&self) -> HardState {
+        self.load_hard_state().unwrap_or_default()
+    }
+
+    /// Compatibility method: get hard state (matches MemStorageWithSnapshot read lock API)
+    pub fn hard_state(&self) -> HardState {
+        self.load_hard_state().unwrap_or_default()
+    }
+}
+
+impl Clone for RocksDBStorage {
+    fn clone(&self) -> Self {
+        Self {
+            db: self.db.clone(),
+            first_index_cache: AtomicU64::new(self.first_index_cache.load(Ordering::SeqCst)),
+            last_index_cache: AtomicU64::new(self.last_index_cache.load(Ordering::SeqCst)),
+            lock: self.lock.clone(),
+        }
+    }
 }
 
 impl raft::Storage for RocksDBStorage {
