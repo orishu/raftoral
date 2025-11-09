@@ -183,7 +183,7 @@ fn create_storage(
                 "node_id" => config.node_id,
                 "cluster_id" => config.cluster_id
             );
-            Ok(RocksDBStorage::open_or_create(storage_path, conf_state)?)
+            Ok(RocksDBStorage::open_or_create(storage_path, config.node_id, conf_state)?)
         }
         None => {
             Err("persistent-storage feature enabled but storage_path not provided".into())

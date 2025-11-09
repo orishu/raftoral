@@ -32,6 +32,7 @@ const CF_ENTRIES: &str = "entries";
 const CF_METADATA: &str = "metadata";
 const CF_SNAPSHOT: &str = "snapshot";
 
+const KEY_NODE_ID: &[u8] = b"node_id";
 const KEY_HARD_STATE: &[u8] = b"hard_state";
 const KEY_CONF_STATE: &[u8] = b"conf_state";
 const KEY_FIRST_INDEX: &[u8] = b"first_index";
@@ -40,6 +41,7 @@ const KEY_SNAPSHOT_DATA: &[u8] = b"snapshot_data";
 const KEY_SNAPSHOT_METADATA: &[u8] = b"snapshot_metadata";
 
 /// RocksDB-backed persistent Raft storage
+#[derive(Debug)]
 pub struct RocksDBStorage {
     /// RocksDB instance
     db: Arc<DB>,
@@ -63,6 +65,7 @@ impl RocksDBStorage {
     ///
     /// # Arguments
     /// * `path` - Path to the RocksDB database directory
+    /// * `node_id` - Node ID to persist (required for restarts)
     /// * `conf_state` - Initial configuration state (voters and learners)
     ///
     /// # Returns
@@ -70,6 +73,7 @@ impl RocksDBStorage {
     /// * `Err(...)` - Failed to create/open database
     pub fn open_or_create<P: AsRef<Path>>(
         path: P,
+        node_id: u64,
         conf_state: ConfState,
     ) -> Result<Self> {
         let path = path.as_ref();
@@ -98,7 +102,7 @@ impl RocksDBStorage {
         };
 
         // Initialize metadata if this is a new database
-        storage.initialize_if_needed(conf_state)?;
+        storage.initialize_if_needed(node_id, conf_state)?;
 
         // Load index caches
         storage.reload_index_caches()?;
@@ -106,8 +110,43 @@ impl RocksDBStorage {
         Ok(storage)
     }
 
+    /// Check if a RocksDB storage directory exists and contains Raft state
+    ///
+    /// This helps distinguish between a fresh start and a node restart.
+    /// Returns Ok(true) if the directory exists and contains Raft metadata.
+    pub fn storage_exists<P: AsRef<Path>>(path: P) -> Result<bool> {
+        use rocksdb::Options;
+
+        let path = path.as_ref();
+
+        // Check if directory exists
+        if !path.exists() {
+            return Ok(false);
+        }
+
+        // Try to open the database read-only to check if it's valid
+        let opts = Options::default();
+        let cfs = vec![CF_ENTRIES, CF_METADATA, CF_SNAPSHOT];
+
+        match rocksdb::DB::open_cf_for_read_only(&opts, path, cfs, false) {
+            Ok(db) => {
+                // Check if node_id exists in metadata (indicates initialized storage)
+                if let Some(cf_metadata) = db.cf_handle(CF_METADATA) {
+                    match db.get_cf(cf_metadata, KEY_NODE_ID) {
+                        Ok(Some(_)) => Ok(true),  // Node ID exists, this is a restart
+                        Ok(None) => Ok(false),     // DB exists but not initialized
+                        Err(_) => Ok(false),       // Error reading, treat as non-existent
+                    }
+                } else {
+                    Ok(false)
+                }
+            }
+            Err(_) => Ok(false),  // Can't open, treat as non-existent
+        }
+    }
+
     /// Initialize database with default state if it's empty
-    fn initialize_if_needed(&self, conf_state: ConfState) -> Result<()> {
+    fn initialize_if_needed(&self, node_id: u64, conf_state: ConfState) -> Result<()> {
         let _lock = self.lock.write().unwrap();
 
         let cf_metadata = self.db.cf_handle(CF_METADATA)
@@ -118,9 +157,21 @@ impl RocksDBStorage {
             .map_err(|e| Error::Store(StorageError::Other(Box::new(e))))?
             .is_some()
         {
-            // Already initialized
+            // Already initialized - verify node ID matches if it exists
+            if let Ok(Some(stored_node_id)) = self.load_node_id() {
+                if stored_node_id != node_id {
+                    return Err(Error::Store(StorageError::Other(
+                        format!("Node ID mismatch: storage contains {}, but {} was provided",
+                                stored_node_id, node_id).into()
+                    )));
+                }
+            }
             return Ok(());
         }
+
+        // Initialize with node ID
+        self.db.put_cf(cf_metadata, KEY_NODE_ID, node_id.to_be_bytes())
+            .map_err(|e| Error::Store(StorageError::Other(Box::new(e))))?;
 
         // Initialize with default hard state
         let hard_state = HardState::default();
@@ -215,6 +266,39 @@ impl RocksDBStorage {
                     .map_err(|e| Error::Store(StorageError::Other(Box::new(e))))
             }
             None => Ok(HardState::default()),
+        }
+    }
+
+    /// Store node ID
+    pub fn store_node_id(&self, node_id: u64) -> Result<()> {
+        let cf_metadata = self.db.cf_handle(CF_METADATA)
+            .ok_or_else(|| Error::Store(StorageError::Unavailable))?;
+
+        self.db.put_cf(cf_metadata, KEY_NODE_ID, node_id.to_be_bytes())
+            .map_err(|e| Error::Store(StorageError::Other(Box::new(e))))
+    }
+
+    /// Load node ID (returns None if not set)
+    pub fn load_node_id(&self) -> Result<Option<u64>> {
+        let cf_metadata = self.db.cf_handle(CF_METADATA)
+            .ok_or_else(|| Error::Store(StorageError::Unavailable))?;
+
+        let value = self.db.get_cf(cf_metadata, KEY_NODE_ID)
+            .map_err(|e| Error::Store(StorageError::Other(Box::new(e))))?;
+
+        match value {
+            Some(bytes) => {
+                if bytes.len() == 8 {
+                    let mut array = [0u8; 8];
+                    array.copy_from_slice(&bytes);
+                    Ok(Some(u64::from_be_bytes(array)))
+                } else {
+                    Err(Error::Store(StorageError::Other(
+                        "Invalid node_id size in storage".into()
+                    )))
+                }
+            }
+            None => Ok(None),
         }
     }
 
@@ -587,6 +671,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let storage = RocksDBStorage::open_or_create(
             temp_dir.path(),
+            1,  // test node_id
             ConfState::default(),
         ).unwrap();
         (storage, temp_dir)
@@ -664,7 +749,7 @@ mod tests {
 
         // Create storage and set hard state
         {
-            let storage = RocksDBStorage::open_or_create(&path, ConfState::default()).unwrap();
+            let storage = RocksDBStorage::open_or_create(&path, 1, ConfState::default()).unwrap();
 
             let mut hs = HardState::default();
             hs.term = 5;
@@ -676,7 +761,7 @@ mod tests {
 
         // Reopen and verify
         {
-            let storage = RocksDBStorage::open_or_create(&path, ConfState::default()).unwrap();
+            let storage = RocksDBStorage::open_or_create(&path, 1, ConfState::default()).unwrap();
             let hs = storage.load_hard_state().unwrap();
 
             assert_eq!(hs.term, 5);
@@ -692,7 +777,7 @@ mod tests {
 
         // Create storage and set conf state
         {
-            let storage = RocksDBStorage::open_or_create(&path, ConfState::default()).unwrap();
+            let storage = RocksDBStorage::open_or_create(&path, 1, ConfState::default()).unwrap();
 
             let mut cs = ConfState::default();
             cs.voters = vec![1, 2, 3];
@@ -703,7 +788,7 @@ mod tests {
 
         // Reopen and verify
         {
-            let storage = RocksDBStorage::open_or_create(&path, ConfState::default()).unwrap();
+            let storage = RocksDBStorage::open_or_create(&path, 1, ConfState::default()).unwrap();
             let cs = storage.load_conf_state().unwrap();
 
             assert_eq!(cs.voters, vec![1, 2, 3]);
@@ -779,7 +864,7 @@ mod tests {
 
         // Write some data
         {
-            let storage = RocksDBStorage::open_or_create(&path, ConfState::default()).unwrap();
+            let storage = RocksDBStorage::open_or_create(&path, 1, ConfState::default()).unwrap();
 
             let mut entries = vec![];
             for i in 1..=5 {
@@ -800,7 +885,7 @@ mod tests {
 
         // Reopen and verify all data persisted
         {
-            let storage = RocksDBStorage::open_or_create(&path, ConfState::default()).unwrap();
+            let storage = RocksDBStorage::open_or_create(&path, 1, ConfState::default()).unwrap();
 
             assert_eq!(storage.first_index().unwrap(), 1);
             assert_eq!(storage.last_index().unwrap(), 5);
@@ -857,5 +942,78 @@ mod tests {
 
         let result = storage.entries(5, 3, None, GetEntriesContext::empty(false)).unwrap();
         assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn test_node_id_persistence_and_restart() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_path_buf();
+
+        // First start: create storage with node_id = 42
+        {
+            let storage = RocksDBStorage::open_or_create(&path, 42, ConfState::default()).unwrap();
+
+            // Verify node_id was stored
+            assert_eq!(storage.load_node_id().unwrap(), Some(42));
+
+            // Write some Raft state
+            let mut entries = vec![];
+            for i in 1..=3 {
+                let mut entry = Entry::default();
+                entry.index = i;
+                entry.term = 1;
+                entry.set_data(format!("data{}", i).into_bytes().into());
+                entries.push(entry);
+            }
+            storage.append(&entries).unwrap();
+
+            let mut hs = HardState::default();
+            hs.term = 1;
+            hs.commit = 3;
+            storage.store_hard_state(&hs).unwrap();
+        }
+        // Storage dropped (simulates node shutdown)
+
+        // Restart: open storage with same node_id (should succeed)
+        {
+            let storage = RocksDBStorage::open_or_create(&path, 42, ConfState::default()).unwrap();
+
+            // Verify node_id matches
+            assert_eq!(storage.load_node_id().unwrap(), Some(42));
+
+            // Verify Raft state was persisted
+            assert_eq!(storage.first_index().unwrap(), 1);
+            assert_eq!(storage.last_index().unwrap(), 3);
+
+            let entries = storage.entries(1, 4, None, GetEntriesContext::empty(false)).unwrap();
+            assert_eq!(entries.len(), 3);
+
+            let hs = storage.load_hard_state().unwrap();
+            assert_eq!(hs.term, 1);
+            assert_eq!(hs.commit, 3);
+        }
+
+        // Attempt to open with wrong node_id (should fail)
+        {
+            let result = RocksDBStorage::open_or_create(&path, 99, ConfState::default());
+            assert!(result.is_err(), "Opening with wrong node_id should fail");
+        }
+    }
+
+    #[test]
+    fn test_storage_exists_helper() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().to_path_buf();
+
+        // Fresh directory - storage should not exist
+        assert!(!RocksDBStorage::storage_exists(&path).unwrap());
+
+        // Create storage
+        {
+            let _storage = RocksDBStorage::open_or_create(&path, 1, ConfState::default()).unwrap();
+        }
+
+        // Now storage should exist
+        assert!(RocksDBStorage::storage_exists(&path).unwrap());
     }
 }
