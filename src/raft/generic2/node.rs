@@ -5,11 +5,11 @@
 //! - Methods: upper layer commands (propose, campaign, add_node, remove_node)
 
 use crate::grpc::server::raft_proto::{self, GenericMessage};
-#[cfg(not(feature = "persistent-storage"))]
 use crate::raft::generic::storage::MemStorageWithSnapshot;
 #[cfg(feature = "persistent-storage")]
 use crate::raft::generic2::rocksdb_storage::RocksDBStorage;
 use crate::raft::generic2::errors::TransportError;
+use crate::raft::generic2::storage::RaftStorage;
 use crate::raft::generic2::{EventBus, StateMachine, Transport};
 use bytes::Bytes;
 use protobuf::Message as ProtobufMessage;
@@ -23,13 +23,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, broadcast, Mutex, oneshot};
 use tokio::time;
-
-/// Storage type selection based on feature flag
-#[cfg(feature = "persistent-storage")]
-type RaftStorage = RocksDBStorage;
-
-#[cfg(not(feature = "persistent-storage"))]
-type RaftStorage = MemStorageWithSnapshot;
 
 /// Configuration for RaftNode initialization
 #[derive(Clone, Debug)]
@@ -183,10 +176,11 @@ fn create_storage(
                 "node_id" => config.node_id,
                 "cluster_id" => config.cluster_id
             );
-            Ok(RocksDBStorage::open_or_create(storage_path, config.node_id, conf_state)?)
+            Ok(RaftStorage::RocksDB(RocksDBStorage::open_or_create(storage_path, config.node_id, conf_state)?))
         }
         None => {
-            Err("persistent-storage feature enabled but storage_path not provided".into())
+            // Fall back to in-memory storage when storage_path is not provided
+            Ok(RaftStorage::Memory(MemStorageWithSnapshot::new_with_conf_state(conf_state)))
         }
     }
 }

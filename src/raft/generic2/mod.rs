@@ -18,6 +18,7 @@ pub mod node;
 pub mod proposal_router;
 pub mod server;
 pub mod state_machine;
+pub mod storage;
 pub mod transport;
 
 #[cfg(feature = "persistent-storage")]
@@ -32,6 +33,7 @@ pub use event_bus::EventBus;
 pub use node::{RaftNode, RaftNodeConfig, NodeMetadata, RoleChange};
 pub use proposal_router::{ProposalRouter, ProposalError};
 pub use state_machine::{StateMachine, KvStateMachine, KvCommand, KvEvent};
+pub use storage::RaftStorage;
 pub use transport::{Transport, TransportLayer, MessageSender};
 pub use server::{InProcessServer, InProcessMessageSender, InProcessNetwork, InProcessNetworkSender};
 
