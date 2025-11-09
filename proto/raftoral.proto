@@ -69,6 +69,9 @@ message DiscoveryResponse {
     string address = 3;                      // Address of the responding node
     uint64 management_leader_node_id = 4;    // Node ID of management cluster leader (0 = no leader)
     string management_leader_address = 5;    // Address of management cluster leader (empty if no leader)
+    bool should_join_as_voter = 6;           // Whether the joining node should join as voter (true) or learner (false)
+    uint64 current_voter_count = 7;          // Current number of voters in management cluster
+    uint64 max_voters = 8;                   // Maximum number of voters allowed in management cluster
 }
 
 message AddNodeRequest {

@@ -628,6 +628,9 @@ mod tests {
                     address: self.addr.clone(),
                     management_leader_node_id: 0,  // No leader in this test
                     management_leader_address: String::new(),
+                    should_join_as_voter: true,    // Test mode: all nodes are voters
+                    current_voter_count: 1,        // Just this test node
+                    max_voters: 5,                 // Default value
                 }))
             }
 

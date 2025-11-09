@@ -245,6 +245,124 @@ where
         Ok((runtime, node_arc))
     }
 
+    /// Create a new Management runtime for a node joining an existing cluster as a LEARNER
+    ///
+    /// This constructor is used when joining a large cluster where only a limited number
+    /// of nodes should be voters. Learner nodes receive log updates but don't participate
+    /// in voting for consensus.
+    ///
+    /// # Arguments
+    /// * `config` - Raft node configuration
+    /// * `transport` - Transport layer for network communication
+    /// * `mailbox_rx` - Mailbox receiver for Raft messages
+    /// * `existing_voters` - IDs of the existing voter nodes (NOT including this node)
+    /// * `cluster_router` - Cluster router for registering sub-clusters
+    /// * `shared_config` - Shared configuration for sub-cluster runtimes
+    /// * `logger` - Logger instance
+    ///
+    /// # Returns
+    /// A tuple of (Arc<ManagementRuntime>, RaftNode handle for running event loop)
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Node 6 joins a cluster with 5 existing voters (1-5) as a learner
+    /// let (runtime, node) = ManagementRuntime::new_joining_learner(
+    ///     config,
+    ///     transport,
+    ///     mailbox_rx,
+    ///     vec![1, 2, 3, 4, 5], // existing voters
+    ///     cluster_router,
+    ///     shared_config,
+    ///     logger,
+    /// )?;
+    /// // Node 6 will be a learner, receiving updates but not voting
+    /// ```
+    pub fn new_joining_learner(
+        config: RaftNodeConfig,
+        transport: Arc<dyn Transport>,
+        mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
+        existing_voters: Vec<u64>,
+        cluster_router: Arc<ClusterRouter>,
+        shared_config: Arc<Mutex<R::SharedConfig>>,
+        logger: Logger,
+    ) -> Result<
+        (
+            Arc<Self>,
+            Arc<Mutex<RaftNode<ManagementStateMachine>>>,
+        ),
+        Box<dyn std::error::Error>,
+    >
+    where
+        R: SubClusterRuntime,
+    {
+        let state_machine = ManagementStateMachine::new();
+        let event_bus = Arc::new(EventBus::new(100));
+
+        info!(logger, "Creating Management runtime (joining as learner)";
+            "node_id" => config.node_id,
+            "cluster_id" => config.cluster_id,
+            "existing_voters" => ?existing_voters
+        );
+
+        // Create ConfState with existing voters and this node as a learner
+        use raft::prelude::ConfState;
+        let conf_state = ConfState {
+            voters: existing_voters,
+            learners: vec![config.node_id],
+            ..Default::default()
+        };
+
+        // Create RaftNode with explicit ConfState (learner mode)
+        let node = RaftNode::new_with_conf_state(
+            config.clone(),
+            transport.clone(),
+            mailbox_rx,
+            state_machine,
+            event_bus.clone(),
+            conf_state,
+            logger.clone(),
+        )?;
+
+        let node_arc = Arc::new(Mutex::new(node));
+
+        // Create ProposalRouter
+        let proposal_router = Arc::new(ProposalRouter::new(
+            node_arc.clone(),
+            transport.clone(),
+            config.cluster_id,
+            config.node_id,
+            logger.clone(),
+        ));
+
+        // Start leader tracker in background
+        let router_clone = proposal_router.clone();
+        tokio::spawn(async move {
+            router_clone.run_leader_tracker().await;
+        });
+
+        let runtime = Arc::new(Self {
+            proposal_router,
+            event_bus: event_bus.clone(),
+            cluster_router,
+            transport,
+            sub_clusters: Arc::new(Mutex::new(HashMap::new())),
+            shared_config,
+            cluster_manager: ClusterManager::new(ClusterManagerConfig::default()),
+            node_id: config.node_id,
+            cluster_id: config.cluster_id,
+            logger: logger.clone(),
+            _phantom: PhantomData,
+        });
+
+        // Start event observer in background
+        let runtime_clone = runtime.clone();
+        tokio::spawn(async move {
+            runtime_clone.run_event_observer().await;
+        });
+
+        Ok((runtime, node_arc))
+    }
+
     /// Create a new sub-cluster
     ///
     /// # Arguments

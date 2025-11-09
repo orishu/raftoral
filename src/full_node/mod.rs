@@ -237,13 +237,11 @@ impl FullNode {
         // Register this node's cluster (cluster_id = 0 for management)
         cluster_router.register_cluster(0, mailbox_tx).await;
 
-        // Collect voter node IDs for initial conf_state
-        let initial_voters: Vec<u64> = discovered_peers.iter()
-            .map(|p| p.node_id)
-            .chain(std::iter::once(node_id)) // Include ourselves
-            .collect();
-
-        info!(logger, "Joining management cluster with voters"; "voters" => ?initial_voters);
+        // Determine if we should join as voter or learner
+        // All discovered peers should have consistent voter information
+        let should_join_as_voter = discovered_peers.first()
+            .map(|p| p.should_join_as_voter)
+            .unwrap_or(true); // Default to voter if no info available
 
         // Create shared workflow registry
         let registry = Arc::new(Mutex::new(crate::workflow2::WorkflowRegistry::new()));
@@ -256,15 +254,48 @@ impl FullNode {
             ..Default::default()
         };
 
-        let (runtime, node) = ManagementRuntime::new_joining_node(
-            config,
-            transport.clone(),
-            mailbox_rx,
-            initial_voters,
-            cluster_router.clone(),
-            registry.clone(),
-            logger.clone(),
-        )?;
+        let (runtime, node) = if should_join_as_voter {
+            // Collect voter node IDs including ourselves
+            let initial_voters: Vec<u64> = discovered_peers.iter()
+                .map(|p| p.node_id)
+                .chain(std::iter::once(node_id)) // Include ourselves as voter
+                .collect();
+
+            info!(logger, "Joining management cluster as VOTER";
+                "node_id" => node_id,
+                "existing_voters" => ?initial_voters
+            );
+
+            ManagementRuntime::new_joining_node(
+                config,
+                transport.clone(),
+                mailbox_rx,
+                initial_voters,
+                cluster_router.clone(),
+                registry.clone(),
+                logger.clone(),
+            )?
+        } else {
+            // Collect existing voter node IDs (NOT including ourselves)
+            let existing_voters: Vec<u64> = discovered_peers.iter()
+                .map(|p| p.node_id)
+                .collect();
+
+            info!(logger, "Joining management cluster as LEARNER";
+                "node_id" => node_id,
+                "existing_voters" => ?existing_voters
+            );
+
+            ManagementRuntime::new_joining_learner(
+                config,
+                transport.clone(),
+                mailbox_rx,
+                existing_voters,
+                cluster_router.clone(),
+                registry.clone(),
+                logger.clone(),
+            )?
+        };
 
         // Run Raft node in background
         let node_clone = node.clone();

@@ -10,6 +10,9 @@ pub struct DiscoveredPeer {
     pub highest_known_node_id: u64,
     pub management_leader_node_id: u64,
     pub management_leader_address: String,
+    pub should_join_as_voter: bool,
+    pub current_voter_count: u64,
+    pub max_voters: u64,
 }
 
 /// Discover information from a peer node
@@ -25,6 +28,9 @@ pub async fn discover_peer(address: &str) -> Result<DiscoveredPeer, Box<dyn std:
         highest_known_node_id: discovery.highest_known_node_id,
         management_leader_node_id: discovery.management_leader_node_id,
         management_leader_address: discovery.management_leader_address,
+        should_join_as_voter: discovery.should_join_as_voter,
+        current_voter_count: discovery.current_voter_count,
+        max_voters: discovery.max_voters,
     })
 }
 
@@ -78,6 +84,9 @@ mod tests {
                 highest_known_node_id: 3,
                 management_leader_node_id: 1,
                 management_leader_address: "127.0.0.1:5001".to_string(),
+                should_join_as_voter: true,
+                current_voter_count: 3,
+                max_voters: 5,
             }
         ];
         assert_eq!(next_node_id(&peers), 4);
@@ -92,6 +101,9 @@ mod tests {
                 highest_known_node_id: 3,
                 management_leader_node_id: 1,
                 management_leader_address: "127.0.0.1:5001".to_string(),
+                should_join_as_voter: true,
+                current_voter_count: 3,
+                max_voters: 5,
             },
             DiscoveredPeer {
                 node_id: 2,
@@ -99,6 +111,9 @@ mod tests {
                 highest_known_node_id: 5,
                 management_leader_node_id: 1,
                 management_leader_address: "127.0.0.1:5001".to_string(),
+                should_join_as_voter: true,
+                current_voter_count: 3,
+                max_voters: 5,
             },
             DiscoveredPeer {
                 node_id: 3,
@@ -106,6 +121,9 @@ mod tests {
                 highest_known_node_id: 5,
                 management_leader_node_id: 1,
                 management_leader_address: "127.0.0.1:5001".to_string(),
+                should_join_as_voter: true,
+                current_voter_count: 3,
+                max_voters: 5,
             }
         ];
         // Should pick max highest_known_node_id (5) and add 1

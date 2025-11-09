@@ -194,6 +194,12 @@ impl RaftService for GrpcServer {
         // For now, just return this node's ID as the highest known
         let highest_known = self.node_id;
 
+        // Get voter information from management cluster
+        let voters = self.management_runtime.get_management_voters().await;
+        let current_voter_count = voters.len() as u64;
+        let max_voters = 5u64; // Default from ManagementClusterConfig
+        let should_join_as_voter = current_voter_count < max_voters;
+
         Ok(Response::new(
             crate::grpc::server::raft_proto::DiscoveryResponse {
                 node_id: self.node_id,
@@ -201,6 +207,9 @@ impl RaftService for GrpcServer {
                 address: self.node_address.clone(),
                 management_leader_node_id: leader.leader_id,
                 management_leader_address: leader.leader_address,
+                should_join_as_voter,
+                current_voter_count,
+                max_voters,
             },
         ))
     }

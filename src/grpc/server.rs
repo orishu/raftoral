@@ -130,12 +130,21 @@ impl<E: CommandExecutor + Default + 'static> RaftService for RaftServiceImpl<E> 
                     String::new()
                 };
 
+                // Get voter information from management cluster
+                let node_ids = management_cluster.get_node_ids();
+                let current_voter_count = node_ids.len() as u64;
+                let max_voters = 5u64; // Default from ManagementClusterConfig
+                let should_join_as_voter = current_voter_count < max_voters;
+
                 return Ok(Response::new(DiscoveryResponse {
                     node_id: self.node_id,
                     highest_known_node_id,
                     address: self.address.clone(),
                     management_leader_node_id,
                     management_leader_address,
+                    should_join_as_voter,
+                    current_voter_count,
+                    max_voters,
                 }));
             }
         }
@@ -152,6 +161,9 @@ impl<E: CommandExecutor + Default + 'static> RaftService for RaftServiceImpl<E> 
                 address: self.address.clone(),
                 management_leader_node_id: 0,  // No management cluster in single-cluster mode
                 management_leader_address: String::new(),
+                should_join_as_voter: true,    // Backward compatibility: all nodes are voters
+                current_voter_count: node_ids.len() as u64,
+                max_voters: 5,                 // Default value
             }))
         } else {
             // No cluster info available
@@ -161,6 +173,9 @@ impl<E: CommandExecutor + Default + 'static> RaftService for RaftServiceImpl<E> 
                 address: self.address.clone(),
                 management_leader_node_id: 0,
                 management_leader_address: String::new(),
+                should_join_as_voter: true,    // Backward compatibility: all nodes are voters
+                current_voter_count: 1,        // Just this node
+                max_voters: 5,                 // Default value
             }))
         }
     }
