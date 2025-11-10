@@ -19,7 +19,7 @@
 //! - `snapshot_data` → Snapshot protobuf bytes
 //! - `snapshot_metadata` → SnapshotMetadata
 
-use rocksdb::{ColumnFamilyDescriptor, DB, Options, WriteBatch};
+use rocksdb::{ColumnFamilyDescriptor, DB, Options, WriteBatch, WriteOptions};
 use raft::prelude::*;
 use raft::{Error, Result, StorageError};
 use raft::GetEntriesContext;
@@ -46,11 +46,11 @@ pub struct RocksDBStorage {
     /// RocksDB instance
     db: Arc<DB>,
 
-    /// Cached first index (for performance)
-    first_index_cache: AtomicU64,
+    /// Cached first index (for performance) - shared across clones
+    first_index_cache: Arc<AtomicU64>,
 
-    /// Cached last index (for performance)
-    last_index_cache: AtomicU64,
+    /// Cached last index (for performance) - shared across clones
+    last_index_cache: Arc<AtomicU64>,
 
     /// RwLock for coordinating reads and writes
     /// (RocksDB is thread-safe, but we need to coordinate cache updates)
@@ -96,8 +96,8 @@ impl RocksDBStorage {
 
         let storage = Self {
             db: Arc::new(db),
-            first_index_cache: AtomicU64::new(0),
-            last_index_cache: AtomicU64::new(0),
+            first_index_cache: Arc::new(AtomicU64::new(0)),
+            last_index_cache: Arc::new(AtomicU64::new(0)),
             lock: Arc::new(RwLock::new(())),
         };
 
@@ -242,7 +242,10 @@ impl RocksDBStorage {
         let value = hs.write_to_bytes()
             .map_err(|e| Error::Store(StorageError::Other(Box::new(e))))?;
 
-        self.db.put_cf(cf_metadata, KEY_HARD_STATE, value)
+        // Use synchronous write for hard state durability
+        let mut write_opts = WriteOptions::default();
+        write_opts.set_sync(true);
+        self.db.put_cf_opt(cf_metadata, KEY_HARD_STATE, value, &write_opts)
             .map_err(|e| Error::Store(StorageError::Other(Box::new(e))))?;
 
         Ok(())
@@ -384,6 +387,10 @@ impl RocksDBStorage {
             return Ok(());
         }
 
+        eprintln!("[DEBUG] RocksDBStorage::append: Appending {} entries, indices {:?}",
+            entries.len(),
+            entries.iter().map(|e| e.index).collect::<Vec<_>>());
+
         let _lock = self.lock.write().unwrap();
 
         let cf_entries = self.db.cf_handle(CF_ENTRIES)
@@ -407,18 +414,27 @@ impl RocksDBStorage {
 
         // Update first_index if this is the first write
         let current_first = self.first_index_cache.load(Ordering::SeqCst);
-        if current_first == 0 {
+        let current_last = self.last_index_cache.load(Ordering::SeqCst);
+        eprintln!("[DEBUG] RocksDBStorage::append: current_first={}, current_last={}", current_first, current_last);
+        if current_last == 0 {
+            // This is the first real append - update first_index to match the first entry
             let first_index = entries.first().unwrap().index;
+            eprintln!("[DEBUG] RocksDBStorage::append: First real append, updating first_index to {}", first_index);
             batch.put_cf(cf_metadata, KEY_FIRST_INDEX, first_index.to_be_bytes());
             self.first_index_cache.store(first_index, Ordering::SeqCst);
         }
 
-        // Write batch atomically
-        self.db.write(batch)
+        // Write batch atomically with fsync for durability
+        let mut write_opts = WriteOptions::default();
+        write_opts.set_sync(true);  // Force fsync to disk
+        self.db.write_opt(batch, &write_opts)
             .map_err(|e| Error::Store(StorageError::Other(Box::new(e))))?;
 
         // Update cache
         self.last_index_cache.store(last_index, Ordering::SeqCst);
+        eprintln!("[DEBUG] RocksDBStorage::append: Updated last_index_cache to {}", last_index);
+        eprintln!("[DEBUG] RocksDBStorage::append: Verification - last_index_cache.load() = {}",
+            self.last_index_cache.load(Ordering::SeqCst));
 
         Ok(())
     }
@@ -525,9 +541,13 @@ impl RocksDBStorage {
 
     /// Compatibility method: update commit index in hard state
     pub fn update_commit(&self, commit: u64) -> Result<()> {
+        eprintln!("[DEBUG] RocksDBStorage::update_commit: commit={}", commit);
         let mut hs = self.load_hard_state()?;
+        eprintln!("[DEBUG] RocksDBStorage::update_commit: old_commit={}", hs.commit);
         hs.set_commit(commit);
-        self.store_hard_state(&hs)
+        self.store_hard_state(&hs)?;
+        eprintln!("[DEBUG] RocksDBStorage::update_commit: stored new commit={}", commit);
+        Ok(())
     }
 
     /// Compatibility method: get mutable hard state reference (not truly mutable for RocksDB)
@@ -546,8 +566,8 @@ impl Clone for RocksDBStorage {
     fn clone(&self) -> Self {
         Self {
             db: self.db.clone(),
-            first_index_cache: AtomicU64::new(self.first_index_cache.load(Ordering::SeqCst)),
-            last_index_cache: AtomicU64::new(self.last_index_cache.load(Ordering::SeqCst)),
+            first_index_cache: self.first_index_cache.clone(),  // Clone the Arc, not create new AtomicU64
+            last_index_cache: self.last_index_cache.clone(),    // Clone the Arc, not create new AtomicU64
             lock: self.lock.clone(),
         }
     }
@@ -557,6 +577,9 @@ impl raft::Storage for RocksDBStorage {
     fn initial_state(&self) -> Result<RaftState> {
         let hard_state = self.load_hard_state()?;
         let conf_state = self.load_conf_state()?;
+
+        eprintln!("[DEBUG] RocksDBStorage::initial_state: hard_state=(term={}, vote={}, commit={}), conf_state=(voters={:?}, learners={:?})",
+            hard_state.term, hard_state.vote, hard_state.commit, conf_state.voters, conf_state.learners);
 
         Ok(RaftState {
             hard_state,
@@ -573,19 +596,26 @@ impl raft::Storage for RocksDBStorage {
     ) -> Result<Vec<Entry>> {
         let max_size = max_size.into();
 
+        eprintln!("[DEBUG] RocksDBStorage::entries: low={}, high={}, max_size={:?}", low, high, max_size);
+
         if low >= high {
+            eprintln!("[DEBUG] RocksDBStorage::entries: low >= high, returning empty");
             return Ok(vec![]);
         }
 
         let first_index = self.first_index_cache.load(Ordering::SeqCst);
         let last_index = self.last_index_cache.load(Ordering::SeqCst);
 
+        eprintln!("[DEBUG] RocksDBStorage::entries: first_index={}, last_index={}", first_index, last_index);
+
         // Check bounds
         if low < first_index {
+            eprintln!("[DEBUG] RocksDBStorage::entries: low < first_index, returning Compacted error");
             return Err(Error::Store(StorageError::Compacted));
         }
 
         if high > last_index + 1 {
+            eprintln!("[DEBUG] RocksDBStorage::entries: high > last_index+1, returning Unavailable error");
             return Err(Error::Store(StorageError::Unavailable));
         }
 
@@ -649,11 +679,15 @@ impl raft::Storage for RocksDBStorage {
     }
 
     fn first_index(&self) -> Result<u64> {
-        Ok(self.first_index_cache.load(Ordering::SeqCst))
+        let first = self.first_index_cache.load(Ordering::SeqCst);
+        eprintln!("[DEBUG] RocksDBStorage::first_index() = {}", first);
+        Ok(first)
     }
 
     fn last_index(&self) -> Result<u64> {
-        Ok(self.last_index_cache.load(Ordering::SeqCst))
+        let last = self.last_index_cache.load(Ordering::SeqCst);
+        eprintln!("[DEBUG] RocksDBStorage::last_index() = {}", last);
+        Ok(last)
     }
 
     fn snapshot(&self, request_index: u64, _to: u64) -> Result<Snapshot> {

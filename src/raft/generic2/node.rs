@@ -169,14 +169,16 @@ fn create_storage(
 ) -> Result<RaftStorage, Box<dyn std::error::Error>> {
     match &config.storage_path {
         Some(storage_path) => {
-            slog::info!(
-                slog::Logger::root(slog::Discard, slog::o!()),
-                "Creating RocksDB storage";
-                "path" => ?storage_path,
-                "node_id" => config.node_id,
-                "cluster_id" => config.cluster_id
-            );
-            Ok(RaftStorage::RocksDB(RocksDBStorage::open_or_create(storage_path, config.node_id, conf_state)?))
+            // Create cluster-specific subdirectory to avoid RocksDB lock conflicts
+            // when multiple clusters run on the same node
+            let cluster_storage_path = storage_path.join(format!("cluster_{}", config.cluster_id));
+
+            // Note: Using stderr for logging since we don't have a logger here
+            eprintln!("[DEBUG] About to create RocksDB storage at {:?} for cluster_id={}",
+                cluster_storage_path, config.cluster_id);
+            let result = RocksDBStorage::open_or_create(&cluster_storage_path, config.node_id, conf_state)?;
+            eprintln!("[DEBUG] Successfully created RocksDB storage for cluster_id={}", config.cluster_id);
+            Ok(RaftStorage::RocksDB(result))
         }
         None => {
             // Fall back to in-memory storage when storage_path is not provided
@@ -708,7 +710,9 @@ impl<SM: StateMachine> RaftNode<SM> {
 
         // 2. Handle committed entries BEFORE persisting new entries
         let committed_entries = ready.committed_entries();
+        eprintln!("[DEBUG] RaftNode::on_ready: committed_entries.len()={}", committed_entries.len());
         if !committed_entries.is_empty() {
+            eprintln!("[DEBUG] RaftNode::on_ready: Processing {} committed entries", committed_entries.len());
             for entry in committed_entries {
                 if entry.data.is_empty() {
                     // Empty entry from leader election
@@ -799,7 +803,9 @@ impl<SM: StateMachine> RaftNode<SM> {
 
         // 4. Persist hard state
         if let Some(hs) = ready.hs() {
-            store.wl().set_hardstate(hs.clone());
+            eprintln!("[DEBUG] RaftNode::on_ready: Persisting hard state: term={}, vote={}, commit={}",
+                hs.term, hs.vote, hs.commit);
+            store.wl().set_hardstate(hs.clone())?;
         }
 
         // 5. Handle role changes
@@ -839,11 +845,15 @@ impl<SM: StateMachine> RaftNode<SM> {
             }
         }
 
-        // 8. Advance the ready
-        let mut light_rd = self.raw_node.advance(ready);
+        // 8. Advance with persist notification (for synchronous persistence)
+        // advance_append automatically calls on_persist_ready and returns light ready
+        eprintln!("[DEBUG] RaftNode::on_ready: Calling advance_append for synchronous persistence");
+        let mut light_rd = self.raw_node.advance_append(ready);
 
         // 9. Handle commit index from light ready
+        eprintln!("[DEBUG] RaftNode::on_ready: light_rd.commit_index()={:?}", light_rd.commit_index());
         if let Some(commit) = light_rd.commit_index() {
+            eprintln!("[DEBUG] RaftNode::on_ready: Updating commit index to {}", commit);
             #[cfg(feature = "persistent-storage")]
             {
                 store.update_commit(commit)?;
@@ -863,6 +873,7 @@ impl<SM: StateMachine> RaftNode<SM> {
 
         // 11. Apply committed entries from light ready
         let light_committed = light_rd.committed_entries();
+        eprintln!("[DEBUG] RaftNode::on_ready: light_rd.committed_entries().len()={}", light_committed.len());
         if !light_committed.is_empty() {
             for entry in light_committed {
                 if entry.data.is_empty() {

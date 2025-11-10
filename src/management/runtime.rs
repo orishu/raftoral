@@ -56,6 +56,9 @@ where
     /// Cluster ID
     cluster_id: u32,
 
+    /// Storage path for persistent storage (passed to sub-clusters)
+    storage_path: Option<std::path::PathBuf>,
+
     /// Logger
     logger: Logger,
 
@@ -141,6 +144,7 @@ where
             cluster_manager: ClusterManager::new(ClusterManagerConfig::default()),
             node_id: config.node_id,
             cluster_id: config.cluster_id,
+            storage_path: config.storage_path.clone(),
             logger: logger.clone(),
             _phantom: PhantomData,
         });
@@ -200,6 +204,7 @@ where
             cluster_manager: ClusterManager::new(ClusterManagerConfig::default()),
             node_id: config.node_id,
             cluster_id: config.cluster_id,
+            storage_path: config.storage_path.clone(),
             logger: logger.clone(),
             _phantom: PhantomData,
         });
@@ -1059,6 +1064,7 @@ where
                                 node_id: self.node_id,
                                 cluster_id,
                                 snapshot_interval: 100,
+                                storage_path: self.storage_path.clone(),
                                 ..Default::default()
                             };
 
@@ -1217,6 +1223,7 @@ where
                                         node_id: self.node_id,
                                         cluster_id,
                                         snapshot_interval: 100,
+                                        storage_path: self.storage_path.clone(),
                                         ..Default::default()
                                     };
 
