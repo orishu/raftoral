@@ -180,8 +180,10 @@ impl RocksDBStorage {
         // Initialize with provided conf state
         self.store_conf_state_locked(&conf_state)?;
 
-        // Initialize indices to 0
-        self.store_index_locked(KEY_FIRST_INDEX, 0)?;
+        // Initialize indices following raft-rs convention:
+        // - Empty log has first_index = 1, last_index = 0
+        // - This maintains the invariant: first_index > last_index when empty
+        self.store_index_locked(KEY_FIRST_INDEX, 1)?;
         self.store_index_locked(KEY_LAST_INDEX, 0)?;
 
         Ok(())
@@ -619,14 +621,20 @@ impl raft::Storage for RocksDBStorage {
         let first_index = self.first_index_cache.load(Ordering::SeqCst);
         let last_index = self.last_index_cache.load(Ordering::SeqCst);
 
-        if idx < first_index {
-            // Check if this matches the snapshot
-            if let Some(snapshot) = self.get_snapshot()? {
-                let snapshot_index = snapshot.get_metadata().index;
-                if idx == snapshot_index {
-                    return Ok(snapshot.get_metadata().term);
-                }
+        // Check if this matches the snapshot (following MemStorage logic)
+        if let Some(snapshot) = self.get_snapshot()? {
+            let snapshot_index = snapshot.get_metadata().index;
+            if idx == snapshot_index {
+                return Ok(snapshot.get_metadata().term);
             }
+        } else {
+            // No snapshot stored yet - default snapshot has index=0, term=0
+            if idx == 0 {
+                return Ok(0);
+            }
+        }
+
+        if idx < first_index {
             return Err(Error::Store(StorageError::Compacted));
         }
 
@@ -681,8 +689,9 @@ mod tests {
     fn test_create_and_open() {
         let (storage, _temp_dir) = create_test_storage();
 
-        // Verify initial state
-        assert_eq!(storage.first_index().unwrap(), 0);
+        // Verify initial state follows raft-rs convention:
+        // Empty log has first_index=1, last_index=0 (first > last indicates empty)
+        assert_eq!(storage.first_index().unwrap(), 1);
         assert_eq!(storage.last_index().unwrap(), 0);
 
         let raft_state = storage.initial_state().unwrap();
@@ -918,8 +927,10 @@ mod tests {
         assert_eq!(storage.term(3).unwrap(), 3);
         assert_eq!(storage.term(5).unwrap(), 5);
 
-        // Out of bounds
-        assert!(storage.term(0).is_err());
+        // term(0) returns 0 (default snapshot term) following raft-rs MemStorage convention
+        assert_eq!(storage.term(0).unwrap(), 0);
+
+        // Index beyond last_index is unavailable
         assert!(storage.term(6).is_err());
     }
 

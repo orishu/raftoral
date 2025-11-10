@@ -56,14 +56,21 @@ cleanup() {
         kill $NODE2_PID 2>/dev/null || true
         wait $NODE2_PID 2>/dev/null || true
     fi
-    echo -e "${GREEN}✓ Processes stopped${NC}"
+    # Clean up storage directories
+    rm -rf ./raftoral_node1_data ./raftoral_node2_data
+    echo -e "${GREEN}✓ Processes stopped and storage cleaned up${NC}"
 }
 
 # Set trap for cleanup on exit
 trap cleanup EXIT
 
-# Clean up any previous test logs
+# Clean up any previous test logs and storage directories
 rm -f /tmp/raftoral_node1.log /tmp/raftoral_node2.log
+rm -rf ./raftoral_node1_data ./raftoral_node2_data
+
+# Create storage directories for persistent storage
+mkdir -p ./raftoral_node1_data ./raftoral_node2_data
+echo -e "${GREEN}✓ Created storage directories${NC}\n"
 
 # Build the binary first (dev mode for faster builds)
 echo -e "${YELLOW}Building raftoral binary...${NC}"
@@ -76,6 +83,7 @@ RUST_LOG=info cargo run --bin raftoral -- \
     --listen 127.0.0.1:7001 \
     --node-id 1 \
     --bootstrap \
+    --storage-path ./raftoral_node1_data \
     > /tmp/raftoral_node1.log 2>&1 &
 NODE1_PID=$!
 echo -e "${GREEN}✓ Node 1 started (PID: $NODE1_PID)${NC}"
@@ -100,6 +108,7 @@ echo -e "\n${YELLOW}Starting Node 2 (join mode with automatic discovery)...${NC}
 RUST_LOG=info cargo run --bin raftoral -- \
     --listen 127.0.0.1:7002 \
     --peers 127.0.0.1:7001 \
+    --storage-path ./raftoral_node2_data \
     > /tmp/raftoral_node2.log 2>&1 &
 NODE2_PID=$!
 echo -e "${GREEN}✓ Node 2 started (PID: $NODE2_PID)${NC}"

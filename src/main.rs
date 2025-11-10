@@ -28,6 +28,10 @@ struct Args {
     /// Bootstrap a new cluster (use this for the first node)
     #[arg(short, long, default_value_t = false)]
     bootstrap: bool,
+
+    /// Path for persistent storage (optional, uses in-memory storage if not provided)
+    #[arg(short = 's', long)]
+    storage_path: Option<String>,
 }
 
 // Workflow uses simple String input/output for compatibility with scripts
@@ -52,20 +56,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Determine address (advertise takes precedence if provided)
     let address = args.advertise.as_ref().unwrap_or(&args.listen).clone();
 
+    // Convert storage_path to PathBuf if provided
+    let storage_path = args.storage_path.map(std::path::PathBuf::from);
+
     // Create FullNode based on mode
     let node = if args.bootstrap {
         let node_id = args.node_id.unwrap_or(1);
-        info!(logger, "Bootstrap mode"; "node_id" => node_id);
+        info!(logger, "Bootstrap mode"; "node_id" => node_id, "storage_path" => ?storage_path);
 
-        FullNode::new(node_id, address, logger.clone()).await?
+        FullNode::new(node_id, address, storage_path, logger.clone()).await?
     } else {
         if args.peers.is_empty() {
             return Err("--peers is required when not in bootstrap mode".into());
         }
 
-        info!(logger, "Join mode"; "peers" => ?args.peers);
+        info!(logger, "Join mode"; "peers" => ?args.peers, "storage_path" => ?storage_path);
 
-        let node = FullNode::new_joining(address, args.peers, logger.clone()).await?;
+        let node = FullNode::new_joining(address, args.peers, storage_path, logger.clone()).await?;
 
         info!(logger, "Node joined with ID"; "node_id" => node.node_id());
         node

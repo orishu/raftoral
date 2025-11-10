@@ -55,6 +55,7 @@ impl FullNode {
     /// # Arguments
     /// * `node_id` - Unique identifier for this node
     /// * `address` - Network address to bind to (e.g., "127.0.0.1:50051")
+    /// * `storage_path` - Optional path for persistent storage (None = in-memory)
     /// * `logger` - Logger instance
     ///
     /// # Returns
@@ -62,6 +63,7 @@ impl FullNode {
     pub async fn new(
         node_id: u64,
         address: String,
+        storage_path: Option<std::path::PathBuf>,
         logger: Logger,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         info!(logger, "Creating FullNode"; "node_id" => node_id, "address" => &address);
@@ -87,6 +89,7 @@ impl FullNode {
             node_id,
             cluster_id: 0, // Management cluster ID
             snapshot_interval: 100, // Take snapshot every 100 entries
+            storage_path,
             ..Default::default()
         };
 
@@ -183,6 +186,7 @@ impl FullNode {
     /// # Arguments
     /// * `address` - Network address to bind to (e.g., "127.0.0.1:50051")
     /// * `seed_addresses` - Addresses of existing cluster nodes to discover
+    /// * `storage_path` - Optional path for persistent storage (None = in-memory)
     /// * `logger` - Logger instance
     ///
     /// # Returns
@@ -190,6 +194,7 @@ impl FullNode {
     pub async fn new_joining(
         address: String,
         seed_addresses: Vec<String>,
+        storage_path: Option<std::path::PathBuf>,
         logger: Logger,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         info!(logger, "Creating FullNode in join mode";
@@ -251,6 +256,7 @@ impl FullNode {
             node_id,
             cluster_id: 0, // Management cluster ID
             snapshot_interval: 100,
+            storage_path,
             ..Default::default()
         };
 
@@ -456,6 +462,7 @@ mod tests {
         let node = FullNode::new(
             1,
             "127.0.0.1:50051".to_string(),
+            None, // No persistent storage for test
             logger.clone(),
         )
         .await
@@ -534,6 +541,7 @@ mod tests {
         let node1 = FullNode::new(
             1,
             "127.0.0.1:50061".to_string(),
+            None, // No persistent storage for test
             logger.clone(),
         )
         .await
@@ -550,6 +558,7 @@ mod tests {
         let node2 = FullNode::new_joining(
             "127.0.0.1:50062".to_string(),
             vec!["127.0.0.1:50061".to_string()],
+            None, // No persistent storage for test
             logger.clone(),
         )
         .await
