@@ -85,7 +85,7 @@ where
     pub fn new(
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
-        mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
+        mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
         cluster_router: Arc<ClusterRouter>,
         shared_config: Arc<Mutex<R::SharedConfig>>,
         logger: Logger,
@@ -234,7 +234,7 @@ where
     pub fn new_joining_node(
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
-        mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
+        mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
         initial_voters: Vec<u64>,
         cluster_router: Arc<ClusterRouter>,
         shared_config: Arc<Mutex<R::SharedConfig>>,
@@ -319,7 +319,7 @@ where
     pub fn new_joining_learner(
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
-        mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
+        mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
         existing_voters: Vec<u64>,
         cluster_router: Arc<ClusterRouter>,
         shared_config: Arc<Mutex<R::SharedConfig>>,
@@ -1366,7 +1366,7 @@ mod tests {
         fn new_single_node(
             _config: RaftNodeConfig,
             _transport: Arc<dyn crate::raft::generic2::Transport>,
-            _mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
+            _mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
             _shared_config: Arc<Mutex<Self::SharedConfig>>,
             _logger: Logger,
         ) -> Result<(Self, Arc<Mutex<RaftNode<Self::StateMachine>>>), Box<dyn std::error::Error>> {
@@ -1376,7 +1376,7 @@ mod tests {
         fn new_joining_node(
             _config: RaftNodeConfig,
             _transport: Arc<dyn crate::raft::generic2::Transport>,
-            _mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
+            _mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
             _initial_voters: Vec<u64>,
             _shared_config: Arc<Mutex<Self::SharedConfig>>,
             _logger: Logger,

@@ -3,7 +3,7 @@
 //! This module provides a gRPC client that implements the MessageSender trait,
 //! enabling the Transport layer to send Raft messages over gRPC.
 
-use crate::grpc::server::raft_proto::{
+use crate::grpc2::proto::{
     raft_service_client::RaftServiceClient, GenericMessage, MessageResponse,
 };
 use crate::raft::generic2::errors::TransportError;

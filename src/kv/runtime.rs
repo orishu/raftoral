@@ -49,7 +49,7 @@ impl KvRuntime {
     pub fn new(
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
-        mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
+        mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
         logger: Logger,
     ) -> Result<(Self, Arc<Mutex<RaftNode<KvStateMachine>>>), Box<dyn std::error::Error>> {
         let state_machine = KvStateMachine::new();
@@ -115,7 +115,7 @@ impl KvRuntime {
     pub fn new_joining_node(
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
-        mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
+        mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
         initial_voters: Vec<u64>,
         logger: Logger,
     ) -> Result<(Self, Arc<Mutex<RaftNode<KvStateMachine>>>), Box<dyn std::error::Error>> {
@@ -327,7 +327,7 @@ impl crate::management::SubClusterRuntime for KvRuntime {
     fn new_single_node(
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
-        mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
+        mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
         _shared_config: Arc<tokio::sync::Mutex<Self::SharedConfig>>,
         logger: slog::Logger,
     ) -> Result<(Self, Arc<Mutex<RaftNode<Self::StateMachine>>>), Box<dyn std::error::Error>> {
@@ -337,7 +337,7 @@ impl crate::management::SubClusterRuntime for KvRuntime {
     fn new_joining_node(
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
-        mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
+        mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
         initial_voters: Vec<u64>,
         _shared_config: Arc<tokio::sync::Mutex<Self::SharedConfig>>,
         logger: slog::Logger,

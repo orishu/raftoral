@@ -1,14 +1,10 @@
 pub mod raft;
-pub mod workflow;
-pub mod grpc;
-pub mod grpc2;  // New gRPC implementation for generic2 architecture
+pub mod grpc2;  // gRPC implementation for generic2 architecture
 pub mod kv;  // KV runtime for generic2 architecture
 pub mod management;  // Management runtime for generic2 architecture
 pub mod workflow2;  // Workflow execution runtime for generic2 architecture
 pub mod full_node;  // Complete node stack (Layer 0-7)
 pub mod config;  // Configuration for Raftoral nodes
-pub mod runtime;
-pub mod nodemanager;
 
 /// Create a replicated variable with an explicit key.
 ///
@@ -53,15 +49,5 @@ macro_rules! checkpoint_compute {
     };
 }
 
-// Type alias for our workflow-specific cluster
-pub type WorkflowCluster = raft::RaftCluster<workflow::WorkflowCommandExecutor>;
-
-pub use raft::{RaftCluster, PlaceholderCommand, RaftCommand, RoleChange};
-pub use workflow::{
-    WorkflowCommand, WorkflowStartData, WorkflowEndData, CheckpointData,
-    WorkflowCommandExecutor, WorkflowError,
-    ReplicatedVar, ReplicatedVarError, WorkflowRuntime, WorkflowRun, WorkflowContext
-};
-pub use grpc::{start_grpc_server, start_grpc_server_with_config, GrpcServerHandle, RaftClient, discover_peers, DiscoveredPeer, bootstrap};
+// Re-export common types for convenience
 pub use config::RaftoralConfig;
-pub use runtime::RaftoralGrpcRuntime;

@@ -149,19 +149,19 @@ impl FullNode {
         let grpc_server_handle = tokio::spawn(async move {
             // Enable gRPC reflection for grpcurl support
             let reflection_service = tonic_reflection::server::Builder::configure()
-                .register_encoded_file_descriptor_set(crate::grpc::server::raft_proto::FILE_DESCRIPTOR_SET)
+                .register_encoded_file_descriptor_set(crate::grpc2::proto::FILE_DESCRIPTOR_SET)
                 .build_v1()
                 .unwrap();
 
             Server::builder()
                 .add_service(reflection_service)
                 .add_service(
-                    crate::grpc::server::raft_proto::raft_service_server::RaftServiceServer::new(
+                    crate::grpc2::proto::raft_service_server::RaftServiceServer::new(
                         (*grpc_server_clone).clone(),
                     ),
                 )
                 .add_service(
-                    crate::grpc::server::raft_proto::workflow_management_server::WorkflowManagementServer::new(
+                    crate::grpc2::proto::workflow_management_server::WorkflowManagementServer::new(
                         workflow_service,
                     ),
                 )
@@ -203,7 +203,7 @@ impl FullNode {
         );
 
         // Discover existing peers
-        use crate::grpc::bootstrap::{discover_peers, next_node_id};
+        use crate::grpc2::bootstrap::{discover_peers, next_node_id};
         let discovered_peers = discover_peers(seed_addresses).await;
 
         if discovered_peers.is_empty() {
@@ -214,194 +214,187 @@ impl FullNode {
         let node_id = next_node_id(&discovered_peers);
         info!(logger, "Assigned node ID"; "node_id" => node_id);
 
-        // Find management leader
-        let leader_peer = discovered_peers.iter()
-            .find(|p| p.management_leader_node_id != 0)
-            .ok_or("No management leader found in discovered peers")?;
 
-        info!(logger, "Found management leader";
-            "leader_node_id" => leader_peer.management_leader_node_id,
-            "leader_address" => &leader_peer.management_leader_address
-        );
+// Find management leader
+let leader_peer = discovered_peers.iter()
+    .find(|p| p.management_leader_node_id != 0)
+    .ok_or("No management leader found in discovered peers")?;
+info!(logger, "Found management leader";
+    "leader_node_id" => leader_peer.management_leader_node_id,
+    "leader_address" => &leader_peer.management_leader_address
+);
+// Layer 1: Create transport with gRPC message sender
+let grpc_sender = Arc::new(GrpcMessageSender::new());
+let transport = Arc::new(TransportLayer::new(grpc_sender));
+// Add all discovered peers to transport
+for peer in &discovered_peers {
+    transport.add_peer(peer.node_id, peer.address.clone()).await;
+}
+// Create mailbox for this node
+let (mailbox_tx, mailbox_rx) = mpsc::channel(1000);
+// Layer 2: Create cluster router
+let cluster_router = Arc::new(ClusterRouter::new());
+// Register this node's cluster (cluster_id = 0 for management)
+cluster_router.register_cluster(0, mailbox_tx).await;
+// Determine if we should join as voter or learner
+// All discovered peers should have consistent voter information
+let should_join_as_voter = discovered_peers.first()
+    .map(|p| p.should_join_as_voter)
+    .unwrap_or(true); // Default to voter if no info available
+// Create shared workflow registry
+let registry = Arc::new(Mutex::new(crate::workflow2::WorkflowRegistry::new()));
 
-        // Layer 1: Create transport with gRPC message sender
-        let grpc_sender = Arc::new(GrpcMessageSender::new());
-        let transport = Arc::new(TransportLayer::new(grpc_sender));
+// Layers 3-7: Create management runtime in joining mode
+let config = RaftNodeConfig {
+node_id,
+cluster_id: 0, // Management cluster ID
+snapshot_interval: 100,
+storage_path,
+..Default::default()
+};
 
-        // Add all discovered peers to transport
-        for peer in &discovered_peers {
-            transport.add_peer(peer.node_id, peer.address.clone()).await;
-        }
+let (runtime, node) = if should_join_as_voter {
+// Collect voter node IDs including ourselves
+let initial_voters: Vec<u64> = discovered_peers.iter()
+.map(|p| p.node_id)
+.chain(std::iter::once(node_id)) // Include ourselves as voter
+.collect();
 
-        // Create mailbox for this node
-        let (mailbox_tx, mailbox_rx) = mpsc::channel(1000);
+info!(logger, "Joining management cluster as VOTER";
+"node_id" => node_id,
+"existing_voters" => ?initial_voters
+);
 
-        // Layer 2: Create cluster router
-        let cluster_router = Arc::new(ClusterRouter::new());
+ManagementRuntime::new_joining_node(
+config,
+transport.clone(),
+mailbox_rx,
+initial_voters,
+cluster_router.clone(),
+registry.clone(),
+logger.clone(),
+)?
+} else {
+// Collect existing voter node IDs (NOT including ourselves)
+let existing_voters: Vec<u64> = discovered_peers.iter()
+.map(|p| p.node_id)
+.collect();
 
-        // Register this node's cluster (cluster_id = 0 for management)
-        cluster_router.register_cluster(0, mailbox_tx).await;
+info!(logger, "Joining management cluster as LEARNER";
+"node_id" => node_id,
+"existing_voters" => ?existing_voters
+);
 
-        // Determine if we should join as voter or learner
-        // All discovered peers should have consistent voter information
-        let should_join_as_voter = discovered_peers.first()
-            .map(|p| p.should_join_as_voter)
-            .unwrap_or(true); // Default to voter if no info available
+ManagementRuntime::new_joining_learner(
+config,
+transport.clone(),
+mailbox_rx,
+existing_voters,
+cluster_router.clone(),
+registry.clone(),
+logger.clone(),
+)?
+};
 
-        // Create shared workflow registry
-        let registry = Arc::new(Mutex::new(crate::workflow2::WorkflowRegistry::new()));
+// Run Raft node in background
+let node_clone = node.clone();
+tokio::spawn(async move {
+info!(slog::Logger::root(slog::Discard, slog::o!()), "Starting Raft node event loop");
+let _ = RaftNode::run_from_arc(node_clone).await;
+});
 
-        // Layers 3-7: Create management runtime in joining mode
-        let config = RaftNodeConfig {
-            node_id,
-            cluster_id: 0, // Management cluster ID
-            snapshot_interval: 100,
-            storage_path,
-            ..Default::default()
-        };
+// Do NOT campaign - we're joining an existing cluster
+// The leader will add us via add_node()
 
-        let (runtime, node) = if should_join_as_voter {
-            // Collect voter node IDs including ourselves
-            let initial_voters: Vec<u64> = discovered_peers.iter()
-                .map(|p| p.node_id)
-                .chain(std::iter::once(node_id)) // Include ourselves as voter
-                .collect();
+// Layer 0: Start gRPC server
+let grpc_server = Arc::new(GrpcServer::new(
+cluster_router,
+node_id,
+address.clone(),
+runtime.clone(),
+));
 
-            info!(logger, "Joining management cluster as VOTER";
-                "node_id" => node_id,
-                "existing_voters" => ?initial_voters
-            );
+// Start leader tracker
+grpc_server.start_leader_tracker(node.clone(), transport.clone());
 
-            ManagementRuntime::new_joining_node(
-                config,
-                transport.clone(),
-                mailbox_rx,
-                initial_voters,
-                cluster_router.clone(),
-                registry.clone(),
-                logger.clone(),
-            )?
-        } else {
-            // Collect existing voter node IDs (NOT including ourselves)
-            let existing_voters: Vec<u64> = discovered_peers.iter()
-                .map(|p| p.node_id)
-                .collect();
+// Create WorkflowManagement service
+let workflow_service = WorkflowManagementService::new(runtime.clone(), logger.clone());
 
-            info!(logger, "Joining management cluster as LEARNER";
-                "node_id" => node_id,
-                "existing_voters" => ?existing_voters
-            );
+let addr = address.parse()?;
 
-            ManagementRuntime::new_joining_learner(
-                config,
-                transport.clone(),
-                mailbox_rx,
-                existing_voters,
-                cluster_router.clone(),
-                registry.clone(),
-                logger.clone(),
-            )?
-        };
+info!(logger, "Starting gRPC server"; "address" => &address);
 
-        // Run Raft node in background
-        let node_clone = node.clone();
-        tokio::spawn(async move {
-            info!(slog::Logger::root(slog::Discard, slog::o!()), "Starting Raft node event loop");
-            let _ = RaftNode::run_from_arc(node_clone).await;
-        });
+let grpc_server_clone = grpc_server.clone();
+let grpc_server_handle = tokio::spawn(async move {
+// Enable gRPC reflection for grpcurl support
+let reflection_service = tonic_reflection::server::Builder::configure()
+.register_encoded_file_descriptor_set(crate::grpc2::proto::FILE_DESCRIPTOR_SET)
+.build_v1()
+.unwrap();
 
-        // Do NOT campaign - we're joining an existing cluster
-        // The leader will add us via add_node()
+Server::builder()
+.add_service(reflection_service)
+.add_service(
+crate::grpc2::proto::raft_service_server::RaftServiceServer::new(
+(*grpc_server_clone).clone(),
+),
+)
+.add_service(
+crate::grpc2::proto::workflow_management_server::WorkflowManagementServer::new(
+workflow_service,
+),
+)
+.serve(addr)
+.await
+});
 
-        // Layer 0: Start gRPC server
-        let grpc_server = Arc::new(GrpcServer::new(
-            cluster_router,
-            node_id,
-            address.clone(),
-            runtime.clone(),
-        ));
+info!(logger, "FullNode started in join mode"; "node_id" => node_id, "address" => &address);
 
-        // Start leader tracker
-        grpc_server.start_leader_tracker(node.clone(), transport.clone());
+let full_node = Self {
+runtime: runtime.clone(),
+node,
+grpc_server_handle: Some(grpc_server_handle),
+workflow_registry: registry,
+address: address.clone(),
+logger: logger.clone(),
+};
 
-        // Create WorkflowManagement service
-        let workflow_service = WorkflowManagementService::new(runtime.clone(), logger.clone());
+// Use AddNode RPC to register with management cluster leader
+info!(logger, "Calling AddNode RPC on management leader";
+"node_id" => node_id, "leader" => &leader_peer.management_leader_address);
 
-        let addr = address.parse()?;
+use crate::grpc2::proto::raft_service_client::RaftServiceClient;
+use crate::grpc2::proto::AddNodeRequest;
 
-        info!(logger, "Starting gRPC server"; "address" => &address);
+let leader_endpoint = format!("http://{}", leader_peer.management_leader_address);
+match RaftServiceClient::connect(leader_endpoint).await {
+Ok(mut client) => {
+let request = tonic::Request::new(AddNodeRequest {
+node_id,
+address: address.clone(),
+});
 
-        let grpc_server_clone = grpc_server.clone();
-        let grpc_server_handle = tokio::spawn(async move {
-            // Enable gRPC reflection for grpcurl support
-            let reflection_service = tonic_reflection::server::Builder::configure()
-                .register_encoded_file_descriptor_set(crate::grpc::server::raft_proto::FILE_DESCRIPTOR_SET)
-                .build_v1()
-                .unwrap();
+match client.add_node(request).await {
+Ok(response) => {
+let resp = response.into_inner();
+if resp.success {
+info!(logger, "Successfully added to management cluster via RPC");
+// ClusterManager will automatically assign us to an execution cluster
+} else {
+info!(logger, "AddNode RPC returned error"; "error" => &resp.error);
+}
+}
+Err(e) => {
+info!(logger, "AddNode RPC call failed"; "error" => %e);
+}
+}
+}
+Err(e) => {
+info!(logger, "Failed to connect to management leader"; "error" => %e);
+}
+}
 
-            Server::builder()
-                .add_service(reflection_service)
-                .add_service(
-                    crate::grpc::server::raft_proto::raft_service_server::RaftServiceServer::new(
-                        (*grpc_server_clone).clone(),
-                    ),
-                )
-                .add_service(
-                    crate::grpc::server::raft_proto::workflow_management_server::WorkflowManagementServer::new(
-                        workflow_service,
-                    ),
-                )
-                .serve(addr)
-                .await
-        });
-
-        info!(logger, "FullNode started in join mode"; "node_id" => node_id, "address" => &address);
-
-        let full_node = Self {
-            runtime: runtime.clone(),
-            node,
-            grpc_server_handle: Some(grpc_server_handle),
-            workflow_registry: registry,
-            address: address.clone(),
-            logger: logger.clone(),
-        };
-
-        // Use AddNode RPC to register with management cluster leader
-        info!(logger, "Calling AddNode RPC on management leader";
-            "node_id" => node_id, "leader" => &leader_peer.management_leader_address);
-
-        use crate::grpc::server::raft_proto::raft_service_client::RaftServiceClient;
-        use crate::grpc::server::raft_proto::AddNodeRequest;
-
-        let leader_endpoint = format!("http://{}", leader_peer.management_leader_address);
-        match RaftServiceClient::connect(leader_endpoint).await {
-            Ok(mut client) => {
-                let request = tonic::Request::new(AddNodeRequest {
-                    node_id,
-                    address: address.clone(),
-                });
-
-                match client.add_node(request).await {
-                    Ok(response) => {
-                        let resp = response.into_inner();
-                        if resp.success {
-                            info!(logger, "Successfully added to management cluster via RPC");
-                            // ClusterManager will automatically assign us to an execution cluster
-                        } else {
-                            info!(logger, "AddNode RPC returned error"; "error" => &resp.error);
-                        }
-                    }
-                    Err(e) => {
-                        info!(logger, "AddNode RPC call failed"; "error" => %e);
-                    }
-                }
-            }
-            Err(e) => {
-                info!(logger, "Failed to connect to management leader"; "error" => %e);
-            }
-        }
-
-        Ok(full_node)
+Ok(full_node)
     }
 
     /// Get a reference to the management runtime

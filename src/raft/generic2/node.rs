@@ -4,8 +4,8 @@
 //! - Mailbox: receives peer Raft messages from lower layers (via ClusterRouter → Transport)
 //! - Methods: upper layer commands (propose, campaign, add_node, remove_node)
 
-use crate::grpc::server::raft_proto::{self, GenericMessage};
-use crate::raft::generic::storage::MemStorageWithSnapshot;
+use crate::grpc2::proto::{self as raft_proto, GenericMessage};
+use crate::raft::generic2::storage::MemStorageWithSnapshot;
 #[cfg(feature = "persistent-storage")]
 use crate::raft::generic2::rocksdb_storage::RocksDBStorage;
 use crate::raft::generic2::errors::TransportError;

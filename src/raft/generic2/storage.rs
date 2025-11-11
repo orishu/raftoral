@@ -4,11 +4,15 @@
 //! When the `persistent-storage` feature is enabled, RaftStorage can be either variant.
 //! When disabled, it's just a type alias to MemStorageWithSnapshot.
 
-use crate::raft::generic::storage::MemStorageWithSnapshot;
-#[cfg(feature = "persistent-storage")]
-use crate::raft::generic2::rocksdb_storage::RocksDBStorage;
 use raft::prelude::*;
 use raft::{Storage, GetEntriesContext};
+use raft::storage::MemStorage;
+
+/// Type alias for MemStorage from raft-rs (in-memory storage with snapshot support)
+pub type MemStorageWithSnapshot = MemStorage;
+
+#[cfg(feature = "persistent-storage")]
+use crate::raft::generic2::rocksdb_storage::RocksDBStorage;
 
 /// Storage type that can be either RocksDB (persistent) or in-memory
 ///
@@ -82,7 +86,10 @@ impl RaftStorage {
     pub fn apply_snapshot_with_data(&self, snapshot: Snapshot) -> raft::Result<()> {
         match self {
             RaftStorage::RocksDB(s) => s.apply_snapshot_with_data(snapshot),
-            RaftStorage::Memory(s) => s.apply_snapshot_with_data(snapshot),
+            RaftStorage::Memory(s) => {
+                // MemStorage doesn't have apply_snapshot_with_data, use apply_snapshot instead
+                s.wl().apply_snapshot(snapshot)
+            }
         }
     }
 

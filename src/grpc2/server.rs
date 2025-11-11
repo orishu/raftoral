@@ -3,7 +3,7 @@
 //! This module provides a gRPC server that receives Raft messages via RaftService
 //! and forwards them to the ClusterRouter for routing to the appropriate cluster.
 
-use crate::grpc::server::raft_proto::{
+use crate::grpc2::proto::{
     raft_service_server::{RaftService, RaftServiceServer},
     AddNodeRequest, AddNodeResponse, GenericMessage, MessageResponse,
 };
@@ -185,8 +185,8 @@ impl RaftService for GrpcServer {
 
     async fn discover(
         &self,
-        _request: Request<crate::grpc::server::raft_proto::DiscoveryRequest>,
-    ) -> Result<Response<crate::grpc::server::raft_proto::DiscoveryResponse>, Status> {
+        _request: Request<crate::grpc2::proto::DiscoveryRequest>,
+    ) -> Result<Response<crate::grpc2::proto::DiscoveryResponse>, Status> {
         // Get cached leader information
         let leader = self.management_leader.lock().await.clone();
 
@@ -201,7 +201,7 @@ impl RaftService for GrpcServer {
         let should_join_as_voter = current_voter_count < max_voters;
 
         Ok(Response::new(
-            crate::grpc::server::raft_proto::DiscoveryResponse {
+            crate::grpc2::proto::DiscoveryResponse {
                 node_id: self.node_id,
                 highest_known_node_id: highest_known,
                 address: self.node_address.clone(),

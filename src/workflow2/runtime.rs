@@ -121,7 +121,7 @@ impl WorkflowRuntime {
     pub fn new(
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
-        mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
+        mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
         registry: Arc<Mutex<WorkflowRegistry>>,
         logger: Logger,
     ) -> Result<
@@ -185,7 +185,7 @@ impl WorkflowRuntime {
     pub fn new_joining_node(
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
-        mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
+        mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
         initial_voters: Vec<u64>,
         registry: Arc<Mutex<WorkflowRegistry>>,
         logger: Logger,
@@ -1227,7 +1227,7 @@ impl crate::management::SubClusterRuntime for WorkflowRuntime {
     fn new_single_node(
         config: RaftNodeConfig,
         transport: Arc<dyn crate::raft::generic2::Transport>,
-        mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
+        mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
         shared_config: Arc<Mutex<Self::SharedConfig>>,
         logger: slog::Logger,
     ) -> Result<
@@ -1240,7 +1240,7 @@ impl crate::management::SubClusterRuntime for WorkflowRuntime {
     fn new_joining_node(
         config: RaftNodeConfig,
         transport: Arc<dyn crate::raft::generic2::Transport>,
-        mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
+        mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
         initial_voters: Vec<u64>,
         shared_config: Arc<Mutex<Self::SharedConfig>>,
         logger: slog::Logger,

@@ -1,6 +1,7 @@
 //! Configuration for Raftoral nodes
 
-use crate::grpc::{client::ChannelBuilder, ServerConfigurator};
+// TODO: Re-implement these types in grpc2 if needed
+// use crate::grpc::{client::ChannelBuilder, ServerConfigurator};
 
 /// Configuration for starting a Raftoral gRPC node.
 pub struct RaftoralConfig {
@@ -21,13 +22,14 @@ pub struct RaftoralConfig {
     /// Bootstrap a new cluster (use this for the first node)
     pub bootstrap: bool,
 
-    /// Optional gRPC channel builder for customizing client connections
-    /// (TLS, timeouts, compression, etc.)
-    pub channel_builder: Option<ChannelBuilder>,
-
-    /// Optional gRPC server configurator for customizing the server
-    /// (TLS, concurrency limits, timeouts, etc.)
-    pub server_configurator: Option<ServerConfigurator>,
+    // TODO: Re-enable these when gRPC customization types are re-implemented in grpc2
+    // /// Optional gRPC channel builder for customizing client connections
+    // /// (TLS, timeouts, compression, etc.)
+    // pub channel_builder: Option<ChannelBuilder>,
+    //
+    // /// Optional gRPC server configurator for customizing the server
+    // /// (TLS, concurrency limits, timeouts, etc.)
+    // pub server_configurator: Option<ServerConfigurator>,
 }
 
 impl RaftoralConfig {
@@ -39,8 +41,6 @@ impl RaftoralConfig {
             node_id,
             peers: Vec::new(),
             bootstrap: true,
-            channel_builder: None,
-            server_configurator: None,
         }
     }
 
@@ -52,8 +52,6 @@ impl RaftoralConfig {
             node_id: None,
             peers,
             bootstrap: false,
-            channel_builder: None,
-            server_configurator: None,
         }
     }
 
@@ -69,29 +67,30 @@ impl RaftoralConfig {
         self
     }
 
-    /// Set a custom gRPC channel builder for client connections.
-    ///
-    /// This allows customization of outgoing gRPC connections with features like:
-    /// - TLS/SSL configuration
-    /// - Connection timeouts
-    /// - Keep-alive settings
-    /// - Compression
-    /// - Interceptors for authentication
-    pub fn with_channel_builder(mut self, builder: ChannelBuilder) -> Self {
-        self.channel_builder = Some(builder);
-        self
-    }
-
-    /// Set a custom gRPC server configurator.
-    ///
-    /// This allows customization of the gRPC server with features like:
-    /// - TLS/SSL configuration
-    /// - Concurrency limits
-    /// - Request timeouts
-    /// - Maximum message sizes
-    /// - Interceptors for authentication/authorization
-    pub fn with_server_configurator(mut self, configurator: ServerConfigurator) -> Self {
-        self.server_configurator = Some(configurator);
-        self
-    }
+    // TODO: Re-enable these when gRPC customization types are re-implemented in grpc2
+    // /// Set a custom gRPC channel builder for client connections.
+    // ///
+    // /// This allows customization of outgoing gRPC connections with features like:
+    // /// - TLS/SSL configuration
+    // /// - Connection timeouts
+    // /// - Keep-alive settings
+    // /// - Compression
+    // /// - Interceptors for authentication
+    // pub fn with_channel_builder(mut self, builder: ChannelBuilder) -> Self {
+    //     self.channel_builder = Some(builder);
+    //     self
+    // }
+    //
+    // /// Set a custom gRPC server configurator.
+    // ///
+    // /// This allows customization of the gRPC server with features like:
+    // /// - TLS/SSL configuration
+    // /// - Concurrency limits
+    // /// - Request timeouts
+    // /// - Maximum message sizes
+    // /// - Interceptors for authentication/authorization
+    // pub fn with_server_configurator(mut self, configurator: ServerConfigurator) -> Self {
+    //     self.server_configurator = Some(configurator);
+    //     self
+    // }
 }

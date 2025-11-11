@@ -2,7 +2,7 @@
 //!
 //! Provides RunWorkflowAsync and WaitForWorkflowCompletion RPCs for workflow execution.
 
-use crate::grpc::server::raft_proto::{
+use crate::grpc2::proto::{
     workflow_management_server::WorkflowManagement, RunWorkflowAsyncResponse,
     RunWorkflowRequest, RunWorkflowResponse, WaitForWorkflowRequest,
 };

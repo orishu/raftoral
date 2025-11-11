@@ -37,7 +37,7 @@ pub trait SubClusterRuntime: Send + Sync + 'static {
     fn new_single_node(
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
-        mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
+        mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
         shared_config: Arc<Mutex<Self::SharedConfig>>,
         logger: Logger,
     ) -> Result<
@@ -64,7 +64,7 @@ pub trait SubClusterRuntime: Send + Sync + 'static {
     fn new_joining_node(
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
-        mailbox_rx: mpsc::Receiver<crate::grpc::server::raft_proto::GenericMessage>,
+        mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
         initial_voters: Vec<u64>,
         shared_config: Arc<Mutex<Self::SharedConfig>>,
         logger: Logger,

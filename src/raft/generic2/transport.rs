@@ -3,7 +3,7 @@
 //! This module provides an abstract interface for sending and receiving Raft messages
 //! without tying to a specific protocol (gRPC, HTTP, or InProcess).
 
-use crate::grpc::server::raft_proto::GenericMessage;
+use crate::grpc2::proto::GenericMessage;
 use crate::raft::generic2::errors::TransportError;
 use crate::raft::generic2::ClusterRouter;
 use std::collections::HashMap;

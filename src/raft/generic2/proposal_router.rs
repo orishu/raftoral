@@ -3,7 +3,7 @@
 //! Routes proposals to the leader node and tracks completion.
 //! Simplifies the client experience by handling leader election and retries.
 
-use crate::grpc::server::raft_proto;
+use crate::grpc2::proto::{self as raft_proto};
 use crate::raft::generic2::{RaftNode, RoleChange, StateMachine, Transport};
 use slog::{debug, warn, Logger};
 use std::collections::HashMap;

@@ -3,7 +3,7 @@
 //! Provides in-memory message routing without actual network I/O.
 //! This enables fast multi-node unit tests.
 
-use crate::grpc::server::raft_proto::GenericMessage;
+use crate::grpc2::proto::GenericMessage;
 use crate::raft::generic2::errors::TransportError;
 use crate::raft::generic2::transport::MessageSender;
 use std::collections::HashMap;
