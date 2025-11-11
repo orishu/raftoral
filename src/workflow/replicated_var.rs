@@ -3,7 +3,7 @@
 //! Replicated variables provide a way to store workflow state that is
 //! replicated across the Raft cluster for fault tolerance.
 
-use crate::workflow2::{WorkflowContext, WorkflowError};
+use crate::workflow::{WorkflowContext, WorkflowError};
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
 
@@ -156,8 +156,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::generic2::{InProcessNetwork, InProcessNetworkSender, TransportLayer, RaftNodeConfig};
-    use crate::workflow2::WorkflowRuntime;
+    use crate::raft::generic::{InProcessNetwork, InProcessNetworkSender, TransportLayer, RaftNodeConfig};
+    use crate::workflow::WorkflowRuntime;
     use crate::{checkpoint, checkpoint_compute};
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -191,7 +191,7 @@ mod tests {
         };
 
         // Create shared registry
-        let registry = Arc::new(tokio::sync::Mutex::new(crate::workflow2::WorkflowRegistry::new()));
+        let registry = Arc::new(tokio::sync::Mutex::new(crate::workflow::WorkflowRegistry::new()));
 
         let (runtime, node) = WorkflowRuntime::new(config, transport, rx, registry, logger).unwrap();
         let runtime = Arc::new(runtime);
@@ -202,7 +202,7 @@ mod tests {
         // Run node in background
         let node_clone = node.clone();
         tokio::spawn(async move {
-            use crate::raft::generic2::RaftNode;
+            use crate::raft::generic::RaftNode;
             let _ = RaftNode::run_from_arc(node_clone).await;
         });
 
@@ -259,7 +259,7 @@ mod tests {
         };
 
         // Create shared registry
-        let registry = Arc::new(tokio::sync::Mutex::new(crate::workflow2::WorkflowRegistry::new()));
+        let registry = Arc::new(tokio::sync::Mutex::new(crate::workflow::WorkflowRegistry::new()));
 
         let (runtime, node) = WorkflowRuntime::new(config, transport, rx, registry, logger).unwrap();
         let runtime = Arc::new(runtime);
@@ -270,7 +270,7 @@ mod tests {
         // Run node in background
         let node_clone = node.clone();
         tokio::spawn(async move {
-            use crate::raft::generic2::RaftNode;
+            use crate::raft::generic::RaftNode;
             let _ = RaftNode::run_from_arc(node_clone).await;
         });
 

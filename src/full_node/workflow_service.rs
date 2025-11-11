@@ -2,12 +2,12 @@
 //!
 //! Provides RunWorkflowAsync and WaitForWorkflowCompletion RPCs for workflow execution.
 
-use crate::grpc2::proto::{
+use crate::grpc::proto::{
     workflow_management_server::WorkflowManagement, RunWorkflowAsyncResponse,
     RunWorkflowRequest, RunWorkflowResponse, WaitForWorkflowRequest,
 };
 use crate::management::ManagementRuntime;
-use crate::workflow2::WorkflowRuntime;
+use crate::workflow::WorkflowRuntime;
 use slog::{info, warn, Logger};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};

@@ -1,6 +1,6 @@
 //! Bootstrap functionality for discovering and joining existing clusters
 
-use crate::grpc2::proto::{
+use crate::grpc::proto::{
     raft_service_client::RaftServiceClient, DiscoveryRequest,
 };
 

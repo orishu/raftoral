@@ -2,8 +2,8 @@
 //!
 //! Routes incoming Raft messages to the correct cluster based on cluster_id.
 
-use crate::grpc2::proto::GenericMessage;
-use crate::raft::generic2::errors::RoutingError;
+use crate::grpc::proto::GenericMessage;
+use crate::raft::generic::errors::RoutingError;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};

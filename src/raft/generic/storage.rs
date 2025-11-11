@@ -12,7 +12,7 @@ use raft::storage::MemStorage;
 pub type MemStorageWithSnapshot = MemStorage;
 
 #[cfg(feature = "persistent-storage")]
-use crate::raft::generic2::rocksdb_storage::RocksDBStorage;
+use crate::raft::generic::rocksdb_storage::RocksDBStorage;
 
 /// Storage type that can be either RocksDB (persistent) or in-memory
 ///

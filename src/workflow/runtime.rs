@@ -1,14 +1,14 @@
 //! Workflow Execution Runtime (Layer 7)
 //!
 //! Provides a high-level application interface for distributed workflow execution
-//! built on the generic2 Raft infrastructure.
+//! built on the generic Raft infrastructure.
 
-use crate::raft::generic2::{EventBus, ProposalRouter, RaftNode, RaftNodeConfig, Transport};
-use crate::workflow2::{
+use crate::raft::generic::{EventBus, ProposalRouter, RaftNode, RaftNodeConfig, Transport};
+use crate::workflow::{
     WorkflowCommand, WorkflowContext, WorkflowError, WorkflowEvent, WorkflowRegistry,
     WorkflowRun, WorkflowStateMachine, TypedWorkflowRun,
 };
-use crate::workflow2::error::WorkflowStatus;
+use crate::workflow::error::WorkflowStatus;
 use slog::{info, Logger};
 use std::sync::Arc;
 use std::time::Duration;
@@ -121,7 +121,7 @@ impl WorkflowRuntime {
     pub fn new(
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
-        mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
+        mailbox_rx: mpsc::Receiver<crate::grpc::proto::GenericMessage>,
         registry: Arc<Mutex<WorkflowRegistry>>,
         logger: Logger,
     ) -> Result<
@@ -185,7 +185,7 @@ impl WorkflowRuntime {
     pub fn new_joining_node(
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
-        mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
+        mailbox_rx: mpsc::Receiver<crate::grpc::proto::GenericMessage>,
         initial_voters: Vec<u64>,
         registry: Arc<Mutex<WorkflowRegistry>>,
         logger: Logger,
@@ -872,8 +872,8 @@ impl WorkflowRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::generic2::{InProcessNetwork, InProcessNetworkSender, TransportLayer, RaftNodeConfig};
-    use crate::workflow2::ReplicatedVar;
+    use crate::raft::generic::{InProcessNetwork, InProcessNetworkSender, TransportLayer, RaftNodeConfig};
+    use crate::workflow::ReplicatedVar;
     use crate::{checkpoint, checkpoint_compute};
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
@@ -929,7 +929,7 @@ mod tests {
         // Run node in background
         let node_clone = node.clone();
         tokio::spawn(async move {
-            use crate::raft::generic2::RaftNode;
+            use crate::raft::generic::RaftNode;
             let _ = RaftNode::run_from_arc(node_clone).await;
         });
 
@@ -1024,7 +1024,7 @@ mod tests {
         // Run node in background
         let node_clone = node.clone();
         tokio::spawn(async move {
-            use crate::raft::generic2::RaftNode;
+            use crate::raft::generic::RaftNode;
             let _ = RaftNode::run_from_arc(node_clone).await;
         });
 
@@ -1090,7 +1090,7 @@ mod tests {
         // Run node 1 in background
         let node1_clone = node1.clone();
         tokio::spawn(async move {
-            use crate::raft::generic2::RaftNode;
+            use crate::raft::generic::RaftNode;
             let _ = RaftNode::run_from_arc(node1_clone).await;
         });
 
@@ -1132,7 +1132,7 @@ mod tests {
         // Run node 2 in background
         let node2_clone = node2.clone();
         tokio::spawn(async move {
-            use crate::raft::generic2::RaftNode;
+            use crate::raft::generic::RaftNode;
             let _ = RaftNode::run_from_arc(node2_clone).await;
         });
 
@@ -1190,9 +1190,9 @@ mod tests {
         let result1_future = workflow1.wait_for_completion();
 
         // Node 2 can also wait for the same workflow
-        let workflow2 = runtime2
+        let workflow = runtime2
             .get_workflow_run::<FibonacciOutput>("two-node-test-1".to_string());
-        let result2_future = workflow2.wait_for_completion();
+        let result2_future = workflow.wait_for_completion();
 
         // Wait for both to complete
         let (result1, result2): (Result<FibonacciOutput, WorkflowError>, Result<FibonacciOutput, WorkflowError>) =
@@ -1226,8 +1226,8 @@ impl crate::management::SubClusterRuntime for WorkflowRuntime {
 
     fn new_single_node(
         config: RaftNodeConfig,
-        transport: Arc<dyn crate::raft::generic2::Transport>,
-        mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
+        transport: Arc<dyn crate::raft::generic::Transport>,
+        mailbox_rx: mpsc::Receiver<crate::grpc::proto::GenericMessage>,
         shared_config: Arc<Mutex<Self::SharedConfig>>,
         logger: slog::Logger,
     ) -> Result<
@@ -1239,8 +1239,8 @@ impl crate::management::SubClusterRuntime for WorkflowRuntime {
 
     fn new_joining_node(
         config: RaftNodeConfig,
-        transport: Arc<dyn crate::raft::generic2::Transport>,
-        mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
+        transport: Arc<dyn crate::raft::generic::Transport>,
+        mailbox_rx: mpsc::Receiver<crate::grpc::proto::GenericMessage>,
         initial_voters: Vec<u64>,
         shared_config: Arc<Mutex<Self::SharedConfig>>,
         logger: slog::Logger,

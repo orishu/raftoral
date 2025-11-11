@@ -7,7 +7,7 @@
 //! Cluster IDs are assigned sequentially starting from 1 (0 is reserved for the management cluster).
 
 use crate::management::ManagementEvent;
-use crate::raft::generic2::StateMachine;
+use crate::raft::generic::StateMachine;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

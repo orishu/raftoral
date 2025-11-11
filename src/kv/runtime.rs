@@ -1,9 +1,9 @@
 //! Key-Value Store Runtime (Layer 7)
 //!
 //! Provides a high-level application interface for a distributed key-value store
-//! built on the generic2 Raft infrastructure.
+//! built on the generic Raft infrastructure.
 
-use crate::raft::generic2::{
+use crate::raft::generic::{
     EventBus, KvCommand, KvEvent, KvStateMachine, ProposalRouter, RaftNode,
     RaftNodeConfig, Transport,
 };
@@ -49,7 +49,7 @@ impl KvRuntime {
     pub fn new(
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
-        mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
+        mailbox_rx: mpsc::Receiver<crate::grpc::proto::GenericMessage>,
         logger: Logger,
     ) -> Result<(Self, Arc<Mutex<RaftNode<KvStateMachine>>>), Box<dyn std::error::Error>> {
         let state_machine = KvStateMachine::new();
@@ -115,7 +115,7 @@ impl KvRuntime {
     pub fn new_joining_node(
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
-        mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
+        mailbox_rx: mpsc::Receiver<crate::grpc::proto::GenericMessage>,
         initial_voters: Vec<u64>,
         logger: Logger,
     ) -> Result<(Self, Arc<Mutex<RaftNode<KvStateMachine>>>), Box<dyn std::error::Error>> {
@@ -327,7 +327,7 @@ impl crate::management::SubClusterRuntime for KvRuntime {
     fn new_single_node(
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
-        mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
+        mailbox_rx: mpsc::Receiver<crate::grpc::proto::GenericMessage>,
         _shared_config: Arc<tokio::sync::Mutex<Self::SharedConfig>>,
         logger: slog::Logger,
     ) -> Result<(Self, Arc<Mutex<RaftNode<Self::StateMachine>>>), Box<dyn std::error::Error>> {
@@ -337,7 +337,7 @@ impl crate::management::SubClusterRuntime for KvRuntime {
     fn new_joining_node(
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
-        mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
+        mailbox_rx: mpsc::Receiver<crate::grpc::proto::GenericMessage>,
         initial_voters: Vec<u64>,
         _shared_config: Arc<tokio::sync::Mutex<Self::SharedConfig>>,
         logger: slog::Logger,
@@ -367,8 +367,8 @@ impl crate::management::SubClusterRuntime for KvRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::generic2::{InProcessMessageSender, InProcessServer, TransportLayer};
-    use crate::raft::generic2::errors::TransportError;
+    use crate::raft::generic::{InProcessMessageSender, InProcessServer, TransportLayer};
+    use crate::raft::generic::errors::TransportError;
 
     fn create_logger() -> Logger {
         use slog::Drain;
@@ -412,7 +412,7 @@ mod tests {
         // Run node in background
         let node_clone = node.clone();
         let _node_handle = tokio::spawn(async move {
-            use crate::raft::generic2::RaftNode;
+            use crate::raft::generic::RaftNode;
             let _ = RaftNode::run_from_arc(node_clone).await;
         });
 

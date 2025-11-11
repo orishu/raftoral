@@ -3,9 +3,9 @@
 //! This module provides an abstract interface for sending and receiving Raft messages
 //! without tying to a specific protocol (gRPC, HTTP, or InProcess).
 
-use crate::grpc2::proto::GenericMessage;
-use crate::raft::generic2::errors::TransportError;
-use crate::raft::generic2::ClusterRouter;
+use crate::grpc::proto::GenericMessage;
+use crate::raft::generic::errors::TransportError;
+use crate::raft::generic::ClusterRouter;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -289,7 +289,7 @@ mod tests {
     /// Integration test: Multi-node communication via InProcessServer + ClusterRouter
     #[tokio::test]
     async fn test_multi_node_transport_with_cluster_router() {
-        use crate::raft::generic2::{ClusterRouter, InProcessServer, InProcessMessageSender};
+        use crate::raft::generic::{ClusterRouter, InProcessServer, InProcessMessageSender};
         use tokio::sync::mpsc;
 
         // Create in-process server

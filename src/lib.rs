@@ -1,8 +1,8 @@
 pub mod raft;
-pub mod grpc2;  // gRPC implementation for generic2 architecture
-pub mod kv;  // KV runtime for generic2 architecture
-pub mod management;  // Management runtime for generic2 architecture
-pub mod workflow2;  // Workflow execution runtime for generic2 architecture
+pub mod grpc;  // gRPC implementation for generic architecture
+pub mod kv;  // KV runtime for generic architecture
+pub mod management;  // Management runtime for generic architecture
+pub mod workflow;  // Workflow execution runtime for generic architecture
 pub mod full_node;  // Complete node stack (Layer 0-7)
 pub mod config;  // Configuration for Raftoral nodes
 

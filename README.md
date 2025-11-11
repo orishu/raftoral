@@ -215,9 +215,9 @@ runtime.register_workflow_closure("process_payment", 1,
 ### Bootstrap a Cluster
 
 ```rust
-use raftoral::workflow2::{WorkflowRuntime, WorkflowContext};
+use raftoral::workflow::{WorkflowRuntime, WorkflowContext};
 use raftoral::{checkpoint, checkpoint_compute};
-use raftoral::raft::generic2::{RaftNodeConfig, TransportLayer, GrpcTransport};
+use raftoral::raft::generic::{RaftNodeConfig, TransportLayer, GrpcTransport};
 use tokio::signal;
 
 #[tokio::main]
@@ -469,8 +469,8 @@ cargo test
 ### In-Memory Network (Testing)
 
 ```rust
-use raftoral::raft::generic2::{InProcessNetwork, InProcessNetworkSender, TransportLayer};
-use raftoral::workflow2::WorkflowRuntime;
+use raftoral::raft::generic::{InProcessNetwork, InProcessNetworkSender, TransportLayer};
+use raftoral::workflow::WorkflowRuntime;
 
 // Create shared network
 let network = Arc::new(InProcessNetwork::new());
@@ -519,7 +519,7 @@ let result = workflow.wait_for_completion().await?;
 
 ```
 src/
-├── raft/generic2/
+├── raft/generic/
 │   ├── node.rs                # RaftNode with raft-rs integration
 │   ├── proposal_router.rs     # ProposalRouter for command submission
 │   ├── transport.rs           # Transport abstraction (Layer 2-3)
@@ -530,7 +530,7 @@ src/
 │   ├── errors.rs              # Error types
 │   ├── cluster_router.rs      # Multi-cluster message routing
 │   └── integration_tests.rs   # Two-node KV cluster tests
-├── workflow2/
+├── workflow/
 │   ├── mod.rs                 # Public API exports
 │   ├── runtime.rs             # WorkflowRuntime with owner/wait pattern
 │   ├── state_machine.rs       # WorkflowStateMachine & commands
@@ -545,7 +545,7 @@ src/
 │   ├── node_manager.rs        # Owns management + execution clusters
 │   ├── management_command.rs  # Management cluster commands
 │   └── management_executor.rs # Management state & execution
-├── grpc2/
+├── grpc/
 │   └── server.rs              # gRPC service implementation
 └── lib.rs                     # Public API exports
 

@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use crate::workflow2::error::WorkflowError;
-use crate::workflow2::context::WorkflowContext;
+use crate::workflow::error::WorkflowError;
+use crate::workflow::context::WorkflowContext;
 
 /// A trait for workflow functions that can be registered and executed
 ///

@@ -3,13 +3,13 @@
 //! This module provides a gRPC server that receives Raft messages via RaftService
 //! and forwards them to the ClusterRouter for routing to the appropriate cluster.
 
-use crate::grpc2::proto::{
+use crate::grpc::proto::{
     raft_service_server::{RaftService, RaftServiceServer},
     AddNodeRequest, AddNodeResponse, GenericMessage, MessageResponse,
 };
 use crate::management::ManagementRuntime;
-use crate::raft::generic2::ClusterRouter;
-use crate::workflow2::WorkflowRuntime;
+use crate::raft::generic::ClusterRouter;
+use crate::workflow::WorkflowRuntime;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -24,7 +24,7 @@ struct LeaderInfo {
     leader_address: String,
 }
 
-/// gRPC server implementation for generic2 architecture
+/// gRPC server implementation for generic architecture
 ///
 /// This server receives GenericMessage via gRPC and routes them to
 /// the appropriate cluster via ClusterRouter.
@@ -85,10 +85,10 @@ impl GrpcServer {
     /// * `transport` - Transport to query peer addresses
     pub fn start_leader_tracker<SM>(
         self: &Arc<Self>,
-        management_node: Arc<Mutex<crate::raft::generic2::RaftNode<SM>>>,
-        transport: Arc<dyn crate::raft::generic2::Transport>,
+        management_node: Arc<Mutex<crate::raft::generic::RaftNode<SM>>>,
+        transport: Arc<dyn crate::raft::generic::Transport>,
     ) where
-        SM: crate::raft::generic2::StateMachine + 'static,
+        SM: crate::raft::generic::StateMachine + 'static,
     {
         let server = Arc::clone(self);
 
@@ -185,8 +185,8 @@ impl RaftService for GrpcServer {
 
     async fn discover(
         &self,
-        _request: Request<crate::grpc2::proto::DiscoveryRequest>,
-    ) -> Result<Response<crate::grpc2::proto::DiscoveryResponse>, Status> {
+        _request: Request<crate::grpc::proto::DiscoveryRequest>,
+    ) -> Result<Response<crate::grpc::proto::DiscoveryResponse>, Status> {
         // Get cached leader information
         let leader = self.management_leader.lock().await.clone();
 
@@ -201,7 +201,7 @@ impl RaftService for GrpcServer {
         let should_join_as_voter = current_voter_count < max_voters;
 
         Ok(Response::new(
-            crate::grpc2::proto::DiscoveryResponse {
+            crate::grpc::proto::DiscoveryResponse {
                 node_id: self.node_id,
                 highest_known_node_id: highest_known,
                 address: self.node_address.clone(),

@@ -3,9 +3,9 @@
 //! Maintains workflow execution state, checkpoints, and ownership.
 //! Emits events through the EventBus for the runtime to observe.
 
-use crate::raft::generic2::StateMachine;
-use crate::workflow2::error::WorkflowStatus;
-use crate::workflow2::event::WorkflowEvent;
+use crate::raft::generic::StateMachine;
+use crate::workflow::error::WorkflowStatus;
+use crate::workflow::event::WorkflowEvent;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 

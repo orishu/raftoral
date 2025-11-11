@@ -1,6 +1,6 @@
 //! Configuration for Raftoral nodes
 
-// TODO: Re-implement these types in grpc2 if needed
+// TODO: Re-implement these types in grpc if needed
 // use crate::grpc::{client::ChannelBuilder, ServerConfigurator};
 
 /// Configuration for starting a Raftoral gRPC node.
@@ -22,7 +22,7 @@ pub struct RaftoralConfig {
     /// Bootstrap a new cluster (use this for the first node)
     pub bootstrap: bool,
 
-    // TODO: Re-enable these when gRPC customization types are re-implemented in grpc2
+    // TODO: Re-enable these when gRPC customization types are re-implemented in grpc
     // /// Optional gRPC channel builder for customizing client connections
     // /// (TLS, timeouts, compression, etc.)
     // pub channel_builder: Option<ChannelBuilder>,
@@ -67,7 +67,7 @@ impl RaftoralConfig {
         self
     }
 
-    // TODO: Re-enable these when gRPC customization types are re-implemented in grpc2
+    // TODO: Re-enable these when gRPC customization types are re-implemented in grpc
     // /// Set a custom gRPC channel builder for client connections.
     // ///
     // /// This allows customization of outgoing gRPC connections with features like:

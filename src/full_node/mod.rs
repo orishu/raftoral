@@ -12,12 +12,12 @@
 mod workflow_service;
 pub use workflow_service::WorkflowManagementService;
 
-use crate::grpc2::{GrpcMessageSender, GrpcServer};
+use crate::grpc::{GrpcMessageSender, GrpcServer};
 use crate::management::ManagementRuntime;
-use crate::raft::generic2::{
+use crate::raft::generic::{
     ClusterRouter, RaftNode, RaftNodeConfig, Transport, TransportLayer,
 };
-use crate::workflow2::WorkflowRuntime;
+use crate::workflow::WorkflowRuntime;
 use slog::{info, Logger};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
@@ -40,7 +40,7 @@ pub struct FullNode {
     grpc_server_handle: Option<JoinHandle<Result<(), tonic::transport::Error>>>,
 
     /// Shared workflow registry (accessible before execution clusters are created)
-    workflow_registry: Arc<Mutex<crate::workflow2::WorkflowRegistry>>,
+    workflow_registry: Arc<Mutex<crate::workflow::WorkflowRegistry>>,
 
     /// Node address
     address: String,
@@ -82,7 +82,7 @@ impl FullNode {
         cluster_router.register_cluster(0, mailbox_tx).await;
 
         // Create shared workflow registry
-        let registry = Arc::new(Mutex::new(crate::workflow2::WorkflowRegistry::new()));
+        let registry = Arc::new(Mutex::new(crate::workflow::WorkflowRegistry::new()));
 
         // Layers 3-7: Create management runtime (includes RaftNode, EventBus, ProposalRouter)
         let config = RaftNodeConfig {
@@ -149,19 +149,19 @@ impl FullNode {
         let grpc_server_handle = tokio::spawn(async move {
             // Enable gRPC reflection for grpcurl support
             let reflection_service = tonic_reflection::server::Builder::configure()
-                .register_encoded_file_descriptor_set(crate::grpc2::proto::FILE_DESCRIPTOR_SET)
+                .register_encoded_file_descriptor_set(crate::grpc::proto::FILE_DESCRIPTOR_SET)
                 .build_v1()
                 .unwrap();
 
             Server::builder()
                 .add_service(reflection_service)
                 .add_service(
-                    crate::grpc2::proto::raft_service_server::RaftServiceServer::new(
+                    crate::grpc::proto::raft_service_server::RaftServiceServer::new(
                         (*grpc_server_clone).clone(),
                     ),
                 )
                 .add_service(
-                    crate::grpc2::proto::workflow_management_server::WorkflowManagementServer::new(
+                    crate::grpc::proto::workflow_management_server::WorkflowManagementServer::new(
                         workflow_service,
                     ),
                 )
@@ -203,7 +203,7 @@ impl FullNode {
         );
 
         // Discover existing peers
-        use crate::grpc2::bootstrap::{discover_peers, next_node_id};
+        use crate::grpc::bootstrap::{discover_peers, next_node_id};
         let discovered_peers = discover_peers(seed_addresses).await;
 
         if discovered_peers.is_empty() {
@@ -242,7 +242,7 @@ let should_join_as_voter = discovered_peers.first()
     .map(|p| p.should_join_as_voter)
     .unwrap_or(true); // Default to voter if no info available
 // Create shared workflow registry
-let registry = Arc::new(Mutex::new(crate::workflow2::WorkflowRegistry::new()));
+let registry = Arc::new(Mutex::new(crate::workflow::WorkflowRegistry::new()));
 
 // Layers 3-7: Create management runtime in joining mode
 let config = RaftNodeConfig {
@@ -328,19 +328,19 @@ let grpc_server_clone = grpc_server.clone();
 let grpc_server_handle = tokio::spawn(async move {
 // Enable gRPC reflection for grpcurl support
 let reflection_service = tonic_reflection::server::Builder::configure()
-.register_encoded_file_descriptor_set(crate::grpc2::proto::FILE_DESCRIPTOR_SET)
+.register_encoded_file_descriptor_set(crate::grpc::proto::FILE_DESCRIPTOR_SET)
 .build_v1()
 .unwrap();
 
 Server::builder()
 .add_service(reflection_service)
 .add_service(
-crate::grpc2::proto::raft_service_server::RaftServiceServer::new(
+crate::grpc::proto::raft_service_server::RaftServiceServer::new(
 (*grpc_server_clone).clone(),
 ),
 )
 .add_service(
-crate::grpc2::proto::workflow_management_server::WorkflowManagementServer::new(
+crate::grpc::proto::workflow_management_server::WorkflowManagementServer::new(
 workflow_service,
 ),
 )
@@ -363,8 +363,8 @@ logger: logger.clone(),
 info!(logger, "Calling AddNode RPC on management leader";
 "node_id" => node_id, "leader" => &leader_peer.management_leader_address);
 
-use crate::grpc2::proto::raft_service_client::RaftServiceClient;
-use crate::grpc2::proto::AddNodeRequest;
+use crate::grpc::proto::raft_service_client::RaftServiceClient;
+use crate::grpc::proto::AddNodeRequest;
 
 let leader_endpoint = format!("http://{}", leader_peer.management_leader_address);
 match RaftServiceClient::connect(leader_endpoint).await {
@@ -406,7 +406,7 @@ Ok(full_node)
     ///
     /// This allows registering workflows before execution clusters are created.
     /// All WorkflowRuntime instances share this registry.
-    pub fn workflow_registry(&self) -> &Arc<Mutex<crate::workflow2::WorkflowRegistry>> {
+    pub fn workflow_registry(&self) -> &Arc<Mutex<crate::workflow::WorkflowRegistry>> {
         &self.workflow_registry
     }
 

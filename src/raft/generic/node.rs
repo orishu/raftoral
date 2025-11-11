@@ -4,13 +4,13 @@
 //! - Mailbox: receives peer Raft messages from lower layers (via ClusterRouter → Transport)
 //! - Methods: upper layer commands (propose, campaign, add_node, remove_node)
 
-use crate::grpc2::proto::{self as raft_proto, GenericMessage};
-use crate::raft::generic2::storage::MemStorageWithSnapshot;
+use crate::grpc::proto::{self as raft_proto, GenericMessage};
+use crate::raft::generic::storage::MemStorageWithSnapshot;
 #[cfg(feature = "persistent-storage")]
-use crate::raft::generic2::rocksdb_storage::RocksDBStorage;
-use crate::raft::generic2::errors::TransportError;
-use crate::raft::generic2::storage::RaftStorage;
-use crate::raft::generic2::{EventBus, StateMachine, Transport};
+use crate::raft::generic::rocksdb_storage::RocksDBStorage;
+use crate::raft::generic::errors::TransportError;
+use crate::raft::generic::storage::RaftStorage;
+use crate::raft::generic::{EventBus, StateMachine, Transport};
 use bytes::Bytes;
 use protobuf::Message as ProtobufMessage;
 use raft::prelude::*;
@@ -270,7 +270,7 @@ impl<SM: StateMachine> RaftNode<SM> {
     ///
     /// # Example
     /// ```no_run
-    /// # use raftoral::raft::generic2::*;
+    /// # use raftoral::raft::generic::*;
     /// # use raft::prelude::ConfState;
     /// # use std::sync::Arc;
     /// # use tokio::sync::mpsc;
@@ -1181,7 +1181,7 @@ impl<SM: StateMachine> RaftNode<SM> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::generic2::{InProcessServer, InProcessMessageSender, KvCommand, KvStateMachine, TransportLayer};
+    use crate::raft::generic::{InProcessServer, InProcessMessageSender, KvCommand, KvStateMachine, TransportLayer};
     use tokio::sync::mpsc;
 
     fn create_logger() -> Logger {

@@ -1,13 +1,13 @@
-//! gRPC Client (Layer 0) - Implements MessageSender for generic2 architecture
+//! gRPC Client (Layer 0) - Implements MessageSender for generic architecture
 //!
 //! This module provides a gRPC client that implements the MessageSender trait,
 //! enabling the Transport layer to send Raft messages over gRPC.
 
-use crate::grpc2::proto::{
+use crate::grpc::proto::{
     raft_service_client::RaftServiceClient, GenericMessage, MessageResponse,
 };
-use crate::raft::generic2::errors::TransportError;
-use crate::raft::generic2::transport::MessageSender;
+use crate::raft::generic::errors::TransportError;
+use crate::raft::generic::transport::MessageSender;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;

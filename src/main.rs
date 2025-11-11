@@ -1,6 +1,6 @@
 use clap::Parser;
 use raftoral::full_node::FullNode;
-use raftoral::workflow2::WorkflowError;
+use raftoral::workflow::WorkflowError;
 use slog::{info, o, Drain};
 use tokio::signal;
 

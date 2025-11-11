@@ -3,7 +3,7 @@
 //! Defines the interface that all sub-cluster runtimes must implement
 //! to enable dynamic construction by the ManagementRuntime.
 
-use crate::raft::generic2::{RaftNode, RaftNodeConfig, Transport};
+use crate::raft::generic::{RaftNode, RaftNodeConfig, Transport};
 use slog::Logger;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, oneshot};
@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, Mutex, oneshot};
 /// without knowing the concrete type at compile time.
 pub trait SubClusterRuntime: Send + Sync + 'static {
     /// The state machine type used by this runtime
-    type StateMachine: crate::raft::generic2::StateMachine + Send + Sync + 'static;
+    type StateMachine: crate::raft::generic::StateMachine + Send + Sync + 'static;
 
     /// Shared configuration type for this runtime (e.g., WorkflowRegistry for WorkflowRuntime)
     /// This allows sharing configuration/state across multiple runtime instances of the same type
@@ -37,7 +37,7 @@ pub trait SubClusterRuntime: Send + Sync + 'static {
     fn new_single_node(
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
-        mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
+        mailbox_rx: mpsc::Receiver<crate::grpc::proto::GenericMessage>,
         shared_config: Arc<Mutex<Self::SharedConfig>>,
         logger: Logger,
     ) -> Result<
@@ -64,7 +64,7 @@ pub trait SubClusterRuntime: Send + Sync + 'static {
     fn new_joining_node(
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
-        mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
+        mailbox_rx: mpsc::Receiver<crate::grpc::proto::GenericMessage>,
         initial_voters: Vec<u64>,
         shared_config: Arc<Mutex<Self::SharedConfig>>,
         logger: Logger,

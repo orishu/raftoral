@@ -3,9 +3,9 @@
 //! Provides a shared message bus that connects multiple in-process nodes,
 //! enabling full Raft consensus simulation in memory.
 
-use crate::grpc2::proto::GenericMessage;
-use crate::raft::generic2::errors::TransportError;
-use crate::raft::generic2::transport::MessageSender;
+use crate::grpc::proto::GenericMessage;
+use crate::raft::generic::errors::TransportError;
+use crate::raft::generic::transport::MessageSender;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};

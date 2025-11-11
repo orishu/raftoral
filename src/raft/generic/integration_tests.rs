@@ -1,4 +1,4 @@
-//! Integration tests for generic2 architecture (Layers 0-7)
+//! Integration tests for generic architecture (Layers 0-7)
 //!
 //! These tests exercise the full stack from in-process server to KV runtime:
 //! - Layer 0: InProcessServer
@@ -12,7 +12,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::raft::generic2::{
+    use crate::raft::generic::{
         InProcessMessageSender, InProcessServer, InProcessNetwork, InProcessNetworkSender,
         KvRuntime, RaftNodeConfig, Transport, TransportLayer, errors::TransportError,
     };
@@ -63,7 +63,7 @@ mod tests {
         // Run node in background
         let node_clone = node.clone();
         let node_handle = tokio::spawn(async move {
-            use crate::raft::generic2::RaftNode;
+            use crate::raft::generic::RaftNode;
             let _ = RaftNode::run_from_arc(node_clone).await;
         });
 
@@ -144,7 +144,7 @@ mod tests {
         // Run node 1 in background
         let node1_clone = node1.clone();
         let node1_handle = tokio::spawn(async move {
-            use crate::raft::generic2::RaftNode;
+            use crate::raft::generic::RaftNode;
             let _ = RaftNode::run_from_arc(node1_clone).await;
         });
 
@@ -190,7 +190,7 @@ mod tests {
         // Run node 2 in background
         let node2_clone = node2.clone();
         let node2_handle = tokio::spawn(async move {
-            use crate::raft::generic2::RaftNode;
+            use crate::raft::generic::RaftNode;
             let _ = RaftNode::run_from_arc(node2_clone).await;
         });
 

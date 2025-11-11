@@ -3,7 +3,7 @@
 //! Provides the context for workflow execution including workflow ID
 //! and methods for creating replicated variables (checkpoints).
 
-use crate::workflow2::{WorkflowError, WorkflowRuntime};
+use crate::workflow::{WorkflowError, WorkflowRuntime};
 use std::sync::Arc;
 
 /// Context provided to workflow functions during execution
@@ -40,11 +40,11 @@ impl WorkflowContext {
         &self,
         key: &str,
         value: T,
-    ) -> Result<crate::workflow2::ReplicatedVar<T>, WorkflowError>
+    ) -> Result<crate::workflow::ReplicatedVar<T>, WorkflowError>
     where
         T: serde::Serialize + for<'de> serde::Deserialize<'de> + Clone + Send + Sync + 'static,
     {
-        crate::workflow2::ReplicatedVar::with_value(key, self, value).await
+        crate::workflow::ReplicatedVar::with_value(key, self, value).await
     }
 
     /// Create a replicated variable from a computed value (side effect)
@@ -56,13 +56,13 @@ impl WorkflowContext {
         &self,
         key: &str,
         compute: F,
-    ) -> Result<crate::workflow2::ReplicatedVar<T>, WorkflowError>
+    ) -> Result<crate::workflow::ReplicatedVar<T>, WorkflowError>
     where
         T: serde::Serialize + for<'de> serde::Deserialize<'de> + Clone + Send + Sync + 'static,
         F: FnOnce() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = T> + Send + 'static,
     {
-        crate::workflow2::ReplicatedVar::with_computation(key, self, compute).await
+        crate::workflow::ReplicatedVar::with_computation(key, self, compute).await
     }
 }
 
@@ -136,7 +136,7 @@ where
     ///
     /// This subscribes to workflow events and waits for completion.
     pub async fn wait_for_completion(&self) -> Result<O, WorkflowError> {
-        use crate::workflow2::WorkflowEvent;
+        use crate::workflow::WorkflowEvent;
 
         // Subscribe to events
         let mut event_rx = self.inner.runtime.subscribe_events();

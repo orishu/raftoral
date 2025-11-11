@@ -1,13 +1,13 @@
 //! Management Runtime (Layer 7)
 //!
 //! Provides a high-level application interface for managing sub-cluster metadata
-//! built on the generic2 Raft infrastructure.
+//! built on the generic Raft infrastructure.
 
 use crate::management::{
     ClusterAction, ClusterManager, ClusterManagerConfig, ManagementEvent, ManagementStateMachine,
     SubClusterRuntime,
 };
-use crate::raft::generic2::{ClusterRouter, EventBus, ProposalRouter, RaftNode, RaftNodeConfig, Transport};
+use crate::raft::generic::{ClusterRouter, EventBus, ProposalRouter, RaftNode, RaftNodeConfig, Transport};
 use slog::{info, Logger};
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -85,7 +85,7 @@ where
     pub fn new(
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
-        mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
+        mailbox_rx: mpsc::Receiver<crate::grpc::proto::GenericMessage>,
         cluster_router: Arc<ClusterRouter>,
         shared_config: Arc<Mutex<R::SharedConfig>>,
         logger: Logger,
@@ -234,7 +234,7 @@ where
     pub fn new_joining_node(
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
-        mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
+        mailbox_rx: mpsc::Receiver<crate::grpc::proto::GenericMessage>,
         initial_voters: Vec<u64>,
         cluster_router: Arc<ClusterRouter>,
         shared_config: Arc<Mutex<R::SharedConfig>>,
@@ -319,7 +319,7 @@ where
     pub fn new_joining_learner(
         config: RaftNodeConfig,
         transport: Arc<dyn Transport>,
-        mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
+        mailbox_rx: mpsc::Receiver<crate::grpc::proto::GenericMessage>,
         existing_voters: Vec<u64>,
         cluster_router: Arc<ClusterRouter>,
         shared_config: Arc<Mutex<R::SharedConfig>>,
@@ -1351,9 +1351,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::generic2::{InProcessMessageSender, InProcessServer, TransportLayer};
-    use crate::raft::generic2::errors::TransportError;
-    use crate::raft::generic2::StateMachine;
+    use crate::raft::generic::{InProcessMessageSender, InProcessServer, TransportLayer};
+    use crate::raft::generic::errors::TransportError;
+    use crate::raft::generic::StateMachine;
 
     // Dummy shared config for testing
     pub struct DummyConfig;
@@ -1365,8 +1365,8 @@ mod tests {
 
         fn new_single_node(
             _config: RaftNodeConfig,
-            _transport: Arc<dyn crate::raft::generic2::Transport>,
-            _mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
+            _transport: Arc<dyn crate::raft::generic::Transport>,
+            _mailbox_rx: mpsc::Receiver<crate::grpc::proto::GenericMessage>,
             _shared_config: Arc<Mutex<Self::SharedConfig>>,
             _logger: Logger,
         ) -> Result<(Self, Arc<Mutex<RaftNode<Self::StateMachine>>>), Box<dyn std::error::Error>> {
@@ -1375,8 +1375,8 @@ mod tests {
 
         fn new_joining_node(
             _config: RaftNodeConfig,
-            _transport: Arc<dyn crate::raft::generic2::Transport>,
-            _mailbox_rx: mpsc::Receiver<crate::grpc2::proto::GenericMessage>,
+            _transport: Arc<dyn crate::raft::generic::Transport>,
+            _mailbox_rx: mpsc::Receiver<crate::grpc::proto::GenericMessage>,
             _initial_voters: Vec<u64>,
             _shared_config: Arc<Mutex<Self::SharedConfig>>,
             _logger: Logger,
@@ -1478,7 +1478,7 @@ mod tests {
         // Run node in background
         let node_clone = node.clone();
         let _node_handle = tokio::spawn(async move {
-            use crate::raft::generic2::RaftNode;
+            use crate::raft::generic::RaftNode;
             let _ = RaftNode::run_from_arc(node_clone).await;
         });
 
@@ -1605,7 +1605,7 @@ mod tests {
         // Run node in background
         let node_clone = node.clone();
         let _node_handle = tokio::spawn(async move {
-            use crate::raft::generic2::RaftNode;
+            use crate::raft::generic::RaftNode;
             let _ = RaftNode::run_from_arc(node_clone).await;
         });
 

@@ -1,7 +1,7 @@
 //! Workflow Execution Runtime (Layer 7) - V2 Architecture
 //!
 //! This module provides a high-level runtime for executing distributed workflows
-//! built on the generic2 Raft infrastructure.
+//! built on the generic Raft infrastructure.
 
 pub mod error;
 pub mod event;

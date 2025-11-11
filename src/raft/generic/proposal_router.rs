@@ -3,8 +3,8 @@
 //! Routes proposals to the leader node and tracks completion.
 //! Simplifies the client experience by handling leader election and retries.
 
-use crate::grpc2::proto::{self as raft_proto};
-use crate::raft::generic2::{RaftNode, RoleChange, StateMachine, Transport};
+use crate::grpc::proto::{self as raft_proto};
+use crate::raft::generic::{RaftNode, RoleChange, StateMachine, Transport};
 use slog::{debug, warn, Logger};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -301,7 +301,7 @@ impl<SM: StateMachine> ProposalRouter<SM> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::generic2::{
+    use crate::raft::generic::{
         EventBus, InProcessServer, InProcessMessageSender, KvCommand, KvStateMachine,
         RaftNodeConfig, TransportLayer,
     };

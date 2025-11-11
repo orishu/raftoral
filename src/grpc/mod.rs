@@ -1,7 +1,7 @@
-//! gRPC Layer (Layer 0) for generic2 architecture
+//! gRPC Layer (Layer 0) for generic architecture
 //!
 //! This module provides gRPC client and server implementations that work with
-//! the generic2 Raft architecture. Unlike the original grpc module, this is
+//! the generic Raft architecture. Unlike the original grpc module, this is
 //! designed specifically for the clean layered architecture.
 //!
 //! - `client`: gRPC client implementing MessageSender trait
