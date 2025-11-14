@@ -1103,6 +1103,10 @@ impl<SM: StateMachine> RaftNode<SM> {
     /// This is called periodically when this node is the leader. It tracks the
     /// matched index for each follower and emits events when followers stop
     /// making progress for longer than the configured timeout.
+    ///
+    /// A follower is considered healthy if it's caught up with the commit index.
+    /// A follower is considered failed if it's lagging AND hasn't made progress
+    /// for longer than the timeout.
     async fn check_follower_progress(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         // Skip if failure detection is disabled
         if self.failure_detection_timeout.is_zero() {
@@ -1118,6 +1122,9 @@ impl<SM: StateMachine> RaftNode<SM> {
         let mut progress_map = self.follower_progress.lock().await;
         let mut failed_nodes = Vec::new();
 
+        // Get current commit index
+        let commit_index = self.raw_node.raft.raft_log.committed;
+
         // Check each peer's progress
         let prs = self.raw_node.raft.prs();
         for (&peer_id, progress) in prs.iter() {
@@ -1128,27 +1135,35 @@ impl<SM: StateMachine> RaftNode<SM> {
 
             let matched = progress.matched;
 
-            // Check if this peer made progress
-            if let Some((last_matched, last_update)) = progress_map.get(&peer_id) {
-                if matched > *last_matched {
-                    // Progress made, update tracking
-                    progress_map.insert(peer_id, (matched, now));
-                } else {
-                    // No progress, check if timeout exceeded
-                    let elapsed = now.duration_since(*last_update);
-                    if elapsed > self.failure_detection_timeout {
-                        warn!(self.logger, "Follower failed to make progress";
-                            "node_id" => peer_id,
-                            "matched" => matched,
-                            "timeout" => ?self.failure_detection_timeout,
-                            "elapsed" => ?elapsed
-                        );
-                        failed_nodes.push(peer_id);
-                    }
-                }
-            } else {
-                // First time seeing this peer, track it
+            // If the follower is caught up with commits, it's healthy
+            if matched >= commit_index {
+                // Node is caught up, update tracking
                 progress_map.insert(peer_id, (matched, now));
+            } else {
+                // Node is lagging, check if it's making progress
+                if let Some((last_matched, last_update)) = progress_map.get(&peer_id) {
+                    if matched > *last_matched {
+                        // Progress made, update tracking
+                        progress_map.insert(peer_id, (matched, now));
+                    } else {
+                        // No progress while lagging, check if timeout exceeded
+                        let elapsed = now.duration_since(*last_update);
+                        if elapsed > self.failure_detection_timeout {
+                            warn!(self.logger, "Follower failed to make progress";
+                                "node_id" => peer_id,
+                                "matched" => matched,
+                                "commit_index" => commit_index,
+                                "lag" => commit_index - matched,
+                                "timeout" => ?self.failure_detection_timeout,
+                                "elapsed" => ?elapsed
+                            );
+                            failed_nodes.push(peer_id);
+                        }
+                    }
+                } else {
+                    // First time seeing this peer, track it
+                    progress_map.insert(peer_id, (matched, now));
+                }
             }
         }
 
