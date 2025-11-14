@@ -86,11 +86,19 @@ impl<SM: StateMachine> ProposalRouter<SM> {
         node_id: u64,
         logger: Logger,
     ) -> Self {
+        // Initialize leader_id by querying the node (synchronously via block_in_place)
+        let initial_leader = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let n = node.lock().await;
+                n.leader_id()
+            })
+        });
+
         Self {
             node,
             transport,
             cluster_id,
-            leader_id: Arc::new(Mutex::new(None)),
+            leader_id: Arc::new(Mutex::new(initial_leader)),
             node_id,
             pending_forwarded: Arc::new(Mutex::new(HashMap::new())),
             logger,
@@ -115,8 +123,11 @@ impl<SM: StateMachine> ProposalRouter<SM> {
                             *self.leader_id.lock().await = Some(self.node_id);
                         }
                         RoleChange::BecameFollower | RoleChange::BecameCandidate => {
-                            // We're not leader anymore
-                            *self.leader_id.lock().await = None;
+                            // We're not leader anymore, query the node for current leader
+                            let node = self.node.lock().await;
+                            let actual_leader = node.leader_id();
+                            drop(node);
+                            *self.leader_id.lock().await = actual_leader;
                         }
                     }
                 }
@@ -156,18 +167,31 @@ impl<SM: StateMachine> ProposalRouter<SM> {
         }
 
         // We're not the leader - forward to known leader
-        drop(node); // Release the lock before forwarding
+        // First, check our cached leader_id
+        let mut cached_leader = *self.leader_id.lock().await;
 
-        let leader_id = *self.leader_id.lock().await;
+        // If we don't have a cached leader, query the node for current leader
+        if cached_leader.is_none() {
+            let actual_leader = node.leader_id();
+            drop(node); // Release the lock
 
-        match leader_id {
+            if actual_leader.is_some() {
+                // Update the cache
+                *self.leader_id.lock().await = actual_leader;
+                cached_leader = actual_leader;
+            }
+        } else {
+            drop(node); // Release the lock
+        }
+
+        match cached_leader {
             Some(leader) if leader != self.node_id => {
                 debug!(self.logger, "Forwarding proposal to leader"; "leader_id" => leader);
                 self.forward_to_leader(leader, command).await
             }
             _ => {
-                warn!(self.logger, "Cannot propose - no known leader"; "leader_id" => ?leader_id);
-                Err(ProposalError::NotLeader { leader_id })
+                warn!(self.logger, "Cannot propose - no known leader"; "leader_id" => ?cached_leader);
+                Err(ProposalError::NotLeader { leader_id: cached_leader })
             }
         }
     }
