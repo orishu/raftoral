@@ -427,6 +427,16 @@ impl<SM: StateMachine> RaftNode<SM> {
         Ok(rx)
     }
 
+    /// Register a forwarded proposal
+    ///
+    /// This is called by ProposalRouter when forwarding a proposal to the leader.
+    /// The completion channel will be notified when the proposal is committed locally
+    /// (after being replicated back from the leader).
+    pub async fn register_forwarded_proposal(&mut self, sync_id: u64, tx: oneshot::Sender<Result<(), String>>) {
+        self.pending_proposals.lock().await.insert(sync_id, tx);
+        debug!(self.logger, "Registered forwarded proposal"; "sync_id" => sync_id);
+    }
+
     /// Campaign to become leader (upper layer method, not mailbox)
     pub async fn campaign(&mut self) -> Result<(), String> {
         self.raw_node
@@ -645,7 +655,7 @@ impl<SM: StateMachine> RaftNode<SM> {
                 }
 
                 // Note: The proposal completion will happen through normal on_ready() processing
-                // The sync_id will be extracted from the context and the result sent back
+                // The sync_id will be extracted from the context and any waiting proposals completed
             }
             _ => {
                 // Other message types (campaign, add_node, etc.) should come via method calls

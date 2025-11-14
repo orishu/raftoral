@@ -6,7 +6,6 @@
 use crate::grpc::proto::{self as raft_proto};
 use crate::raft::generic::{RaftNode, RoleChange, StateMachine, Transport};
 use slog::{debug, warn, Logger};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
 
@@ -63,9 +62,6 @@ pub struct ProposalRouter<SM: StateMachine> {
     /// This node's ID
     node_id: u64,
 
-    /// Pending forwarded proposals: sync_id -> oneshot sender
-    pending_forwarded: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<(), String>>>>>,
-
     /// Logger
     logger: Logger,
 }
@@ -100,7 +96,6 @@ impl<SM: StateMachine> ProposalRouter<SM> {
             cluster_id,
             leader_id: Arc::new(Mutex::new(initial_leader)),
             node_id,
-            pending_forwarded: Arc::new(Mutex::new(HashMap::new())),
             logger,
         }
     }
@@ -208,8 +203,11 @@ impl<SM: StateMachine> ProposalRouter<SM> {
         // Create oneshot channel for completion
         let (tx, rx) = oneshot::channel();
 
-        // Store completion channel
-        self.pending_forwarded.lock().await.insert(sync_id, tx);
+        // Register with our local RaftNode so it can complete when the entry is committed locally
+        // (after it's replicated back from the leader)
+        let mut node = self.node.lock().await;
+        node.register_forwarded_proposal(sync_id, tx).await;
+        drop(node);
 
         // Serialize command
         let command_json = serde_json::to_vec(&command)
@@ -231,11 +229,6 @@ impl<SM: StateMachine> ProposalRouter<SM> {
         self.transport.send_message(leader_id, generic_msg)
             .await
             .map_err(|e| {
-                // Remove from tracking on error
-                let pending = self.pending_forwarded.clone();
-                tokio::spawn(async move {
-                    pending.lock().await.remove(&sync_id);
-                });
                 ProposalError::Failed(format!("Failed to forward to leader: {}", e))
             })?;
 
@@ -245,17 +238,6 @@ impl<SM: StateMachine> ProposalRouter<SM> {
         );
 
         Ok(rx)
-    }
-
-    /// Complete a forwarded proposal (called when result comes back from leader)
-    ///
-    /// This is intended to be called by the event processing layer when
-    /// a proposal result is received.
-    pub async fn complete_forwarded_proposal(&self, sync_id: u64, result: Result<(), String>) {
-        if let Some(tx) = self.pending_forwarded.lock().await.remove(&sync_id) {
-            let _ = tx.send(result);
-            debug!(self.logger, "Completed forwarded proposal"; "sync_id" => sync_id);
-        }
     }
 
     /// Propose a command and wait for it to be committed and applied
