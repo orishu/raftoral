@@ -8,21 +8,11 @@ use crate::grpc::proto::{
     AddNodeRequest, AddNodeResponse, GenericMessage, MessageResponse,
 };
 use crate::management::ManagementRuntime;
-use crate::raft::generic::ClusterRouter;
+use crate::raft::generic::{ClusterRouter, Transport};
 use crate::workflow::WorkflowRuntime;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tonic::{transport::Server, Request, Response, Status};
-
-/// Cached leader information for discovery endpoint
-#[derive(Clone, Debug)]
-struct LeaderInfo {
-    /// Current leader node ID (0 if unknown)
-    leader_id: u64,
-    /// Current leader address (empty if unknown)
-    leader_address: String,
-}
 
 /// gRPC server implementation for generic architecture
 ///
@@ -39,13 +29,8 @@ pub struct GrpcServer {
     /// This node's address
     node_address: String,
 
-    /// Cached management cluster leader information
-    /// Updated by background task listening to role changes
-    management_leader: Arc<Mutex<LeaderInfo>>,
-
-    /// Map of node_id -> address for all known nodes
-    /// Used to resolve leader_id to leader_address
-    peer_addresses: Arc<Mutex<HashMap<u64, String>>>,
+    /// Transport for looking up peer addresses
+    transport: Arc<dyn Transport>,
 
     /// Management runtime for cluster operations (e.g., adding nodes)
     management_runtime: Arc<ManagementRuntime<WorkflowRuntime>>,
@@ -58,82 +43,22 @@ impl GrpcServer {
     /// * `cluster_router` - The ClusterRouter for message routing
     /// * `node_id` - This node's ID
     /// * `node_address` - This node's network address
+    /// * `transport` - Transport for looking up peer addresses
     /// * `management_runtime` - The ManagementRuntime for cluster operations
     pub fn new(
         cluster_router: Arc<ClusterRouter>,
         node_id: u64,
         node_address: String,
+        transport: Arc<dyn Transport>,
         management_runtime: Arc<ManagementRuntime<WorkflowRuntime>>,
     ) -> Self {
         Self {
             cluster_router,
             node_id,
             node_address,
-            management_leader: Arc::new(Mutex::new(LeaderInfo {
-                leader_id: 0,
-                leader_address: String::new(),
-            })),
-            peer_addresses: Arc::new(Mutex::new(HashMap::new())),
+            transport,
             management_runtime,
         }
-    }
-
-    /// Start background task to track management cluster leadership
-    ///
-    /// # Arguments
-    /// * `management_node` - The management cluster RaftNode
-    /// * `transport` - Transport to query peer addresses
-    pub fn start_leader_tracker<SM>(
-        self: &Arc<Self>,
-        management_node: Arc<Mutex<crate::raft::generic::RaftNode<SM>>>,
-        transport: Arc<dyn crate::raft::generic::Transport>,
-    ) where
-        SM: crate::raft::generic::StateMachine + 'static,
-    {
-        let server = Arc::clone(self);
-
-        tokio::spawn(async move {
-            // Subscribe to role changes
-            let mut role_rx = {
-                let node = management_node.lock().await;
-                node.subscribe_role_changes()
-            };
-
-            loop {
-                // Check current leader
-                let leader_id = {
-                    let node = management_node.lock().await;
-                    node.leader_id()
-                };
-
-                // Update cached leader info
-                if let Some(lid) = leader_id {
-                    let leader_address = if lid == server.node_id {
-                        // We are the leader
-                        server.node_address.clone()
-                    } else {
-                        // Look up leader address from transport peers
-                        transport.get_peer_address(lid).await.unwrap_or_default()
-                    };
-
-                    let mut leader = server.management_leader.lock().await;
-                    leader.leader_id = lid;
-                    leader.leader_address = leader_address;
-                }
-
-                // Wait for role change
-                match role_rx.recv().await {
-                    Ok(_) => {
-                        // Role changed, loop will check leader again
-                        continue;
-                    }
-                    Err(_) => {
-                        // Channel closed, exit
-                        break;
-                    }
-                }
-            }
-        });
     }
 
     /// Start the gRPC server on the given address
@@ -187,8 +112,22 @@ impl RaftService for GrpcServer {
         &self,
         _request: Request<crate::grpc::proto::DiscoveryRequest>,
     ) -> Result<Response<crate::grpc::proto::DiscoveryResponse>, Status> {
-        // Get cached leader information
-        let leader = self.management_leader.lock().await.clone();
+        // Get leader information from management runtime
+        // Check if we are the leader first (handles case where leader_id() returns None after bootstrap)
+        let (leader_id, leader_address) = if self.management_runtime.is_leader().await {
+            // We are the leader
+            (self.node_id, self.node_address.clone())
+        } else {
+            // We're not the leader, try to find who is
+            match self.management_runtime.leader_id().await {
+                Some(lid) => {
+                    // Look up leader address from transport peers
+                    let addr = self.transport.get_peer_address(lid).await.unwrap_or_default();
+                    (lid, addr)
+                }
+                None => (0, String::new()),
+            }
+        };
 
         // TODO: Track highest_known_node_id properly
         // For now, just return this node's ID as the highest known
@@ -205,8 +144,8 @@ impl RaftService for GrpcServer {
                 node_id: self.node_id,
                 highest_known_node_id: highest_known,
                 address: self.node_address.clone(),
-                management_leader_node_id: leader.leader_id,
-                management_leader_address: leader.leader_address,
+                management_leader_node_id: leader_id,
+                management_leader_address: leader_address,
                 should_join_as_voter,
                 current_voter_count,
                 max_voters,

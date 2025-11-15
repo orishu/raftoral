@@ -139,11 +139,9 @@ impl FullNode {
             cluster_router,
             node_id,
             address.clone(),
+            transport.clone(),
             runtime.clone(),
         ));
-
-        // Start leader tracker
-        grpc_server.start_leader_tracker(node.clone(), transport.clone());
 
         // Create WorkflowManagement service
         let workflow_service = WorkflowManagementService::new(runtime.clone(), logger.clone());
@@ -320,11 +318,9 @@ impl FullNode {
             cluster_router,
             node_id,
             address.clone(),
+            transport.clone(),
             runtime.clone(),
         ));
-
-        // Start leader tracker
-        grpc_server.start_leader_tracker(node.clone(), transport.clone());
 
         // Create WorkflowManagement service
         let workflow_service = WorkflowManagementService::new(runtime.clone(), logger.clone());
