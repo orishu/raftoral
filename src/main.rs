@@ -60,8 +60,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Convert storage_path to PathBuf if provided
     let storage_path = args.storage_path.map(std::path::PathBuf::from);
 
+    // Check if we should resume from existing storage
+    // Note: Storage is created in cluster_0 subdirectory for the management cluster
+    let resume_node_id = if let Some(ref path) = storage_path {
+        #[cfg(feature = "persistent-storage")]
+        {
+            use raftoral::raft::generic::RocksDBStorage;
+
+            // Check in the cluster_0 subdirectory (management cluster)
+            let cluster_0_path = path.join("cluster_0");
+
+            info!(logger, "Checking for existing storage"; "base_path" => ?path, "cluster_path" => ?cluster_0_path);
+
+            match RocksDBStorage::load_node_id_from_path(&cluster_0_path) {
+                Ok(Some(node_id)) => {
+                    info!(logger, "Found existing storage with node_id"; "node_id" => node_id);
+                    Some(node_id)
+                }
+                Ok(None) => {
+                    info!(logger, "No existing storage found at cluster path");
+                    None
+                }
+                Err(e) => {
+                    info!(logger, "Error checking storage"; "error" => ?e);
+                    None
+                }
+            }
+        }
+        #[cfg(not(feature = "persistent-storage"))]
+        None
+    } else {
+        None
+    };
+
     // Create FullNode based on mode
-    let node = if args.bootstrap {
+    let node = if let Some(stored_node_id) = resume_node_id {
+        // Resume from existing storage
+        info!(logger, "Resuming from existing storage";
+            "node_id" => stored_node_id,
+            "storage_path" => ?storage_path
+        );
+
+        FullNode::new(stored_node_id, address, storage_path, logger.clone()).await?
+    } else if args.bootstrap {
         let node_id = args.node_id.unwrap_or(1);
         info!(logger, "Bootstrap mode"; "node_id" => node_id, "storage_path" => ?storage_path);
 

@@ -110,11 +110,60 @@ impl RocksDBStorage {
         Ok(storage)
     }
 
+    /// Load node_id from existing storage without fully opening it
+    ///
+    /// Opens the database read-only to extract the persisted node_id.
+    /// Returns None if storage doesn't exist or node_id hasn't been persisted yet.
+    pub fn load_node_id_from_path<P: AsRef<Path>>(path: P) -> Result<Option<u64>> {
+        use rocksdb::Options;
+
+        let path = path.as_ref();
+
+        // Check if directory exists
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        // Try to open the database read-only
+        let opts = Options::default();
+        let cfs = vec![CF_ENTRIES, CF_METADATA, CF_SNAPSHOT];
+
+        match rocksdb::DB::open_cf_for_read_only(&opts, path, cfs, false) {
+            Ok(db) => {
+                if let Some(cf_metadata) = db.cf_handle(CF_METADATA) {
+                    match db.get_cf(cf_metadata, KEY_NODE_ID) {
+                        Ok(Some(bytes)) => {
+                            if bytes.len() == 8 {
+                                let mut array = [0u8; 8];
+                                array.copy_from_slice(&bytes);
+                                Ok(Some(u64::from_be_bytes(array)))
+                            } else {
+                                Err(Error::Store(StorageError::Other(
+                                    "Invalid node_id size in storage".into()
+                                )))
+                            }
+                        }
+                        Ok(None) => Ok(None),
+                        Err(_) => Ok(None),
+                    }
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
     /// Check if a RocksDB storage directory exists and contains Raft state
     ///
     /// This helps distinguish between a fresh start and a node restart.
     /// Returns Ok(true) if the directory exists and contains Raft metadata.
     pub fn storage_exists<P: AsRef<Path>>(path: P) -> Result<bool> {
+        Self::load_node_id_from_path(path).map(|opt| opt.is_some())
+    }
+
+    #[allow(dead_code)]
+    fn storage_exists_old<P: AsRef<Path>>(path: P) -> Result<bool> {
         use rocksdb::Options;
 
         let path = path.as_ref();
