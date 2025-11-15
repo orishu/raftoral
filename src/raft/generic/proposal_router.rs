@@ -278,7 +278,9 @@ impl<SM: StateMachine> ProposalRouter<SM> {
 
     /// Get the current leader ID (if known)
     pub async fn leader_id(&self) -> Option<u64> {
-        *self.leader_id.lock().await
+        // Query the RaftNode directly for current leader (don't rely on cache)
+        let node = self.node.lock().await;
+        node.leader_id()
     }
 
     /// Check if this node is the leader

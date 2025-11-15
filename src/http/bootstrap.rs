@@ -1,7 +1,21 @@
 //! Bootstrap functionality for discovering and joining existing clusters via HTTP
 
 use crate::http::messages::{PeerInfo, RegisterNodeRequest, RegisterNodeResponse};
+use serde::{Deserialize, Serialize};
 use slog::{info, warn, Logger};
+
+/// Discovery response from /discovery/peers endpoint
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DiscoveryResponse {
+    node_id: u64,
+    highest_known_node_id: u64,
+    address: String,
+    management_leader_node_id: u64,
+    management_leader_address: String,
+    should_join_as_voter: bool,
+    current_voter_count: u64,
+    max_voters: u64,
+}
 
 /// Information about a discovered peer node
 #[derive(Debug, Clone)]
@@ -20,39 +34,25 @@ pub struct DiscoveredPeer {
 pub async fn discover_peer(address: &str) -> Result<DiscoveredPeer, Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
 
-    // For now, use a simplified discovery - just register and get peer info
-    // TODO: Add full discovery endpoint with cluster information
-    let url = format!("{}/discovery/peers", address);
+    // Call the discovery endpoint
+    let url = format!("http://{}/discovery/peers", address);
 
-    let response: Vec<PeerInfo> = client
+    let response: DiscoveryResponse = client
         .get(&url)
         .send()
         .await?
         .json()
         .await?;
 
-    // Find highest node_id
-    let highest_known_node_id = response
-        .iter()
-        .map(|p| p.node_id)
-        .max()
-        .unwrap_or(0);
-
-    // For now, assume first peer is the management leader (simplified)
-    let (leader_id, leader_address) = response
-        .first()
-        .map(|p| (p.node_id, p.address.clone()))
-        .unwrap_or((0, String::new()));
-
     Ok(DiscoveredPeer {
-        node_id: 0, // Will be assigned during registration
-        address: address.to_string(),
-        highest_known_node_id,
-        management_leader_node_id: leader_id,
-        management_leader_address: leader_address,
-        should_join_as_voter: true, // Simplified for now
-        current_voter_count: response.len() as u64,
-        max_voters: 5, // Default
+        node_id: response.node_id,
+        address: response.address,
+        highest_known_node_id: response.highest_known_node_id,
+        management_leader_node_id: response.management_leader_node_id,
+        management_leader_address: response.management_leader_address,
+        should_join_as_voter: response.should_join_as_voter,
+        current_voter_count: response.current_voter_count,
+        max_voters: response.max_voters,
     })
 }
 
@@ -91,13 +91,14 @@ pub fn next_node_id(discovered_peers: &[DiscoveredPeer]) -> u64 {
 pub async fn register_with_peer(
     seed_address: &str,
     our_address: &str,
+    node_id: u64,
 ) -> Result<u64, Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
-    let url = format!("{}/discovery/register", seed_address);
+    let url = format!("http://{}/discovery/register", seed_address);
 
     let request = RegisterNodeRequest {
         address: our_address.to_string(),
-        node_id: None, // Let the peer assign an ID
+        node_id: Some(node_id),
     };
 
     let response: RegisterNodeResponse = client

@@ -133,12 +133,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         info!(logger, "Join mode"; "peers" => ?args.peers, "storage_path" => ?storage_path);
 
-        // Note: Join mode with HTTP transport not yet implemented
-        if args.transport == "http" {
-            return Err("HTTP transport with join mode is not yet implemented. Use --transport grpc or bootstrap mode.".into());
-        }
-
-        let node = FullNode::new_joining(address, args.peers, storage_path, logger.clone()).await?;
+        let node = if args.transport == "http" {
+            FullNode::new_joining_with_http(address, args.peers, storage_path, logger.clone()).await?
+        } else {
+            FullNode::new_joining(address, args.peers, storage_path, logger.clone()).await?
+        };
 
         info!(logger, "Node joined with ID"; "node_id" => node.node_id());
         node

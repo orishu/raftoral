@@ -262,23 +262,22 @@ impl FullNode {
         };
 
         let (runtime, node) = if should_join_as_voter {
-            // Collect voter node IDs including ourselves
-            let initial_voters: Vec<u64> = discovered_peers
+            // Collect existing voter node IDs (NOT including ourselves yet - we'll be added via ConfChange)
+            let existing_voters: Vec<u64> = discovered_peers
                 .iter()
                 .map(|p| p.node_id)
-                .chain(std::iter::once(node_id)) // Include ourselves as voter
                 .collect();
 
             info!(logger, "Joining management cluster as VOTER";
             "node_id" => node_id,
-            "existing_voters" => ?initial_voters
+            "existing_voters" => ?existing_voters
             );
 
             ManagementRuntime::new_joining_node(
                 config,
                 transport.clone(),
                 mailbox_rx,
-                initial_voters,
+                existing_voters,
                 cluster_router.clone(),
                 registry.clone(),
                 logger.clone(),
@@ -481,7 +480,9 @@ impl FullNode {
             logger,
             "Bootstrap node adding itself to management cluster to trigger ClusterManager"
         );
-        let add_rx = runtime.add_node(node_id, address.clone()).await?;
+        // For HTTP transport, use full address with http:// prefix
+        let full_address = format!("http://{}", address);
+        let add_rx = runtime.add_node(node_id, full_address).await?;
 
         // Wait for the operation to complete
         match add_rx.await {
@@ -494,18 +495,16 @@ impl FullNode {
         }
 
         // Layer 0: Start HTTP server
-        use crate::http::{HttpServer, HttpTransport};
-
-        let http_transport = Arc::new(HttpTransport::new(
-            cluster_router.clone(),
-            logger.clone(),
-        ));
+        use crate::http::HttpServer;
 
         let addr: std::net::SocketAddr = address.parse()?;
         let http_server = HttpServer::new(
             node_id,
             addr,
-            http_transport.clone(),
+            address.clone(),
+            cluster_router.clone(),
+            transport.clone(),
+            runtime.clone(),
             registry.clone(),
             logger.clone(),
         );
@@ -528,6 +527,165 @@ impl FullNode {
             address,
             logger,
         })
+    }
+
+    /// Create and start a new full node with HTTP transport in join mode
+    ///
+    /// # Arguments
+    /// * `address` - Network address to bind to (e.g., "127.0.0.1:8001")
+    /// * `seed_addresses` - Addresses of existing cluster nodes to discover
+    /// * `storage_path` - Optional path for persistent storage (None = in-memory)
+    /// * `logger` - Logger instance
+    ///
+    /// # Returns
+    /// A running FullNode instance that has joined the cluster via HTTP
+    pub async fn new_joining_with_http(
+        address: String,
+        seed_addresses: Vec<String>,
+        storage_path: Option<std::path::PathBuf>,
+        logger: Logger,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        info!(logger, "Creating FullNode with HTTP transport in join mode";
+            "address" => &address,
+            "seeds" => ?seed_addresses
+        );
+
+        // Discover existing peers via HTTP
+        use crate::http::bootstrap::{discover_peers, next_node_id};
+        let discovered_peers = discover_peers(seed_addresses).await;
+
+        if discovered_peers.is_empty() {
+            return Err("Failed to discover any peers via HTTP".into());
+        }
+
+        // Determine our node ID
+        let node_id = next_node_id(&discovered_peers);
+        info!(logger, "Assigned node ID"; "node_id" => node_id);
+
+        // Find management leader
+        let leader_peer = discovered_peers
+            .iter()
+            .find(|p| p.management_leader_node_id != 0)
+            .ok_or("No management leader found in discovered peers")?;
+        info!(logger, "Found management leader";
+            "leader_node_id" => leader_peer.management_leader_node_id,
+            "leader_address" => &leader_peer.management_leader_address
+        );
+
+        // Layer 1: Create transport with HTTP message sender
+        use crate::http::HttpMessageSender;
+        let http_sender = Arc::new(HttpMessageSender::new(logger.clone()));
+        let transport = Arc::new(TransportLayer::new(http_sender));
+
+        // Add all discovered peers to transport (with http:// prefix for HTTP transport)
+        for peer in &discovered_peers {
+            let peer_address = format!("http://{}", peer.address);
+            transport.add_peer(peer.node_id, peer_address).await;
+        }
+
+        // Create mailbox for this node
+        let (mailbox_tx, mailbox_rx) = mpsc::channel(1000);
+
+        // Layer 2: Create cluster router
+        let cluster_router = Arc::new(ClusterRouter::new());
+
+        // Register this node's cluster (cluster_id = 0 for management)
+        cluster_router.register_cluster(0, mailbox_tx).await;
+
+        // Determine if we should join as voter or learner
+        let should_join_as_voter = discovered_peers
+            .first()
+            .map(|p| p.should_join_as_voter)
+            .unwrap_or(true);
+
+        info!(logger, "Joining as";
+            "role" => if should_join_as_voter { "voter" } else { "learner" }
+        );
+
+        // Create shared workflow registry
+        let registry = Arc::new(Mutex::new(crate::workflow::WorkflowRegistry::new()));
+
+        // Layers 3-7: Create management runtime
+        let config = RaftNodeConfig {
+            node_id,
+            cluster_id: 0,
+            snapshot_interval: 100,
+            storage_path,
+            ..Default::default()
+        };
+
+        let (runtime, node) = ManagementRuntime::new(
+            config,
+            transport.clone(),
+            mailbox_rx,
+            cluster_router.clone(),
+            registry.clone(),
+            logger.clone(),
+        )?;
+
+        // Run Raft node in background
+        let node_clone = node.clone();
+        tokio::spawn(async move {
+            info!(
+                slog::Logger::root(slog::Discard, slog::o!()),
+                "Starting Raft node event loop"
+            );
+            let _ = RaftNode::run_from_arc(node_clone).await;
+        });
+
+        // Layer 0: Start HTTP server
+        use crate::http::HttpServer;
+
+        let addr: std::net::SocketAddr = address.parse()?;
+        let http_server = HttpServer::new(
+            node_id,
+            addr,
+            address.clone(),
+            cluster_router.clone(),
+            transport.clone(),
+            runtime.clone(),
+            registry.clone(),
+            logger.clone(),
+        );
+
+        info!(logger, "Starting HTTP server"; "address" => &address);
+
+        let server_handle = tokio::spawn(async move {
+            if let Err(e) = http_server.start().await {
+                eprintln!("HTTP server error: {}", e);
+            }
+        });
+
+        info!(logger, "FullNode started in join mode with HTTP"; "node_id" => node_id, "address" => &address);
+
+        let full_node = Self {
+            runtime: runtime.clone(),
+            node,
+            server_handle: Some(server_handle),
+            workflow_registry: registry,
+            address: address.clone(),
+            logger: logger.clone(),
+        };
+
+        // Use HTTP POST to register with management cluster leader
+        info!(logger, "Registering with management leader via HTTP";
+            "node_id" => node_id,
+            "leader" => &leader_peer.management_leader_address
+        );
+
+        use crate::http::bootstrap::register_with_peer;
+        match register_with_peer(&leader_peer.management_leader_address, &address, node_id).await {
+            Ok(assigned_id) => {
+                info!(logger, "Successfully registered with management leader";
+                    "assigned_node_id" => assigned_id
+                );
+            }
+            Err(e) => {
+                info!(logger, "Failed to register with management leader (will retry)"; "error" => %e);
+            }
+        }
+
+        Ok(full_node)
     }
 
     /// Get a reference to the management runtime
