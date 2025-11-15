@@ -1,4 +1,5 @@
 use clap::Parser;
+use raftoral::checkpoint_compute;
 use raftoral::full_node::FullNode;
 use raftoral::workflow::WorkflowError;
 use slog::{info, o, Drain};
@@ -91,15 +92,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .register_closure(
                 "ping_pong",
                 1,
-                |input: String, _ctx| async move {
-                    if input == "ping" {
-                        Ok("pong".to_string())
-                    } else {
-                        Err(WorkflowError::ClusterError(format!(
-                            "Expected 'ping', got '{}'",
-                            input
-                        )))
-                    }
+                |input: String, ctx| async move {
+                    // Step 1: Store input in a variable after 1 second using checkpoint_compute
+                    let input_clone = input.clone();
+                    let stored_input = checkpoint_compute!(ctx, "stored_input", || async move {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        input_clone
+                    });
+
+                    // Step 2: Read it back
+                    let read_value = stored_input.get().clone();
+
+                    // Step 3: Use checkpoint_compute again to verify and wait another second
+                    let read_value_clone = read_value.clone();
+                    let result = checkpoint_compute!(ctx, "final_result", || async move {
+                        // Verify it's still "ping"
+                        if read_value_clone == "ping" {
+                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                            Ok("pong".to_string())
+                        } else {
+                            Err(WorkflowError::ClusterError(format!(
+                                "Expected 'ping', got '{}'",
+                                read_value_clone
+                            )))
+                        }
+                    });
+
+                    // Step 4: Return "pong" as the result
+                    result.get().clone()
                 },
             )
             .map_err(|e| format!("Failed to register ping_pong workflow: {}", e))?;
