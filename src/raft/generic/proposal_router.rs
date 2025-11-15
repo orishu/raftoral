@@ -82,19 +82,12 @@ impl<SM: StateMachine> ProposalRouter<SM> {
         node_id: u64,
         logger: Logger,
     ) -> Self {
-        // Initialize leader_id by querying the node (synchronously via block_in_place)
-        let initial_leader = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                let n = node.lock().await;
-                n.leader_id()
-            })
-        });
-
+        // Initialize with None - leader will be discovered on first propose or role change
         Self {
             node,
             transport,
             cluster_id,
-            leader_id: Arc::new(Mutex::new(initial_leader)),
+            leader_id: Arc::new(Mutex::new(None)),
             node_id,
             logger,
         }
@@ -166,6 +159,7 @@ impl<SM: StateMachine> ProposalRouter<SM> {
         let mut cached_leader = *self.leader_id.lock().await;
 
         // If we don't have a cached leader, query the node for current leader
+        // Retry with backoff to handle cases where cluster is still electing a leader
         if cached_leader.is_none() {
             let actual_leader = node.leader_id();
             drop(node); // Release the lock
@@ -174,6 +168,30 @@ impl<SM: StateMachine> ProposalRouter<SM> {
                 // Update the cache
                 *self.leader_id.lock().await = actual_leader;
                 cached_leader = actual_leader;
+            } else {
+                // No leader yet - retry with exponential backoff (up to ~2 seconds total)
+                debug!(self.logger, "No known leader, retrying with backoff");
+                let mut delay_ms = 10u64;
+                let max_delay_ms = 500u64;
+                let timeout = std::time::Duration::from_secs(2);
+                let start = std::time::Instant::now();
+
+                while start.elapsed() < timeout {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+
+                    let node = self.node.lock().await;
+                    let actual_leader = node.leader_id();
+                    drop(node);
+
+                    if actual_leader.is_some() {
+                        *self.leader_id.lock().await = actual_leader;
+                        cached_leader = actual_leader;
+                        debug!(self.logger, "Leader discovered after retry"; "leader_id" => ?actual_leader);
+                        break;
+                    }
+
+                    delay_ms = std::cmp::min(delay_ms * 2, max_delay_ms);
+                }
             }
         } else {
             drop(node); // Release the lock

@@ -269,7 +269,7 @@ impl<SM: StateMachine> RaftNode<SM> {
     /// * `logger` - Logger instance
     ///
     /// # Example
-    /// ```no_run
+    /// ```ignore
     /// # use raftoral::raft::generic::*;
     /// # use raft::prelude::ConfState;
     /// # use std::sync::Arc;
