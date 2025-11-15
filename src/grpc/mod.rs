@@ -13,7 +13,7 @@ pub mod proto {
     tonic::include_proto!("raftoral");
 
     /// File descriptor set for gRPC reflection
-    pub const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!("../../target/descriptor.bin");
+    pub const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descriptor.bin"));
 }
 
 pub mod bootstrap;
