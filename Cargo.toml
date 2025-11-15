@@ -32,6 +32,17 @@ env_logger = "^0.11"
 rand = "^0.9.2"
 ttl_cache = "^0.5"
 rocksdb = { version = "^0.24.0", optional = true }
+axum = "^0.7"
+reqwest = { version = "^0.12", features = ["json"] }
+tower = "^0.5"
+tower-http = { version = "^0.6", features = ["cors"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "^0.2"
+wasm-bindgen-futures = "^0.4"
+js-sys = "^0.3"
+web-sys = { version = "^0.3", features = ["Window", "Request", "Response", "Headers", "RequestInit", "RequestMode", "RequestCredentials"] }
+getrandom = { version = "^0.2", features = ["js"] }
 
 [features]
 default = ["persistent-storage"]

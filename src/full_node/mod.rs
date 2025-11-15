@@ -34,8 +34,8 @@ pub struct FullNode {
     /// Raft node handle
     node: Arc<Mutex<RaftNode<crate::management::ManagementStateMachine>>>,
 
-    /// gRPC server handle
-    grpc_server_handle: Option<JoinHandle<Result<(), tonic::transport::Error>>>,
+    /// Server handle (generic over transport type)
+    server_handle: Option<JoinHandle<()>>,
 
     /// Shared workflow registry (accessible before execution clusters are created)
     workflow_registry: Arc<Mutex<crate::workflow::WorkflowRegistry>>,
@@ -153,14 +153,14 @@ impl FullNode {
         info!(logger, "Starting gRPC server"; "address" => &address);
 
         let grpc_server_clone = grpc_server.clone();
-        let grpc_server_handle = tokio::spawn(async move {
+        let server_handle = tokio::spawn(async move {
             // Enable gRPC reflection for grpcurl support
             let reflection_service = tonic_reflection::server::Builder::configure()
                 .register_encoded_file_descriptor_set(crate::grpc::proto::FILE_DESCRIPTOR_SET)
                 .build_v1()
                 .unwrap();
 
-            Server::builder()
+            let _ = Server::builder()
                 .add_service(reflection_service)
                 .add_service(
                     crate::grpc::proto::raft_service_server::RaftServiceServer::new(
@@ -173,7 +173,7 @@ impl FullNode {
                     ),
                 )
                 .serve(addr)
-                .await
+                .await;
         });
 
         info!(logger, "FullNode started"; "node_id" => node_id, "address" => &address);
@@ -181,7 +181,7 @@ impl FullNode {
         Ok(Self {
             runtime,
             node,
-            grpc_server_handle: Some(grpc_server_handle),
+            server_handle: Some(server_handle),
             workflow_registry: registry,
             address,
             logger,
@@ -335,14 +335,14 @@ impl FullNode {
         info!(logger, "Starting gRPC server"; "address" => &address);
 
         let grpc_server_clone = grpc_server.clone();
-        let grpc_server_handle = tokio::spawn(async move {
+        let server_handle = tokio::spawn(async move {
             // Enable gRPC reflection for grpcurl support
             let reflection_service = tonic_reflection::server::Builder::configure()
                 .register_encoded_file_descriptor_set(crate::grpc::proto::FILE_DESCRIPTOR_SET)
                 .build_v1()
                 .unwrap();
 
-            Server::builder()
+            let _ = Server::builder()
                 .add_service(reflection_service)
                 .add_service(
                     crate::grpc::proto::raft_service_server::RaftServiceServer::new(
@@ -355,7 +355,7 @@ impl FullNode {
                     ),
                 )
                 .serve(addr)
-                .await
+                .await;
         });
 
         info!(logger, "FullNode started in join mode"; "node_id" => node_id, "address" => &address);
@@ -363,7 +363,7 @@ impl FullNode {
         let full_node = Self {
             runtime: runtime.clone(),
             node,
-            grpc_server_handle: Some(grpc_server_handle),
+            server_handle: Some(server_handle),
             workflow_registry: registry,
             address: address.clone(),
             logger: logger.clone(),
@@ -407,6 +407,129 @@ impl FullNode {
         Ok(full_node)
     }
 
+    /// Create and start a new full node with HTTP transport in bootstrap mode
+    ///
+    /// # Arguments
+    /// * `node_id` - Unique identifier for this node
+    /// * `address` - Network address to bind to (e.g., "127.0.0.1:8001")
+    /// * `storage_path` - Optional path for persistent storage (None = in-memory)
+    /// * `logger` - Logger instance
+    ///
+    /// # Returns
+    /// A running FullNode instance using HTTP transport
+    pub async fn new_with_http(
+        node_id: u64,
+        address: String,
+        storage_path: Option<std::path::PathBuf>,
+        logger: Logger,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        info!(logger, "Creating FullNode with HTTP transport"; "node_id" => node_id, "address" => &address);
+
+        // Layer 1: Create transport with HTTP message sender
+        use crate::http::HttpMessageSender;
+        let http_sender = Arc::new(HttpMessageSender::new(logger.clone()));
+        let transport = Arc::new(TransportLayer::new(http_sender));
+
+        // Create mailbox for this node
+        let (mailbox_tx, mailbox_rx) = mpsc::channel(1000);
+
+        // Layer 2: Create cluster router
+        let cluster_router = Arc::new(ClusterRouter::new());
+
+        // Register this node's cluster (cluster_id = 0 for management)
+        cluster_router.register_cluster(0, mailbox_tx).await;
+
+        // Create shared workflow registry
+        let registry = Arc::new(Mutex::new(crate::workflow::WorkflowRegistry::new()));
+
+        // Layers 3-7: Create management runtime (includes RaftNode, EventBus, ProposalRouter)
+        let config = RaftNodeConfig {
+            node_id,
+            cluster_id: 0,          // Management cluster ID
+            snapshot_interval: 100, // Take snapshot every 100 entries
+            storage_path,
+            ..Default::default()
+        };
+
+        let (runtime, node) = ManagementRuntime::new(
+            config,
+            transport.clone(),
+            mailbox_rx,
+            cluster_router.clone(),
+            registry.clone(),
+            logger.clone(),
+        )?;
+
+        // Run Raft node in background
+        let node_clone = node.clone();
+        tokio::spawn(async move {
+            info!(
+                slog::Logger::root(slog::Discard, slog::o!()),
+                "Starting Raft node event loop"
+            );
+            let _ = RaftNode::run_from_arc(node_clone).await;
+        });
+
+        // Campaign to become leader (for single-node cluster)
+        node.lock().await.campaign().await?;
+
+        // Wait for leader election to complete
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        // Bootstrap node should add itself to trigger ClusterManager
+        info!(
+            logger,
+            "Bootstrap node adding itself to management cluster to trigger ClusterManager"
+        );
+        let add_rx = runtime.add_node(node_id, address.clone()).await?;
+
+        // Wait for the operation to complete
+        match add_rx.await {
+            Ok(Ok(_)) => info!(
+                logger,
+                "Bootstrap node successfully added to management cluster"
+            ),
+            Ok(Err(e)) => return Err(format!("Failed to add bootstrap node: {}", e).into()),
+            Err(e) => return Err(format!("Add node oneshot error: {}", e).into()),
+        }
+
+        // Layer 0: Start HTTP server
+        use crate::http::{HttpServer, HttpTransport};
+
+        let http_transport = Arc::new(HttpTransport::new(
+            cluster_router.clone(),
+            logger.clone(),
+        ));
+
+        let addr: std::net::SocketAddr = address.parse()?;
+        let http_server = HttpServer::new(
+            node_id,
+            addr,
+            http_transport.clone(),
+            registry.clone(),
+            logger.clone(),
+        );
+
+        info!(logger, "Starting HTTP server"; "address" => &address);
+
+        let server_handle = tokio::spawn(async move {
+            if let Err(e) = http_server.start().await {
+                eprintln!("HTTP server error: {}", e);
+            }
+        });
+
+        info!(logger, "FullNode started with HTTP transport"; "node_id" => node_id, "address" => &address);
+
+        Ok(Self {
+            runtime,
+            node,
+            server_handle: Some(server_handle),
+            workflow_registry: registry,
+            address,
+            logger,
+        })
+    }
+
     /// Get a reference to the management runtime
     pub fn runtime(&self) -> &Arc<ManagementRuntime<WorkflowRuntime>> {
         &self.runtime
@@ -439,7 +562,7 @@ impl FullNode {
     pub async fn shutdown(mut self) {
         info!(self.logger, "Shutting down FullNode");
 
-        if let Some(handle) = self.grpc_server_handle.take() {
+        if let Some(handle) = self.server_handle.take() {
             handle.abort();
         }
     }

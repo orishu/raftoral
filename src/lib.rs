@@ -1,5 +1,6 @@
 pub mod raft;
 pub mod grpc;  // gRPC implementation for generic architecture
+pub mod http;  // HTTP implementation for generic architecture (WASM-compatible)
 pub mod kv;  // KV runtime for generic architecture
 pub mod management;  // Management runtime for generic architecture
 pub mod workflow;  // Workflow execution runtime for generic architecture

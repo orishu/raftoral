@@ -33,6 +33,10 @@ struct Args {
     /// Path for persistent storage (optional, uses in-memory storage if not provided)
     #[arg(short = 's', long)]
     storage_path: Option<String>,
+
+    /// Transport protocol to use (grpc or http)
+    #[arg(short = 't', long, default_value = "grpc")]
+    transport: String,
 }
 
 // Workflow uses simple String input/output for compatibility with scripts
@@ -49,9 +53,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let logger = create_logger();
 
+    // Validate transport protocol
+    if args.transport != "grpc" && args.transport != "http" {
+        return Err(format!("Invalid transport protocol: {}. Must be 'grpc' or 'http'", args.transport).into());
+    }
+
     info!(logger, "Starting Raftoral node";
         "listen" => &args.listen,
-        "bootstrap" => args.bootstrap
+        "bootstrap" => args.bootstrap,
+        "transport" => &args.transport
     );
 
     // Determine address (advertise takes precedence if provided)
@@ -93,7 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Create FullNode based on mode
+    // Create FullNode based on mode and transport
     let node = if let Some(stored_node_id) = resume_node_id {
         // Resume from existing storage
         info!(logger, "Resuming from existing storage";
@@ -101,18 +111,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "storage_path" => ?storage_path
         );
 
+        // Note: Resume currently only supports gRPC transport
+        if args.transport == "http" {
+            return Err("HTTP transport with resume is not yet implemented. Use --transport grpc or start without existing storage.".into());
+        }
+
         FullNode::new(stored_node_id, address, storage_path, logger.clone()).await?
     } else if args.bootstrap {
         let node_id = args.node_id.unwrap_or(1);
         info!(logger, "Bootstrap mode"; "node_id" => node_id, "storage_path" => ?storage_path);
 
-        FullNode::new(node_id, address, storage_path, logger.clone()).await?
+        if args.transport == "http" {
+            FullNode::new_with_http(node_id, address, storage_path, logger.clone()).await?
+        } else {
+            FullNode::new(node_id, address, storage_path, logger.clone()).await?
+        }
     } else {
         if args.peers.is_empty() {
             return Err("--peers is required when not in bootstrap mode".into());
         }
 
         info!(logger, "Join mode"; "peers" => ?args.peers, "storage_path" => ?storage_path);
+
+        // Note: Join mode with HTTP transport not yet implemented
+        if args.transport == "http" {
+            return Err("HTTP transport with join mode is not yet implemented. Use --transport grpc or bootstrap mode.".into());
+        }
 
         let node = FullNode::new_joining(address, args.peers, storage_path, logger.clone()).await?;
 
