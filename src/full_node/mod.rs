@@ -14,13 +14,11 @@ pub use workflow_service::WorkflowManagementService;
 
 use crate::grpc::{GrpcMessageSender, GrpcServer};
 use crate::management::ManagementRuntime;
-use crate::raft::generic::{
-    ClusterRouter, RaftNode, RaftNodeConfig, Transport, TransportLayer,
-};
+use crate::raft::generic::{ClusterRouter, RaftNode, RaftNodeConfig, Transport, TransportLayer};
 use crate::workflow::WorkflowRuntime;
-use slog::{info, Logger};
+use slog::{Logger, info};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tonic::transport::Server;
 
@@ -87,7 +85,7 @@ impl FullNode {
         // Layers 3-7: Create management runtime (includes RaftNode, EventBus, ProposalRouter)
         let config = RaftNodeConfig {
             node_id,
-            cluster_id: 0, // Management cluster ID
+            cluster_id: 0,          // Management cluster ID
             snapshot_interval: 100, // Take snapshot every 100 entries
             storage_path,
             ..Default::default()
@@ -105,7 +103,10 @@ impl FullNode {
         // Run Raft node in background
         let node_clone = node.clone();
         tokio::spawn(async move {
-            info!(slog::Logger::root(slog::Discard, slog::o!()), "Starting Raft node event loop");
+            info!(
+                slog::Logger::root(slog::Discard, slog::o!()),
+                "Starting Raft node event loop"
+            );
             let _ = RaftNode::run_from_arc(node_clone).await;
         });
 
@@ -117,12 +118,18 @@ impl FullNode {
 
         // Bootstrap node should add itself to trigger ClusterManager
         // This creates the first execution cluster with this node
-        info!(logger, "Bootstrap node adding itself to management cluster to trigger ClusterManager");
+        info!(
+            logger,
+            "Bootstrap node adding itself to management cluster to trigger ClusterManager"
+        );
         let add_rx = runtime.add_node(node_id, address.clone()).await?;
 
         // Wait for the operation to complete
         match add_rx.await {
-            Ok(Ok(_)) => info!(logger, "Bootstrap node successfully added to management cluster"),
+            Ok(Ok(_)) => info!(
+                logger,
+                "Bootstrap node successfully added to management cluster"
+            ),
             Ok(Err(e)) => return Err(format!("Failed to add bootstrap node: {}", e).into()),
             Err(e) => return Err(format!("Add node oneshot error: {}", e).into()),
         }
@@ -214,187 +221,190 @@ impl FullNode {
         let node_id = next_node_id(&discovered_peers);
         info!(logger, "Assigned node ID"; "node_id" => node_id);
 
+        // Find management leader
+        let leader_peer = discovered_peers
+            .iter()
+            .find(|p| p.management_leader_node_id != 0)
+            .ok_or("No management leader found in discovered peers")?;
+        info!(logger, "Found management leader";
+            "leader_node_id" => leader_peer.management_leader_node_id,
+            "leader_address" => &leader_peer.management_leader_address
+        );
+        // Layer 1: Create transport with gRPC message sender
+        let grpc_sender = Arc::new(GrpcMessageSender::new());
+        let transport = Arc::new(TransportLayer::new(grpc_sender));
+        // Add all discovered peers to transport
+        for peer in &discovered_peers {
+            transport.add_peer(peer.node_id, peer.address.clone()).await;
+        }
+        // Create mailbox for this node
+        let (mailbox_tx, mailbox_rx) = mpsc::channel(1000);
+        // Layer 2: Create cluster router
+        let cluster_router = Arc::new(ClusterRouter::new());
+        // Register this node's cluster (cluster_id = 0 for management)
+        cluster_router.register_cluster(0, mailbox_tx).await;
+        // Determine if we should join as voter or learner
+        // All discovered peers should have consistent voter information
+        let should_join_as_voter = discovered_peers
+            .first()
+            .map(|p| p.should_join_as_voter)
+            .unwrap_or(true); // Default to voter if no info available
+        // Create shared workflow registry
+        let registry = Arc::new(Mutex::new(crate::workflow::WorkflowRegistry::new()));
 
-// Find management leader
-let leader_peer = discovered_peers.iter()
-    .find(|p| p.management_leader_node_id != 0)
-    .ok_or("No management leader found in discovered peers")?;
-info!(logger, "Found management leader";
-    "leader_node_id" => leader_peer.management_leader_node_id,
-    "leader_address" => &leader_peer.management_leader_address
-);
-// Layer 1: Create transport with gRPC message sender
-let grpc_sender = Arc::new(GrpcMessageSender::new());
-let transport = Arc::new(TransportLayer::new(grpc_sender));
-// Add all discovered peers to transport
-for peer in &discovered_peers {
-    transport.add_peer(peer.node_id, peer.address.clone()).await;
-}
-// Create mailbox for this node
-let (mailbox_tx, mailbox_rx) = mpsc::channel(1000);
-// Layer 2: Create cluster router
-let cluster_router = Arc::new(ClusterRouter::new());
-// Register this node's cluster (cluster_id = 0 for management)
-cluster_router.register_cluster(0, mailbox_tx).await;
-// Determine if we should join as voter or learner
-// All discovered peers should have consistent voter information
-let should_join_as_voter = discovered_peers.first()
-    .map(|p| p.should_join_as_voter)
-    .unwrap_or(true); // Default to voter if no info available
-// Create shared workflow registry
-let registry = Arc::new(Mutex::new(crate::workflow::WorkflowRegistry::new()));
+        // Layers 3-7: Create management runtime in joining mode
+        let config = RaftNodeConfig {
+            node_id,
+            cluster_id: 0, // Management cluster ID
+            snapshot_interval: 100,
+            storage_path,
+            ..Default::default()
+        };
 
-// Layers 3-7: Create management runtime in joining mode
-let config = RaftNodeConfig {
-node_id,
-cluster_id: 0, // Management cluster ID
-snapshot_interval: 100,
-storage_path,
-..Default::default()
-};
+        let (runtime, node) = if should_join_as_voter {
+            // Collect voter node IDs including ourselves
+            let initial_voters: Vec<u64> = discovered_peers
+                .iter()
+                .map(|p| p.node_id)
+                .chain(std::iter::once(node_id)) // Include ourselves as voter
+                .collect();
 
-let (runtime, node) = if should_join_as_voter {
-// Collect voter node IDs including ourselves
-let initial_voters: Vec<u64> = discovered_peers.iter()
-.map(|p| p.node_id)
-.chain(std::iter::once(node_id)) // Include ourselves as voter
-.collect();
+            info!(logger, "Joining management cluster as VOTER";
+            "node_id" => node_id,
+            "existing_voters" => ?initial_voters
+            );
 
-info!(logger, "Joining management cluster as VOTER";
-"node_id" => node_id,
-"existing_voters" => ?initial_voters
-);
+            ManagementRuntime::new_joining_node(
+                config,
+                transport.clone(),
+                mailbox_rx,
+                initial_voters,
+                cluster_router.clone(),
+                registry.clone(),
+                logger.clone(),
+            )?
+        } else {
+            // Collect existing voter node IDs (NOT including ourselves)
+            let existing_voters: Vec<u64> = discovered_peers.iter().map(|p| p.node_id).collect();
 
-ManagementRuntime::new_joining_node(
-config,
-transport.clone(),
-mailbox_rx,
-initial_voters,
-cluster_router.clone(),
-registry.clone(),
-logger.clone(),
-)?
-} else {
-// Collect existing voter node IDs (NOT including ourselves)
-let existing_voters: Vec<u64> = discovered_peers.iter()
-.map(|p| p.node_id)
-.collect();
+            info!(logger, "Joining management cluster as LEARNER";
+            "node_id" => node_id,
+            "existing_voters" => ?existing_voters
+            );
 
-info!(logger, "Joining management cluster as LEARNER";
-"node_id" => node_id,
-"existing_voters" => ?existing_voters
-);
+            ManagementRuntime::new_joining_learner(
+                config,
+                transport.clone(),
+                mailbox_rx,
+                existing_voters,
+                cluster_router.clone(),
+                registry.clone(),
+                logger.clone(),
+            )?
+        };
 
-ManagementRuntime::new_joining_learner(
-config,
-transport.clone(),
-mailbox_rx,
-existing_voters,
-cluster_router.clone(),
-registry.clone(),
-logger.clone(),
-)?
-};
+        // Run Raft node in background
+        let node_clone = node.clone();
+        tokio::spawn(async move {
+            info!(
+                slog::Logger::root(slog::Discard, slog::o!()),
+                "Starting Raft node event loop"
+            );
+            let _ = RaftNode::run_from_arc(node_clone).await;
+        });
 
-// Run Raft node in background
-let node_clone = node.clone();
-tokio::spawn(async move {
-info!(slog::Logger::root(slog::Discard, slog::o!()), "Starting Raft node event loop");
-let _ = RaftNode::run_from_arc(node_clone).await;
-});
+        // Do NOT campaign - we're joining an existing cluster
+        // The leader will add us via add_node()
 
-// Do NOT campaign - we're joining an existing cluster
-// The leader will add us via add_node()
+        // Layer 0: Start gRPC server
+        let grpc_server = Arc::new(GrpcServer::new(
+            cluster_router,
+            node_id,
+            address.clone(),
+            runtime.clone(),
+        ));
 
-// Layer 0: Start gRPC server
-let grpc_server = Arc::new(GrpcServer::new(
-cluster_router,
-node_id,
-address.clone(),
-runtime.clone(),
-));
+        // Start leader tracker
+        grpc_server.start_leader_tracker(node.clone(), transport.clone());
 
-// Start leader tracker
-grpc_server.start_leader_tracker(node.clone(), transport.clone());
+        // Create WorkflowManagement service
+        let workflow_service = WorkflowManagementService::new(runtime.clone(), logger.clone());
 
-// Create WorkflowManagement service
-let workflow_service = WorkflowManagementService::new(runtime.clone(), logger.clone());
+        let addr = address.parse()?;
 
-let addr = address.parse()?;
+        info!(logger, "Starting gRPC server"; "address" => &address);
 
-info!(logger, "Starting gRPC server"; "address" => &address);
+        let grpc_server_clone = grpc_server.clone();
+        let grpc_server_handle = tokio::spawn(async move {
+            // Enable gRPC reflection for grpcurl support
+            let reflection_service = tonic_reflection::server::Builder::configure()
+                .register_encoded_file_descriptor_set(crate::grpc::proto::FILE_DESCRIPTOR_SET)
+                .build_v1()
+                .unwrap();
 
-let grpc_server_clone = grpc_server.clone();
-let grpc_server_handle = tokio::spawn(async move {
-// Enable gRPC reflection for grpcurl support
-let reflection_service = tonic_reflection::server::Builder::configure()
-.register_encoded_file_descriptor_set(crate::grpc::proto::FILE_DESCRIPTOR_SET)
-.build_v1()
-.unwrap();
+            Server::builder()
+                .add_service(reflection_service)
+                .add_service(
+                    crate::grpc::proto::raft_service_server::RaftServiceServer::new(
+                        (*grpc_server_clone).clone(),
+                    ),
+                )
+                .add_service(
+                    crate::grpc::proto::workflow_management_server::WorkflowManagementServer::new(
+                        workflow_service,
+                    ),
+                )
+                .serve(addr)
+                .await
+        });
 
-Server::builder()
-.add_service(reflection_service)
-.add_service(
-crate::grpc::proto::raft_service_server::RaftServiceServer::new(
-(*grpc_server_clone).clone(),
-),
-)
-.add_service(
-crate::grpc::proto::workflow_management_server::WorkflowManagementServer::new(
-workflow_service,
-),
-)
-.serve(addr)
-.await
-});
+        info!(logger, "FullNode started in join mode"; "node_id" => node_id, "address" => &address);
 
-info!(logger, "FullNode started in join mode"; "node_id" => node_id, "address" => &address);
+        let full_node = Self {
+            runtime: runtime.clone(),
+            node,
+            grpc_server_handle: Some(grpc_server_handle),
+            workflow_registry: registry,
+            address: address.clone(),
+            logger: logger.clone(),
+        };
 
-let full_node = Self {
-runtime: runtime.clone(),
-node,
-grpc_server_handle: Some(grpc_server_handle),
-workflow_registry: registry,
-address: address.clone(),
-logger: logger.clone(),
-};
-
-// Use AddNode RPC to register with management cluster leader
-info!(logger, "Calling AddNode RPC on management leader";
+        // Use AddNode RPC to register with management cluster leader
+        info!(logger, "Calling AddNode RPC on management leader";
 "node_id" => node_id, "leader" => &leader_peer.management_leader_address);
 
-use crate::grpc::proto::raft_service_client::RaftServiceClient;
-use crate::grpc::proto::AddNodeRequest;
+        use crate::grpc::proto::AddNodeRequest;
+        use crate::grpc::proto::raft_service_client::RaftServiceClient;
 
-let leader_endpoint = format!("http://{}", leader_peer.management_leader_address);
-match RaftServiceClient::connect(leader_endpoint).await {
-Ok(mut client) => {
-let request = tonic::Request::new(AddNodeRequest {
-node_id,
-address: address.clone(),
-});
+        let leader_endpoint = format!("http://{}", leader_peer.management_leader_address);
+        match RaftServiceClient::connect(leader_endpoint).await {
+            Ok(mut client) => {
+                let request = tonic::Request::new(AddNodeRequest {
+                    node_id,
+                    address: address.clone(),
+                });
 
-match client.add_node(request).await {
-Ok(response) => {
-let resp = response.into_inner();
-if resp.success {
-info!(logger, "Successfully added to management cluster via RPC");
-// ClusterManager will automatically assign us to an execution cluster
-} else {
-info!(logger, "AddNode RPC returned error"; "error" => &resp.error);
-}
-}
-Err(e) => {
-info!(logger, "AddNode RPC call failed"; "error" => %e);
-}
-}
-}
-Err(e) => {
-info!(logger, "Failed to connect to management leader"; "error" => %e);
-}
-}
+                match client.add_node(request).await {
+                    Ok(response) => {
+                        let resp = response.into_inner();
+                        if resp.success {
+                            info!(logger, "Successfully added to management cluster via RPC");
+                        // ClusterManager will automatically assign us to an execution cluster
+                        } else {
+                            info!(logger, "AddNode RPC returned error"; "error" => &resp.error);
+                        }
+                    }
+                    Err(e) => {
+                        info!(logger, "AddNode RPC call failed"; "error" => %e);
+                    }
+                }
+            }
+            Err(e) => {
+                info!(logger, "Failed to connect to management leader"; "error" => %e);
+            }
+        }
 
-Ok(full_node)
+        Ok(full_node)
     }
 
     /// Get a reference to the management runtime
@@ -469,7 +479,8 @@ mod tests {
         // when the node added itself to the management cluster
 
         // Create a sub-cluster using the management runtime
-        let cluster_id = node.runtime()
+        let cluster_id = node
+            .runtime()
             .create_sub_cluster(vec![1, 2, 3])
             .await
             .expect("Create sub-cluster should succeed");
@@ -487,14 +498,18 @@ mod tests {
             .expect("Set metadata should succeed");
 
         // Verify metadata was set correctly
-        let metadata = node.runtime()
+        let metadata = node
+            .runtime()
             .get_sub_cluster(&cluster_id)
             .await
             .expect("Sub-cluster should exist");
 
         assert_eq!(metadata.node_ids, vec![1, 2, 3]);
         assert_eq!(metadata.metadata.get("type"), Some(&"kv".to_string()));
-        assert_eq!(metadata.metadata.get("region"), Some(&"us-west".to_string()));
+        assert_eq!(
+            metadata.metadata.get("region"),
+            Some(&"us-west".to_string())
+        );
 
         // Delete metadata
         node.runtime()
@@ -502,7 +517,8 @@ mod tests {
             .await
             .expect("Delete metadata should succeed");
 
-        let metadata = node.runtime()
+        let metadata = node
+            .runtime()
             .get_sub_cluster(&cluster_id)
             .await
             .expect("Sub-cluster should exist");
@@ -561,7 +577,8 @@ mod tests {
 
         // Add node 2 to the management cluster via node 1 (as leader)
         println!("\nAdding Node 2 to management cluster via Node 1...");
-        let add_rx = node1.runtime()
+        let add_rx = node1
+            .runtime()
             .add_node(2, "127.0.0.1:50062".to_string())
             .await
             .expect("Should initiate add_node");
@@ -579,41 +596,62 @@ mod tests {
 
         // Verify that ClusterManager automatically created execution cluster(s)
         println!("\nVerifying ClusterManager created execution clusters...");
-        let all_clusters = node1.runtime()
-            .list_sub_clusters()
-            .await;
+        let all_clusters = node1.runtime().list_sub_clusters().await;
 
-        println!("✓ ClusterManager created {} execution cluster(s): {:?}",
-                 all_clusters.len(), all_clusters);
+        println!(
+            "✓ ClusterManager created {} execution cluster(s): {:?}",
+            all_clusters.len(),
+            all_clusters
+        );
 
         // ClusterManager should have created at least one cluster
-        assert!(!all_clusters.is_empty(), "ClusterManager should have created at least one execution cluster");
+        assert!(
+            !all_clusters.is_empty(),
+            "ClusterManager should have created at least one execution cluster"
+        );
 
         // Get the first cluster for verification
         let cluster_id = all_clusters[0];
 
         println!("\nVerifying cluster {} contains both nodes...", cluster_id);
-        let metadata1 = node1.runtime()
+        let metadata1 = node1
+            .runtime()
             .get_sub_cluster(&cluster_id)
             .await
             .expect("Node 1 should have sub-cluster metadata");
         println!("✓ Cluster {} nodes: {:?}", cluster_id, metadata1.node_ids);
 
         // Both nodes should be in the same execution cluster (since cluster size 2 < target size 3)
-        assert_eq!(metadata1.node_ids.len(), 2, "Cluster should have both nodes");
-        assert!(metadata1.node_ids.contains(&1), "Cluster should contain node 1");
-        assert!(metadata1.node_ids.contains(&2), "Cluster should contain node 2");
+        assert_eq!(
+            metadata1.node_ids.len(),
+            2,
+            "Cluster should have both nodes"
+        );
+        assert!(
+            metadata1.node_ids.contains(&1),
+            "Cluster should contain node 1"
+        );
+        assert!(
+            metadata1.node_ids.contains(&2),
+            "Cluster should contain node 2"
+        );
 
         // Verify node 2 can also see the clusters
         println!("\nVerifying Node 2 observed clusters...");
-        let metadata2 = node2.runtime()
+        let metadata2 = node2
+            .runtime()
             .get_sub_cluster(&cluster_id)
             .await
             .expect("Node 2 should have sub-cluster metadata");
         println!("✓ Node 2 metadata: node_ids={:?}", metadata2.node_ids);
-        assert_eq!(metadata2.node_ids, metadata1.node_ids, "Both nodes should see the same cluster membership");
+        assert_eq!(
+            metadata2.node_ids, metadata1.node_ids,
+            "Both nodes should see the same cluster membership"
+        );
 
-        println!("\n✓ ClusterManager successfully created and assigned both nodes to the same execution cluster!");
+        println!(
+            "\n✓ ClusterManager successfully created and assigned both nodes to the same execution cluster!"
+        );
 
         println!("\n=== Test complete - shutting down nodes ===");
 
