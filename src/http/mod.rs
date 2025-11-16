@@ -11,10 +11,23 @@
 pub mod messages;
 pub mod transport;
 pub mod server;
-pub mod client;
 pub mod bootstrap;
 
+// Native (non-WASM) HTTP client using reqwest
+#[cfg(not(target_arch = "wasm32"))]
+pub mod client;
+
+// WASM HTTP client using browser fetch API
+#[cfg(target_arch = "wasm32")]
+pub mod wasm_client;
+
 pub use bootstrap::{discover_peer, discover_peers, next_node_id, DiscoveredPeer};
+
+#[cfg(not(target_arch = "wasm32"))]
 pub use client::HttpMessageSender;
+
+#[cfg(target_arch = "wasm32")]
+pub use wasm_client::WasmHttpClient as HttpMessageSender;
+
 pub use server::HttpServer;
 pub use transport::HttpTransport;

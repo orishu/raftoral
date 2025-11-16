@@ -7,6 +7,10 @@ pub mod workflow;  // Workflow execution runtime for generic architecture
 pub mod full_node;  // Complete node stack (Layer 0-7)
 pub mod config;  // Configuration for Raftoral nodes
 
+// WASM bindings (only compiled when targeting wasm32)
+#[cfg(target_arch = "wasm32")]
+pub mod wasm;
+
 /// Create a replicated variable with an explicit key.
 ///
 /// This macro creates a ReplicatedVar with a user-provided key that remains stable

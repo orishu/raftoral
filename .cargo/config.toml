@@ -1,0 +1,9 @@
+# Cargo configuration for raftoral
+
+# WASM build configuration
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'wasm_js']
+
+# Enable getrandom WASM support for all wasm32 targets
+[env]
+GETRANDOM_WASM_JS = "1"
