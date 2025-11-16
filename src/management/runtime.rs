@@ -8,7 +8,7 @@ use crate::management::{
     SubClusterRuntime,
 };
 use crate::raft::generic::{ClusterRouter, EventBus, ProposalRouter, RaftNode, RaftNodeConfig, Transport};
-use slog::{info, Logger};
+use slog::{Logger, info, o};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -106,6 +106,8 @@ where
             "node_id" => config.node_id,
             "cluster_id" => config.cluster_id
         );
+        let child_logger =
+            logger.new(o!("node_id" => config.node_id, "cluster_id" => config.cluster_id));
 
         // Create RaftNode
         let node = RaftNode::new_single_node(
@@ -114,7 +116,7 @@ where
             mailbox_rx,
             state_machine,
             event_bus.clone(),
-            logger.clone(),
+            child_logger.clone(),
         )?;
 
         let node_arc = Arc::new(Mutex::new(node));
@@ -125,7 +127,7 @@ where
             transport.clone(),
             config.cluster_id,
             config.node_id,
-            logger.clone(),
+            child_logger.clone(),
         ));
 
         // Start leader tracker in background
@@ -145,7 +147,7 @@ where
             node_id: config.node_id,
             cluster_id: config.cluster_id,
             storage_path: config.storage_path.clone(),
-            logger: logger.clone(),
+            logger: logger,
             _phantom: PhantomData,
         });
 
@@ -179,13 +181,16 @@ where
     {
         let node_arc = Arc::new(Mutex::new(node));
 
+        let child_logger =
+            logger.new(o!("node_id" => config.node_id, "cluster_id" => config.cluster_id));
+
         // Create ProposalRouter
         let proposal_router = Arc::new(ProposalRouter::new(
             node_arc.clone(),
             transport.clone(),
             config.cluster_id,
             config.node_id,
-            logger.clone(),
+            child_logger.clone(),
         ));
 
         // Start leader tracker in background
@@ -257,6 +262,8 @@ where
             "cluster_id" => config.cluster_id,
             "initial_voters" => ?initial_voters
         );
+        let child_logger =
+            logger.new(o!("node_id" => config.node_id, "cluster_id" => config.cluster_id));
 
         // Create ConfState with all nodes as voters
         use raft::prelude::ConfState;
@@ -270,7 +277,7 @@ where
             state_machine,
             event_bus.clone(),
             conf_state,
-            logger.clone(),
+            child_logger.clone(),
         )?;
 
         Ok(Self::new_from_node(
@@ -342,6 +349,8 @@ where
             "cluster_id" => config.cluster_id,
             "existing_voters" => ?existing_voters
         );
+        let child_logger =
+            logger.new(o!("node_id" => config.node_id, "cluster_id" => config.cluster_id));
 
         // Create ConfState with existing voters and this node as a learner
         use raft::prelude::ConfState;
@@ -359,7 +368,7 @@ where
             state_machine,
             event_bus.clone(),
             conf_state,
-            logger.clone(),
+            child_logger.clone(),
         )?;
 
         Ok(Self::new_from_node(
@@ -1043,6 +1052,8 @@ where
                                 "node_ids" => ?node_ids,
                                 "this_node" => self.node_id
                             );
+                            let child_logger =
+                                self.logger.new(o!("node_id" => self.node_id, "cluster_id" => cluster_id));
 
                             // Check if we're the first node (leader/initiator)
                             let is_first_node = node_ids.first() == Some(&self.node_id);
@@ -1078,7 +1089,7 @@ where
                                     self.transport.clone(),
                                     mailbox_rx,
                                     self.shared_config.clone(),
-                                    self.logger.clone(),
+                                    child_logger.clone(),
                                 ) {
                                     Ok(pair) => pair,
                                     Err(e) => {
@@ -1101,7 +1112,7 @@ where
                                     mailbox_rx,
                                     node_ids.clone(),
                                     self.shared_config.clone(),
-                                    self.logger.clone(),
+                                    child_logger.clone(),
                                 ) {
                                     Ok(pair) => pair,
                                     Err(e) => {
@@ -1193,6 +1204,7 @@ where
                                     "cluster_id" => cluster_id,
                                     "node_id" => node_id
                                 );
+                                let child_logger = self.logger.new(o!("node_id" => node_id, "cluster_id" => cluster_id));
 
                                 // Get the sub-cluster metadata to find all member nodes
                                 let node_arc = self.proposal_router.node();
@@ -1234,7 +1246,7 @@ where
                                         mailbox_rx,
                                         metadata.node_ids.clone(),
                                         self.shared_config.clone(),
-                                        self.logger.clone(),
+                                        child_logger.clone(),
                                     ) {
                                         Ok(pair) => pair,
                                         Err(e) => {

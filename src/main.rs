@@ -42,9 +42,30 @@ struct Args {
 // Workflow uses simple String input/output for compatibility with scripts
 
 fn create_logger() -> slog::Logger {
-    let decorator = slog_term::PlainDecorator::new(std::io::stdout());
+    use slog::Drain;
+    use std::env;
+
+    // Determine log level from environment variable
+    let log_level = env::var("RUST_LOG")
+        .unwrap_or_else(|_| "info".to_string())
+        .to_lowercase();
+
+    let level = match log_level.as_str() {
+        "trace" => slog::Level::Trace,
+        "debug" => slog::Level::Debug,
+        "info" => slog::Level::Info,
+        "warn" | "warning" => slog::Level::Warning,
+        "error" => slog::Level::Error,
+        "critical" => slog::Level::Critical,
+        _ => slog::Level::Info, // Default to Info
+    };
+
+    let decorator = slog_term::TermDecorator::new().build();
+    // Use FullFormat to display key/value pairs
     let drain = slog_term::FullFormat::new(decorator).build().fuse();
+    let drain = slog::LevelFilter::new(drain, level).fuse();
     let drain = slog_async::Async::new(drain).build().fuse();
+
     slog::Logger::root(drain, o!())
 }
 
