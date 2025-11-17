@@ -3,7 +3,7 @@
 //! Implements the Transport trait using HTTP/REST protocol.
 
 use crate::grpc::proto::GenericMessage;
-use crate::http::client::HttpMessageSender;
+use crate::http::HttpMessageSender;
 use crate::raft::generic::errors::TransportError;
 use crate::raft::generic::{ClusterRouter, MessageSender, Transport};
 use slog::{debug, warn, Logger};

@@ -9,6 +9,7 @@
 //! - `bootstrap`: Bootstrap functionality for discovering and joining clusters
 
 // Include generated protobuf code
+#[cfg(not(target_arch = "wasm32"))]
 pub mod proto {
     tonic::include_proto!("raftoral");
 
@@ -16,10 +17,22 @@ pub mod proto {
     pub const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descriptor.bin"));
 }
 
+// For WASM, include proto without tonic
+#[cfg(target_arch = "wasm32")]
+pub mod proto {
+    include!(concat!(env!("OUT_DIR"), "/raftoral.rs"));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 pub mod bootstrap;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod client;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod server;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use bootstrap::{discover_peer, discover_peers, next_node_id, DiscoveredPeer};
+#[cfg(not(target_arch = "wasm32"))]
 pub use client::GrpcMessageSender;
+#[cfg(not(target_arch = "wasm32"))]
 pub use server::GrpcServer;

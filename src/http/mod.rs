@@ -10,7 +10,11 @@
 
 pub mod messages;
 pub mod transport;
+
+// Server and bootstrap only available in non-WASM (need axum/reqwest)
+#[cfg(not(target_arch = "wasm32"))]
 pub mod server;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod bootstrap;
 
 // Native (non-WASM) HTTP client using reqwest
@@ -21,6 +25,7 @@ pub mod client;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_client;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use bootstrap::{discover_peer, discover_peers, next_node_id, DiscoveredPeer};
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -29,5 +34,6 @@ pub use client::HttpMessageSender;
 #[cfg(target_arch = "wasm32")]
 pub use wasm_client::WasmHttpClient as HttpMessageSender;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use server::HttpServer;
 pub use transport::HttpTransport;

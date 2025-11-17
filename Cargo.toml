@@ -72,6 +72,7 @@ tempfile = "3.8"
 
 [build-dependencies]
 tonic-prost-build = "^0.14"
+prost-build = "^0.14"
 
 # Patch raft-rs to use updated dependencies (prost 0.14, rand 0.9)
 [patch.crates-io]

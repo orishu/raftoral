@@ -1702,6 +1702,7 @@ dependencies = [
  "log",
  "port_check",
  "prost 0.14.1",
+ "prost-build 0.14.1",
  "protobuf 4.33.1-release",
  "raft",
  "rand",
