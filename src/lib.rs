@@ -4,11 +4,8 @@ pub mod http;  // HTTP implementation for generic architecture (WASM-compatible)
 pub mod kv;  // KV runtime for generic architecture
 pub mod management;  // Management runtime for generic architecture
 pub mod workflow;  // Workflow execution runtime for generic architecture
+pub mod full_node;  // Complete node stack (Layer 0-7)
 pub mod config;  // Configuration for Raftoral nodes
-
-// Full node stack - only available for non-WASM (server-side)
-#[cfg(not(target_arch = "wasm32"))]
-pub mod full_node;
 
 // WASM bindings (only compiled when targeting wasm32)
 #[cfg(target_arch = "wasm32")]

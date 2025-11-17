@@ -14,21 +14,8 @@ use tokio::sync::Mutex;
 ///
 /// This trait is implemented by each server layer (gRPC, HTTP, InProcess)
 /// to provide actual message sending functionality.
-#[cfg(not(target_arch = "wasm32"))]
 #[tonic::async_trait]
 pub trait MessageSender: Send + Sync {
-    /// Send a message to a peer at the given address
-    ///
-    /// # Arguments
-    /// * `address` - Protocol-specific address string (e.g., "192.168.1.10:5001" for gRPC)
-    /// * `message` - The GenericMessage to send
-    async fn send(&self, address: &str, message: GenericMessage) -> Result<(), TransportError>;
-}
-
-/// Protocol-specific message sender trait (WASM version - single-threaded)
-#[cfg(target_arch = "wasm32")]
-#[async_trait::async_trait(?Send)]
-pub trait MessageSender {
     /// Send a message to a peer at the given address
     ///
     /// # Arguments
@@ -41,7 +28,6 @@ pub trait MessageSender {
 ///
 /// Provides protocol-agnostic message sending/receiving interface.
 /// The actual protocol (gRPC/HTTP/InProcess) is determined by the MessageSender implementation.
-#[cfg(not(target_arch = "wasm32"))]
 #[tonic::async_trait]
 pub trait Transport: Send + Sync {
     /// Send a message to a peer node
@@ -55,33 +41,6 @@ pub trait Transport: Send + Sync {
     ///
     /// This is typically called by the gRPC/HTTP server when it receives
     /// a message, which then forwards it to the ClusterRouter.
-    async fn receive_message(&self, message: GenericMessage) -> Result<(), TransportError>;
-
-    /// Add a peer to the registry
-    async fn add_peer(&self, node_id: u64, address: String);
-
-    /// Remove a peer from the registry
-    async fn remove_peer(&self, node_id: u64);
-
-    /// List all peer node IDs
-    async fn list_peers(&self) -> Vec<u64>;
-
-    /// Get peer address by node ID
-    async fn get_peer_address(&self, node_id: u64) -> Option<String>;
-}
-
-/// Transport layer trait (Layer 1) - WASM version (single-threaded)
-#[cfg(target_arch = "wasm32")]
-#[async_trait::async_trait(?Send)]
-pub trait Transport {
-    /// Send a message to a peer node
-    async fn send_message(
-        &self,
-        target_node_id: u64,
-        message: GenericMessage,
-    ) -> Result<(), TransportError>;
-
-    /// Receive a message from a peer (called by Server layer)
     async fn receive_message(&self, message: GenericMessage) -> Result<(), TransportError>;
 
     /// Add a peer to the registry
@@ -142,70 +101,7 @@ impl TransportLayer {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[tonic::async_trait]
-impl Transport for TransportLayer {
-    async fn send_message(
-        &self,
-        target_node_id: u64,
-        message: GenericMessage,
-    ) -> Result<(), TransportError> {
-        // Look up peer address
-        let address = {
-            let peers = self.peers.lock().await;
-            peers.get(&target_node_id).cloned()
-        };
-
-        match address {
-            Some(addr) => {
-                // Send via protocol-specific sender
-                self.message_sender.send(&addr, message).await
-            }
-            None => Err(TransportError::PeerNotFound {
-                node_id: target_node_id,
-            }),
-        }
-    }
-
-    async fn receive_message(&self, message: GenericMessage) -> Result<(), TransportError> {
-        // Forward to ClusterRouter if available
-        match &self.cluster_router {
-            Some(router) => {
-                router
-                    .route_message(message)
-                    .await
-                    .map_err(|e| TransportError::Other(e.to_string()))
-            }
-            None => {
-                // No router registered yet, this is okay during initialization
-                Ok(())
-            }
-        }
-    }
-
-    async fn add_peer(&self, node_id: u64, address: String) {
-        let mut peers = self.peers.lock().await;
-        peers.insert(node_id, address);
-    }
-
-    async fn remove_peer(&self, node_id: u64) {
-        let mut peers = self.peers.lock().await;
-        peers.remove(&node_id);
-    }
-
-    async fn list_peers(&self) -> Vec<u64> {
-        let peers = self.peers.lock().await;
-        peers.keys().copied().collect()
-    }
-
-    async fn get_peer_address(&self, node_id: u64) -> Option<String> {
-        let peers = self.peers.lock().await;
-        peers.get(&node_id).cloned()
-    }
-}
-
-#[cfg(target_arch = "wasm32")]
-#[async_trait::async_trait(?Send)]
 impl Transport for TransportLayer {
     async fn send_message(
         &self,
