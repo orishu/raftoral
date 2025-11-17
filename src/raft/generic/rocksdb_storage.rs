@@ -26,7 +26,7 @@ use raft::GetEntriesContext;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use prost_lib::Message as ProstMessage;
+use prost::Message as ProstMessage;
 
 const CF_ENTRIES: &str = "entries";
 const CF_METADATA: &str = "metadata";

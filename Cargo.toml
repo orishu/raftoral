@@ -24,8 +24,8 @@ log = "^0.4"
 bytes = "^1.0"
 rocksdb = { version = "^0.24.0", optional = true }
 raft = { version = "0.7.0", default-features = false, features = ["prost-codec", "default-logger"] }
-# Prost 0.11 to match raft's prost-codec feature
-prost-lib = { package = "prost", version = "0.11" }
+# Prost 0.14 to match forked raft's prost-codec feature
+prost = "^0.14"
 
 # Native (non-WASM) dependencies with full networking support
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -72,3 +72,8 @@ tempfile = "3.8"
 
 [build-dependencies]
 tonic-prost-build = "^0.14"
+
+# Patch raft-rs to use updated dependencies (prost 0.14, rand 0.9)
+[patch.crates-io]
+raft = { git = "https://github.com/orishu/raft-rs", branch = "orishu/prost-and-rand-deps" }
+raft-proto = { git = "https://github.com/orishu/raft-rs", branch = "orishu/prost-and-rand-deps" }

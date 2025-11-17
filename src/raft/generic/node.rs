@@ -21,8 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, broadcast, Mutex, oneshot};
 use tokio::time;
-// Import prost 0.11 to match raft's prost-codec
-use prost_lib::Message as ProstMessage;
+// Import prost 0.14 to match forked raft's prost-codec
+use prost::Message as ProstMessage;
 
 /// Configuration for RaftNode initialization
 #[derive(Clone, Debug)]
