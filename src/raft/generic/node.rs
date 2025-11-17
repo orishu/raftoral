@@ -11,8 +11,6 @@ use crate::raft::generic::rocksdb_storage::RocksDBStorage;
 use crate::raft::generic::errors::TransportError;
 use crate::raft::generic::storage::RaftStorage;
 use crate::raft::generic::{EventBus, StateMachine, Transport};
-use bytes::Bytes;
-use protobuf::Message as ProtobufMessage;
 use raft::prelude::*;
 use raft::StateRole;
 use serde::{Deserialize, Serialize};
@@ -23,6 +21,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, broadcast, Mutex, oneshot};
 use tokio::time;
+// Import prost 0.11 to match raft's prost-codec
+use prost_lib::Message as ProstMessage;
 
 /// Configuration for RaftNode initialization
 #[derive(Clone, Debug)]
@@ -467,7 +467,7 @@ impl<SM: StateMachine> RaftNode<SM> {
         let mut cc = ConfChange::default();
         cc.set_change_type(ConfChangeType::AddNode);
         cc.node_id = node_id;
-        cc.context = Bytes::from(context_bytes);
+        cc.context = context_bytes.to_vec();
 
         self.raw_node
             .propose_conf_change(vec![], cc)
@@ -505,7 +505,7 @@ impl<SM: StateMachine> RaftNode<SM> {
         let mut cc = ConfChange::default();
         cc.set_change_type(ConfChangeType::RemoveNode);
         cc.node_id = node_id;
-        cc.context = Bytes::from(context_bytes);
+        cc.context = context_bytes.to_vec();
 
         self.raw_node
             .propose_conf_change(vec![], cc)
@@ -625,8 +625,8 @@ impl<SM: StateMachine> RaftNode<SM> {
 
         match message {
             raft_proto::generic_message::Message::RaftMessage(bytes) => {
-                // Deserialize raft::prelude::Message from protobuf bytes
-                let raft_msg = raft::prelude::Message::parse_from_bytes(&bytes)?;
+                // Deserialize raft::prelude::Message from prost bytes
+                let raft_msg = ProstMessage::decode(&bytes[..])?;
 
                 // Step the message
                 self.raw_node.step(raft_msg)?;
@@ -1002,7 +1002,7 @@ impl<SM: StateMachine> RaftNode<SM> {
         meta.term = store.rl().hard_state().term;
         meta.set_conf_state(conf_state);
 
-        snapshot.set_data(bytes::Bytes::from(snapshot_data));
+        snapshot.set_data(snapshot_data.to_vec());
 
         // Apply snapshot to storage
         store.apply_snapshot_with_data(snapshot)?;
@@ -1017,7 +1017,7 @@ impl<SM: StateMachine> RaftNode<SM> {
 
     /// Apply a configuration change
     async fn apply_conf_change(&mut self, entry: &Entry) -> Result<(), Box<dyn std::error::Error>> {
-        let cc: ConfChange = protobuf::Message::parse_from_bytes(&entry.data)?;
+        let cc: ConfChange = ProstMessage::decode(&entry.data[..])?;
 
         // Extract sync_id from context (first 8 bytes if present)
         let (sync_id, metadata_start) = if cc.context.len() >= 8 {
@@ -1091,12 +1091,8 @@ impl<SM: StateMachine> RaftNode<SM> {
     async fn send_raft_message(&self, msg: raft::prelude::Message) -> Result<(), TransportError> {
         let target_node = msg.to;
 
-        // Serialize raft::prelude::Message to protobuf bytes
-        let bytes = msg.write_to_bytes().map_err(|e| {
-            TransportError::SerializationError {
-                reason: format!("Failed to serialize message: {}", e),
-            }
-        })?;
+        // Serialize raft::prelude::Message to prost bytes
+        let bytes = ProstMessage::encode_to_vec(&msg);
 
         // Create GenericMessage with raft_message variant
         let generic_msg = raft_proto::GenericMessage {

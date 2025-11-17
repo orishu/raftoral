@@ -15,7 +15,6 @@ categories = ["asynchronous", "concurrency", "development-tools"]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-raft = "^0.7.0"
 serde = { version = "^1.0.226", features = ["derive"] }
 serde_json = "^1.0.145"
 slog = "^2.7"
@@ -24,19 +23,22 @@ slog-async = "^2.8"
 log = "^0.4"
 bytes = "^1.0"
 rocksdb = { version = "^0.24.0", optional = true }
+raft = { version = "0.7.0", default-features = false, features = ["prost-codec", "default-logger"] }
+# Prost 0.11 to match raft's prost-codec feature
+prost-lib = { package = "prost", version = "0.11" }
 
 # Native (non-WASM) dependencies with full networking support
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "^1.47.1", features = ["full"] }
 uuid = { version = "^1.0", features = ["v4", "serde"] }
 # gRPC dependencies
-protobuf = "^2.28"
+protobuf = "^4.33.1-release"
 tonic = "^0.14"
 tonic-reflection = "^0.14"
 prost = "^0.14"
 tonic-prost = "^0.14"
 # HTTP server and client
-axum = "^0.7"
+axum = "^0.8"
 reqwest = { version = "^0.12", features = ["json"] }
 tower = "^0.5"
 tower-http = { version = "^0.6", features = ["cors"] }

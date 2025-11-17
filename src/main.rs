@@ -2,7 +2,7 @@ use clap::Parser;
 use raftoral::checkpoint_compute;
 use raftoral::full_node::FullNode;
 use raftoral::workflow::WorkflowError;
-use slog::{info, o, Drain};
+use slog::{info, o};
 use tokio::signal;
 
 #[derive(Parser, Debug)]

@@ -26,7 +26,7 @@ use raft::GetEntriesContext;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use protobuf::Message as ProtobufMessage;
+use prost_lib::Message as ProstMessage;
 
 const CF_ENTRIES: &str = "entries";
 const CF_METADATA: &str = "metadata";
@@ -255,8 +255,7 @@ impl RocksDBStorage {
             .ok_or_else(|| Error::Store(StorageError::Unavailable))?;
 
         let key = entry.index.to_be_bytes();
-        let value = entry.write_to_bytes()
-            .map_err(|e| Error::Store(StorageError::Other(Box::new(e))))?;
+        let value = ProstMessage::encode_to_vec(entry);
 
         self.db.put_cf(cf_entries, key, value)
             .map_err(|e| Error::Store(StorageError::Other(Box::new(e))))?;
@@ -275,7 +274,7 @@ impl RocksDBStorage {
 
         match value {
             Some(bytes) => {
-                let entry = Entry::parse_from_bytes(&bytes)
+                let entry = ProstMessage::decode(&bytes[..])
                     .map_err(|e| Error::Store(StorageError::Other(Box::new(e))))?;
                 Ok(Some(entry))
             }
@@ -288,8 +287,7 @@ impl RocksDBStorage {
         let cf_metadata = self.db.cf_handle(CF_METADATA)
             .ok_or_else(|| Error::Store(StorageError::Unavailable))?;
 
-        let value = hs.write_to_bytes()
-            .map_err(|e| Error::Store(StorageError::Other(Box::new(e))))?;
+        let value = ProstMessage::encode_to_vec(hs);
 
         // Use synchronous write for hard state durability
         let mut write_opts = WriteOptions::default();
@@ -316,7 +314,7 @@ impl RocksDBStorage {
 
         match value {
             Some(bytes) => {
-                HardState::parse_from_bytes(&bytes)
+                ProstMessage::decode(&bytes[..])
                     .map_err(|e| Error::Store(StorageError::Other(Box::new(e))))
             }
             None => Ok(HardState::default()),
@@ -361,8 +359,7 @@ impl RocksDBStorage {
         let cf_metadata = self.db.cf_handle(CF_METADATA)
             .ok_or_else(|| Error::Store(StorageError::Unavailable))?;
 
-        let value = cs.write_to_bytes()
-            .map_err(|e| Error::Store(StorageError::Other(Box::new(e))))?;
+        let value = ProstMessage::encode_to_vec(cs);
 
         self.db.put_cf(cf_metadata, KEY_CONF_STATE, value)
             .map_err(|e| Error::Store(StorageError::Other(Box::new(e))))?;
@@ -386,7 +383,7 @@ impl RocksDBStorage {
 
         match value {
             Some(bytes) => {
-                ConfState::parse_from_bytes(&bytes)
+                ProstMessage::decode(&bytes[..])
                     .map_err(|e| Error::Store(StorageError::Other(Box::new(e))))
             }
             None => Ok(ConfState::default()),
@@ -448,8 +445,7 @@ impl RocksDBStorage {
         // Add all entries to batch
         for entry in entries {
             let key = entry.index.to_be_bytes();
-            let value = entry.write_to_bytes()
-                .map_err(|e| Error::Store(StorageError::Other(Box::new(e))))?;
+            let value = ProstMessage::encode_to_vec(entry);
             batch.put_cf(cf_entries, key, value);
         }
 
@@ -521,8 +517,7 @@ impl RocksDBStorage {
             .ok_or_else(|| Error::Store(StorageError::Unavailable))?;
 
         // Store snapshot data
-        let snapshot_bytes = snapshot.write_to_bytes()
-            .map_err(|e| Error::Store(StorageError::Other(Box::new(e))))?;
+        let snapshot_bytes = ProstMessage::encode_to_vec(&snapshot);
         self.db.put_cf(cf_snapshot, KEY_SNAPSHOT_DATA, snapshot_bytes)
             .map_err(|e| Error::Store(StorageError::Other(Box::new(e))))?;
 
@@ -550,7 +545,7 @@ impl RocksDBStorage {
 
         match value {
             Some(bytes) => {
-                let snapshot = Snapshot::parse_from_bytes(&bytes)
+                let snapshot = ProstMessage::decode(&bytes[..])
                     .map_err(|e| Error::Store(StorageError::Other(Box::new(e))))?;
                 Ok(Some(snapshot))
             }
@@ -651,7 +646,7 @@ impl raft::Storage for RocksDBStorage {
         for idx in low..high {
             match self.load_entry(idx)? {
                 Some(entry) => {
-                    let entry_size = entry.compute_size() as u64;
+                    let entry_size = ProstMessage::encoded_len(&entry) as u64;
 
                     // Check size limit
                     if let Some(max) = max_size {
