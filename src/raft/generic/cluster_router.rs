@@ -4,6 +4,7 @@
 
 use crate::grpc::proto::GenericMessage;
 use crate::raft::generic::errors::RoutingError;
+use slog::{debug, warn, Logger, o};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
@@ -16,6 +17,8 @@ use tokio::sync::{mpsc, Mutex};
 pub struct ClusterRouter {
     /// Map: cluster_id → mpsc::Sender for that cluster's RaftNode
     routes: Arc<Mutex<HashMap<u32, mpsc::Sender<GenericMessage>>>>,
+    /// Logger (optional for backward compatibility)
+    logger: Option<Logger>,
 }
 
 impl ClusterRouter {
@@ -23,6 +26,15 @@ impl ClusterRouter {
     pub fn new() -> Self {
         Self {
             routes: Arc::new(Mutex::new(HashMap::new())),
+            logger: None,
+        }
+    }
+
+    /// Create a new ClusterRouter with logging
+    pub fn new_with_logger(logger: Logger) -> Self {
+        Self {
+            routes: Arc::new(Mutex::new(HashMap::new())),
+            logger: Some(logger),
         }
     }
 
@@ -59,6 +71,11 @@ impl ClusterRouter {
     pub async fn route_message(&self, message: GenericMessage) -> Result<(), RoutingError> {
         let cluster_id = message.cluster_id;
 
+        if let Some(ref logger) = self.logger {
+            debug!(logger, "ClusterRouter: Received message for routing";
+                "cluster_id" => cluster_id);
+        }
+
         // Look up the sender for this cluster
         let sender = {
             let routes = self.routes.lock().await;
@@ -68,12 +85,27 @@ impl ClusterRouter {
         match sender {
             Some(tx) => {
                 // Send to cluster's mailbox
-                tx.send(message).await.map_err(|_| RoutingError::MailboxFull {
-                    cluster_id,
+                tx.send(message).await.map_err(|_| {
+                    if let Some(ref logger) = self.logger {
+                        warn!(logger, "ClusterRouter: Mailbox full";
+                            "cluster_id" => cluster_id);
+                    }
+                    RoutingError::MailboxFull { cluster_id }
                 })?;
+
+                if let Some(ref logger) = self.logger {
+                    debug!(logger, "ClusterRouter: Message routed successfully";
+                        "cluster_id" => cluster_id);
+                }
                 Ok(())
             }
-            None => Err(RoutingError::ClusterNotFound { cluster_id }),
+            None => {
+                if let Some(ref logger) = self.logger {
+                    warn!(logger, "ClusterRouter: Cluster not found";
+                        "cluster_id" => cluster_id);
+                }
+                Err(RoutingError::ClusterNotFound { cluster_id })
+            }
         }
     }
 

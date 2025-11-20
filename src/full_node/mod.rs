@@ -337,7 +337,7 @@ impl FullNode {
                 .build_v1()
                 .unwrap();
 
-            let _ = Server::builder()
+            if let Err(e) = Server::builder()
                 .add_service(reflection_service)
                 .add_service(
                     crate::grpc::proto::raft_service_server::RaftServiceServer::new(
@@ -350,7 +350,10 @@ impl FullNode {
                     ),
                 )
                 .serve(addr)
-                .await;
+                .await
+            {
+                eprintln!("gRPC server failed to start on {:?}: {:?}", addr, e);
+            }
         });
 
         info!(logger, "FullNode started in join mode"; "node_id" => node_id, "address" => &address);
