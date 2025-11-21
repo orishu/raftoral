@@ -1,41 +1,81 @@
 # Raftoral
 
-A Rust library for building fault-tolerant, distributed workflows using the Raft consensus protocol.
+A Rust library for building fault-tolerant, distributed workflows using Raft consensus.
 
-## The Problem: Orchestration Infrastructure Overhead
+## The Problem: Workflow Infrastructure is Getting Complicated
 
-Building long-running, fault-tolerant workflows typically requires deploying and managing separate orchestration infrastructure:
+The workflow orchestration landscape is evolving rapidly:
 
-### Traditional Orchestration Challenges
+**Traditional Approach (Temporal, AWS Step Functions)**:
+- Separate orchestration infrastructure (10+ nodes across multiple systems)
+- Dedicated databases, message queues, worker pools
+- Complex operational overhead
 
-**External Orchestrators (Temporal, AWS Step Functions, etc.):**
-- ❌ **Separate Infrastructure**: Dedicated orchestrator servers and databases to deploy and maintain
-- ❌ **Operational Overhead**: Another cluster to monitor, scale, backup, and upgrade
-- ❌ **Network Latency**: Every workflow step requires round-trips to external orchestrator
-- ❌ **Additional Failure Points**: Orchestrator availability becomes critical path
+**Recent Innovation (Vercel's `use workflow` directive)**:
+- Elegant developer experience with magical syntax
+- But requires serverless platform lock-in (Vercel's infrastructure)
+- Limited control over execution environment
+- Vendor-specific deployment model
 
-**Example Setup (Temporal):**
+**What's Missing?**
+A solution that combines:
+- ✅ **Self-hosted**: Full control over your infrastructure
+- ✅ **Embedded**: No separate orchestrator to deploy
+- ✅ **Type-safe**: Compile-time correctness
+- ✅ **Fault-tolerant**: Built-in consensus and automatic failover
+- ✅ **Cloud-agnostic**: Works anywhere Rust runs
+
+## The Raftoral Solution: Embedded Orchestration with Raft Consensus
+
+Raftoral eliminates separate orchestration infrastructure by embedding the orchestrator directly into your long-running services using a **novel dual-layer Raft architecture**:
+
+### Core Innovation: Two Layers of Raft
+
+**Management Layer (cluster_id = 0)**:
+- Tracks cluster topology and node membership
+- Routes workflows to execution clusters
+- Lightweight coordination (no workflow state)
+
+**Execution Layer (cluster_id = 1+)**:
+- Small clusters (3-5 nodes) that execute workflows
+- Independent consensus per cluster
+- Workflow state isolated to execution clusters
+
+This architecture enables:
+- **Horizontal Scalability**: Add execution clusters as you grow
+- **Fault Isolation**: Execution cluster failures don't affect management
+- **Efficient Replication**: Checkpoints only replicate within small clusters (5x, not 50x)
+- **Zero External Dependencies**: Everything runs in your application process
+
 ```
-Your Services (Workers)  →  Temporal Server Cluster  →  Database (Cassandra/Postgres)
-   3+ nodes                    3-5+ nodes                    3+ nodes
+┌──────────────────────────────────────────────────────────┐
+│           Management Cluster (cluster_id = 0)            │
+│         Coordinates topology across all nodes            │
+│            Voters: 3-5  |  Learners: N nodes             │
+└────────────────────────┬─────────────────────────────────┘
+                         │
+        ┌────────────────┼────────────────┐
+        │                │                │
+┌───────▼──────┐  ┌──────▼──────┐  ┌─────▼───────┐
+│ Exec Cluster │  │ Exec Cluster│  │ Exec Cluster│
+│   (ID: 1)    │  │   (ID: 2)   │  │   (ID: 3)   │
+│  5 nodes     │  │  5 nodes    │  │  5 nodes    │
+│              │  │             │  │             │
+│ ┌──────────┐ │  │ ┌─────────┐ │  │ ┌─────────┐ │
+│ │Workflows │ │  │ │Workflows│ │  │ │Workflows│ │
+│ │   +      │ │  │ │   +     │ │  │ │   +     │ │
+│ │Checkpts  │ │  │ │Checkpts │ │  │ │Checkpts │ │
+│ └──────────┘ │  │ └─────────┘ │  │ └─────────┘ │
+└──────────────┘  └─────────────┘  └─────────────┘
 ```
 
-You end up managing 10+ nodes across multiple systems just to orchestrate workflows.
-
-### The Raftoral Solution: Embedded Orchestration
-
-Raftoral eliminates separate orchestration infrastructure by embedding the orchestrator directly into your long-running services using Raft consensus:
-
-- ✅ **No Separate Infrastructure**: Orchestration runs inside your application processes
-- ✅ **Pure Rust Library**: Just add it to your dependencies
-- ✅ **Self-Coordinating**: Application nodes coordinate via Raft protocol
-- ✅ **Unified Operations**: One cluster to monitor, one deployment pipeline
-- ✅ **Fault Tolerant**: Automatic failover when nodes fail
-- ✅ **Cloud Agnostic**: Works anywhere Rust runs
-
-**The Architecture Difference:**
-- **Traditional**: Your Services → Network → Orchestrator Cluster → Database Cluster → Network → Your Services
-- **Raftoral**: Your Services (with embedded orchestration) ↔ Peer-to-Peer Coordination
+**Key Benefits:**
+- ✅ **No Separate Infrastructure**: Orchestration runs inside your application
+- ✅ **Pure Rust Library**: Just add to `Cargo.toml`
+- ✅ **Self-Coordinating**: Nodes coordinate via Raft consensus
+- ✅ **Automatic Failover**: Workflows survive node failures
+- ✅ **Horizontal Scaling**: Add execution clusters as workload grows
+- ✅ **Cloud Agnostic**: Deploy anywhere Rust runs
 
 **Requirements:**
 - Long-running services (not FaaS/Lambda - workflows need continuous execution)
@@ -44,19 +84,115 @@ Raftoral eliminates separate orchestration infrastructure by embedding the orche
 
 ---
 
-### 📊 **Comparing Workflow Systems?**
-
-**See our detailed comparison**: [Raftoral vs. Temporal vs. DBOS](docs/COMPARISON.md)
-
-This guide helps you choose the right workflow orchestration system by comparing architecture, scalability, complexity, use cases, and trade-offs across all three platforms.
-
----
-
 ## Architecture Overview
+
+### Layered Architecture: Shared Infrastructure
+
+Raftoral uses a **clean layered architecture** where management and execution clusters share infrastructure but maintain independent consensus:
+
+```
+┌───────────────────────────────────────────────────────────┐
+│  Layer 7: Application Runtime                             │
+│  • ManagementRuntime: add_node(), create_cluster()        │
+│  • WorkflowRuntime: start_workflow(), checkpoint()        │
+└───────────────────────────────────────────────────────────┘
+                         ↓ propose commands
+┌───────────────────────────────────────────────────────────┐
+│  Layer 6: Proposal Router                                 │
+│  • Routes proposals to Raft leader (local or remote)      │
+│  • Tracks sync waiters for proposal confirmation          │
+└───────────────────────────────────────────────────────────┘
+                         ↓ forward to Raft
+┌───────────────────────────────────────────────────────────┐
+│  Layer 5: Event Bus                                       │
+│  • Broadcasts state changes to subscribers                │
+│  • Decouples state machine from upper layers              │
+└───────────────────────────────────────────────────────────┘
+                         ↑ emit events  ↓ subscribe
+┌───────────────────────────────────────────────────────────┐
+│  Layer 4: State Machine                                   │
+│  • Applies committed commands to authoritative state      │
+│  • ManagementStateMachine: topology tracking              │
+│  • WorkflowStateMachine: workflow execution state         │
+└───────────────────────────────────────────────────────────┘
+                         ↑ apply(entry)
+┌───────────────────────────────────────────────────────────┐
+│  Layer 3: Raft Node                                       │
+│  • Wraps raft-rs RawNode                                  │
+│  • Independent consensus per cluster_id                   │
+│  • Applies committed entries to state machine             │
+└───────────────────────────────────────────────────────────┘
+                         ↓ send  ↑ receive
+┌───────────────────────────────────────────────────────────┐
+│  Layer 2: Cluster Router                                  │
+│  • Routes messages by cluster_id to correct Raft node     │
+│  • Shared across all clusters on this node                │
+└───────────────────────────────────────────────────────────┘
+                         ↓ outbound  ↑ inbound
+┌───────────────────────────────────────────────────────────┐
+│  Layer 1: Transport Layer                                 │
+│  • Protocol-agnostic message sending/receiving            │
+│  • Maintains peer registry (node_id → address)            │
+│  • Shared by all clusters                                 │
+└───────────────────────────────────────────────────────────┘
+                         ↓ network I/O
+┌───────────────────────────────────────────────────────────┐
+│  Layer 0: Server Layer (Protocol Implementation)          │
+│  • gRPC: Production deployment                            │
+│  • HTTP: Alternative protocol (CORS-friendly)             │
+│  • InProcess: Testing without network overhead            │
+└───────────────────────────────────────────────────────────┘
+```
+
+**Key Design Principles:**
+- **Unidirectional Flow**: Commands flow down, events flow up
+- **No Callbacks**: Lower layers never call upper layers directly
+- **Event-Driven**: State changes propagate via Event Bus
+- **Shared Infrastructure**: Transport, Cluster Router, and Server layers shared across all clusters
+- **Independent Consensus**: Each cluster has its own Raft log and leader
+
+### Dual-Cluster Architecture on a Single Node
+
+```
+    Management Runtime          Workflow Runtime
+    (Layer 7)                   (Layer 7)
+         │                           │
+         ▼                           ▼
+    Proposal Router            Proposal Router
+    (cluster_id=0)             (cluster_id=1)
+         │                           │
+         ▼                           ▼
+    Management Raft            Workflow Raft
+    (Layer 3)                  (Layer 3)
+         │                           │
+         └───────────┬───────────────┘
+                     │
+         ┌───────────▼──────────┐
+         │   Cluster Router     │
+         │      (Layer 2)       │
+         │  Routes by cluster_id│
+         └───────────┬──────────┘
+                     │
+         ┌───────────▼──────────┐
+         │   Transport Layer    │
+         │      (Layer 1)       │
+         │   Peer Registry      │
+         └───────────┬──────────┘
+                     │
+         ┌───────────▼──────────┐
+         │   gRPC/HTTP Server   │
+         │      (Layer 0)       │
+         └──────────────────────┘
+```
+
+**Novel Aspect**: Management and execution clusters share transport/routing but maintain completely independent Raft consensus. This enables:
+- **Scalability**: Management cluster stays small (5 voters) while execution clusters multiply
+- **Fault Isolation**: Execution cluster issues don't affect topology management
+- **Efficient State**: Management only tracks O(N×C) node-cluster mappings, not O(W) workflow states
 
 ### Consensus-Driven Execution with Owner/Wait Pattern
 
-Raftoral uses Raft consensus to coordinate workflow execution across a cluster of nodes without requiring external infrastructure. The **owner/wait pattern** ensures efficient operation in multi-node clusters:
+Raftoral uses Raft consensus to coordinate workflow execution across a cluster. The **owner/wait pattern** ensures efficient operation:
 
 ```
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
@@ -71,193 +207,79 @@ Raftoral uses Raft consensus to coordinate workflow execution across a cluster o
         (No external database needed)
 ```
 
-**All nodes execute workflows in parallel, but only the owner proposes state changes:**
-
-1. **Workflow Start**: Any node can initiate a workflow by proposing a `WorkflowStart` command through Raft
-2. **Parallel Execution**: Once committed via consensus, ALL nodes execute the workflow function
+**How It Works:**
+1. **Workflow Start**: Any node proposes a `WorkflowStart` command through Raft
+2. **Parallel Execution**: ALL nodes execute the workflow function deterministically
 3. **Owner Proposes, Others Wait**:
-   - **Owner node** (typically the starter) proposes checkpoint and completion commands
-   - **Non-owner nodes** wait for checkpoint events from Raft consensus
+   - **Owner node** (typically the starter) proposes checkpoint commands
+   - **Non-owner nodes** wait for checkpoint events from consensus
    - Eliminates 50-75% of redundant Raft proposals
-4. **Automatic Failover**: If owner fails, non-owner detects timeout and becomes new owner
+4. **Automatic Failover**: If owner fails, non-owner detects timeout and takes over
 
-**Key Benefits:**
-- **Load Distribution**: Computation happens on all nodes, not just the leader
-- **Fault Tolerance**: Any node can complete a workflow if the owner fails
-- **Efficient Consensus**: Only owner proposes state changes, reducing Raft traffic
-- **No External Dependencies**: Everything runs in your application process
+**Benefits:**
+- **Load Distribution**: Computation happens on all nodes
+- **Fault Tolerance**: Any node can complete a workflow if owner fails
+- **Efficient Consensus**: Only owner proposes state changes
+- **No External Dependencies**: Everything runs in-process
 
 ### Multi-Cluster Scalability
 
-For large deployments (20+ nodes), Raftoral uses a **two-tier architecture** to prevent checkpoint replication from overwhelming the cluster:
+For large deployments, Raftoral's dual-layer architecture prevents checkpoint replication overhead:
 
-```
-┌─────────────────────────────────────────────────────────┐
-│         Management Cluster (cluster_id = 0)              │
-│   Tracks topology & coordinates multiple exec clusters   │
-│         Voters: 3-5 nodes  |  Learners: N nodes          │
-└─────────────────────────────────────────────────────────┘
-                          │
-         ┌────────────────┼────────────────┐
-         │                │                │
-┌─────────────┐   ┌─────────────┐   ┌─────────────┐
-│ Exec Cluster│   │ Exec Cluster│   │ Exec Cluster│
-│   (ID: 1)   │   │   (ID: 2)   │   │   (ID: 3)   │
-│  5 nodes    │   │  5 nodes    │   │  5 nodes    │
-│ ┌─────────┐ │   │ ┌─────────┐ │   │ ┌─────────┐ │
-│ │Workflows│ │   │ │Workflows│ │   │ │Workflows│ │
-│ │ + Chkpts│ │   │ │ + Chkpts│ │   │ │ + Chkpts│ │
-│ └─────────┘ │   │ └─────────┘ │   │ └─────────┘ │
-└─────────────┘   └─────────────┘   └─────────────┘
-```
+**Single 50-node cluster problems**:
+- Checkpoint replication: 50x per checkpoint
+- State: O(W) workflows tracked globally
+- Raft log grows with every workflow checkpoint
 
-**How It Works:**
-- **Management Cluster**: Tracks which nodes belong to which execution clusters (O(N×C) state)
-- **Execution Clusters**: Small clusters (3-5 nodes) that execute workflows independently
-- **Round-Robin Selection**: Workflows distributed across execution clusters for load balancing
-- **No Global Workflow Tracking**: Execution clusters own their workflows (no O(W) state in management)
-- **Request Forwarding**: Automatic forwarding of queries to nodes with the target execution cluster
-
-**Scalability Benefits:**
-```
-Single 50-node cluster:
-  - Checkpoint replication: 50x per checkpoint
-  - State: O(W) workflows tracked globally
-
-Multi-cluster (10 exec clusters × 5 nodes):
-  - Checkpoint replication: 5x per checkpoint  (10x reduction!)
-  - State: O(C×N) clusters×nodes  (massive reduction for high workflow count)
-  - Each node in ~2-3 execution clusters
-```
+**Multi-cluster solution (10 exec clusters × 5 nodes)**:
+- Checkpoint replication: 5x per checkpoint (10x reduction!)
+- State: O(C×N) clusters×nodes in management
+- Each execution cluster: isolated Raft log
+- Each node participates in ~2-3 execution clusters
 
 **See [docs/SCALABILITY_ARCHITECTURE.md](docs/SCALABILITY_ARCHITECTURE.md) for detailed architecture.**
 
-### Replicated Variables vs. Temporal "Activities"
-
-If you're familiar with Temporal, Raftoral's **replicated variables** serve a similar purpose to **Activities**, but with a different philosophy:
-
-#### Temporal Activities
-```typescript
-// External service call with retries
-const result = await workflow.executeActivity('chargeCard', {
-  amount: 100,
-  retries: 3
-});
-```
-- Separate execution contexts (workflow vs. activity workers)
-- Network calls to external services with retry policies
-- Activity results stored in Temporal's database
-
-#### Raftoral Replicated Variables
-```rust
-use raftoral::{checkpoint, checkpoint_compute};
-
-// Deterministic computation with consensus-backed checkpoints (using macros)
-let mut amount = checkpoint!(ctx, "charge_amount", 100);
-
-let result = checkpoint_compute!(ctx, "payment_result", || async {
-    charge_card(*amount).await  // External call executed once (owner only)
-});
-```
-
-**Key Differences:**
-
-| Aspect | Temporal Activities | Raftoral Replicated Variables |
-|--------|---------------------|-------------------------------|
-| **Execution Model** | Separate worker pools | Same process, all nodes execute |
-| **State Storage** | External database | Raft consensus (in-memory + snapshots) |
-| **Side Effects** | Activity-specific retry logic | `with_computation()` for one-time execution |
-| **Network Overhead** | Every activity call | Only during checkpoint creation (owner-only) |
-| **Determinism** | Activities can be non-deterministic | Workflow code must be deterministic |
-
-**When to use `checkpoint!` vs `checkpoint_compute!`:**
-- **`checkpoint!(ctx, "key", value)`**: For deterministic state (counters, status, computed values)
-- **`checkpoint_compute!(ctx, "key", || async { ... })`**: For side effects (API calls, external services)
-  - Executes the computation **once** (on the owner node only)
-  - Result is replicated to all nodes via Raft
-  - Non-owner nodes wait for the checkpoint event
-  - Subsequent accesses use the cached result
-
-**Example - Payment Processing:**
-```rust
-use raftoral::{checkpoint, checkpoint_compute};
-
-runtime.register_workflow_closure("process_payment", 1,
-    |input: PaymentInput, ctx: WorkflowContext| async move {
-        // Deterministic state (using checkpoint! macro)
-        let order_id = checkpoint!(ctx, "order_id", input.order_id);
-        let amount = checkpoint!(ctx, "amount", input.amount);
-
-        // Side effect: charge card once (owner-only execution)
-        let charge_result = checkpoint_compute!(ctx, "charge", || async {
-            stripe::charge_card(*order_id, *amount).await
-        });
-
-        // Update based on result
-        let mut status = checkpoint!(ctx, "status",
-            if charge_result.is_ok() { "completed" } else { "failed" }
-        );
-
-        Ok(PaymentOutput { status: status.get() })
-    }
-)?;
-```
-
-**Why This Matters:**
-- **No Activity Workers**: No separate processes to manage
-- **No Task Queues**: No polling infrastructure needed
-- **All-in-One**: Orchestration and execution in the same binary
-- **Type Safety**: Rust's type system ensures correctness at compile time
-- **Efficient**: Owner/wait pattern minimizes redundant Raft proposals
+---
 
 ## Quick Start
 
 ### Bootstrap a Cluster
 
 ```rust
-use raftoral::workflow::{WorkflowRuntime, WorkflowContext};
+use raftoral::full_node::FullNode;
 use raftoral::{checkpoint, checkpoint_compute};
-use raftoral::raft::generic::{RaftNodeConfig, TransportLayer, GrpcTransport};
-use tokio::signal;
+use slog::{Drain, o};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
+    // Create logger
+    let decorator = slog_term::TermDecorator::new().build();
+    let drain = slog_term::FullFormat::new(decorator).build().fuse();
+    let drain = slog_async::Async::new(drain).build().fuse();
+    let logger = slog::Logger::root(drain, o!());
 
-    // 1. Create transport and runtime
-    let config = RaftNodeConfig {
-        node_id: 1,
-        cluster_id: 1,
-        ..Default::default()
-    };
+    // Bootstrap first node
+    let node = FullNode::new(
+        1,                          // node_id
+        "127.0.0.1:7001".to_string(), // address
+        None,                       // storage_path (in-memory)
+        logger.clone()
+    ).await?;
 
-    let transport = Arc::new(TransportLayer::new(Arc::new(
-        GrpcTransport::new("127.0.0.1:7001".to_string())
-    )));
-
-    let (tx, rx) = tokio::sync::mpsc::channel(100);
-    let logger = create_logger();
-
-    let (runtime, node) = WorkflowRuntime::new(config, transport, rx, logger)?;
-    let runtime = Arc::new(runtime);
-
-    // 2. Register workflow with checkpoints (using macros for clean syntax)
-    runtime.register_workflow_closure(
+    // Register workflow with checkpoints
+    node.workflow_registry().lock().await.register_workflow_closure(
         "process_order", 1,
-        |input: OrderInput, ctx: WorkflowContext| async move {
+        |input: OrderInput, ctx| async move {
             // Regular checkpoint for deterministic state
             let mut status = checkpoint!(ctx, "status", "processing");
 
-            // Computed checkpoint for side effects (API calls)
-            let inventory_check = checkpoint_compute!(
-                ctx,
-                "inventory",
-                || async {
-                    check_inventory_service(input.item_id).await
-                }
-            );
+            // Computed checkpoint for side effects (e.g., API calls)
+            // Executes once on owner, replicated to all nodes
+            let inventory = checkpoint_compute!(ctx, "inventory", || async {
+                check_inventory_service(input.item_id).await
+            });
 
-            if *inventory_check {
+            if *inventory {
                 status.set("confirmed").await?;
             } else {
                 status.set("out_of_stock").await?;
@@ -267,12 +289,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     ).await?;
 
-    // 3. Run node and wait for shutdown
-    tokio::spawn(async move {
-        let _ = RaftNode::run_from_arc(node).await;
-    });
-
-    signal::ctrl_c().await?;
+    // Node runs indefinitely
+    tokio::signal::ctrl_c().await?;
     Ok(())
 }
 ```
@@ -288,9 +306,9 @@ let input = OrderInput {
 
 let workflow = runtime
     .start_workflow::<OrderInput, OrderOutput>(
-        "my-workflow-1".to_string(),
+        "my-order-1".to_string(),
         "process_order".to_string(),
-        1,
+        1, // version
         input
     )
     .await?;
@@ -299,17 +317,101 @@ let output = workflow.wait_for_completion().await?;
 println!("Order status: {}", output.status);
 ```
 
-## Dynamic Cluster Management
+### Understanding Checkpoints
 
-One of Raftoral's key strengths is **dynamic cluster membership** - you can start with any cluster size and safely add or remove nodes at runtime.
+Raftoral provides two checkpoint macros for different use cases:
+
+#### `checkpoint!` - Deterministic State
+
+Use for values that are computed identically on all nodes:
+
+```rust
+use raftoral::checkpoint;
+
+// Simple values
+let order_id = checkpoint!(ctx, "order_id", input.order_id);
+let amount = checkpoint!(ctx, "amount", input.amount);
+
+// Mutable state
+let mut counter = checkpoint!(ctx, "counter", 0);
+counter.set(counter.get() + 1).await?;
+
+// Computed deterministically
+let total = checkpoint!(ctx, "total", *amount * 2);
+```
+
+**Key:** All nodes compute the same value, so only the owner proposes it to Raft.
+
+#### `checkpoint_compute!` - Side Effects (API Calls)
+
+Use for one-time execution of side effects (API calls, external services):
+
+```rust
+use raftoral::checkpoint_compute;
+
+// Execute once on owner node, replicate result to all nodes
+let payment_result = checkpoint_compute!(ctx, "payment", || async {
+    stripe::charge_card(*order_id, *amount).await
+});
+
+// Owner executes the closure, gets the result
+// Non-owners wait for the checkpoint event from Raft
+// All nodes end up with the same payment_result
+```
+
+**How it works:**
+1. **Owner node**: Executes the closure and proposes result via Raft
+2. **Non-owner nodes**: Wait for checkpoint event (don't execute closure)
+3. **Result**: All nodes have the same `payment_result` value
+
+**Example - Payment Processing:**
+
+```rust
+runtime.register_workflow_closure("process_payment", 1,
+    |input: PaymentInput, ctx| async move {
+        // Deterministic values (all nodes compute)
+        let order_id = checkpoint!(ctx, "order_id", input.order_id);
+        let amount = checkpoint!(ctx, "amount", input.amount);
+
+        // Side effect: charge card once (owner-only execution)
+        let charge_result = checkpoint_compute!(ctx, "charge", || async {
+            stripe::charge_card(*order_id, *amount).await
+        });
+
+        // Update based on result (deterministic)
+        let status = checkpoint!(ctx, "status",
+            if charge_result.success { "completed" } else { "failed" }
+        );
+
+        Ok(PaymentOutput { status: status.get() })
+    }
+)?;
+```
+
+### Comparing to Temporal
+
+If you're familiar with Temporal, here's the mapping:
+
+| Temporal | Raftoral |
+|----------|----------|
+| `workflow.executeActivity('charge', {...})` | `checkpoint_compute!(ctx, "charge", \|\| async { charge_card().await })` |
+| Activity result from database | Result from Raft consensus |
+| Activity workers (separate process) | Owner node (same process) |
+| Activity retries via Temporal | Retry logic in your closure |
+
+**Key Difference**: Raftoral executes everything in your application process. No separate activity workers, no external database.
+
+---
+
+## Dynamic Cluster Management
 
 ### Start With Any Size
 
 ```bash
-# Start with a single node (development)
+# Single node (development)
 ./raftoral --listen 127.0.0.1:7001 --bootstrap
 
-# Or start with 3 nodes (production)
+# Three nodes (production)
 ./raftoral --listen 127.0.0.1:7001 --bootstrap
 ./raftoral --listen 127.0.0.1:7002 --peers 127.0.0.1:7001
 ./raftoral --listen 127.0.0.1:7003 --peers 127.0.0.1:7001
@@ -317,139 +419,64 @@ One of Raftoral's key strengths is **dynamic cluster membership** - you can star
 
 ### Add Nodes Dynamically
 
-New nodes can join a running cluster and **automatically catch up** on in-flight workflows:
+New nodes automatically join and catch up on in-flight workflows via Raft snapshots:
 
 ```rust
-// New node joins cluster
-let (runtime, node) = WorkflowRuntime::new_joining_node(
+// New node discovers cluster and joins
+let (runtime, node) = ManagementRuntime::new_joining_node(
     config,
     transport,
-    rx,
-    vec![1, 2],  // Initial voter IDs
+    mailbox_rx,
+    vec![1, 2], // Existing voter IDs
+    cluster_router,
+    shared_config,
     logger
 )?;
-
-// Node discovers cluster configuration, gets assigned node ID,
-// and receives Raft snapshot to catch up on running workflows
 ```
 
-**What Happens During Join:**
-1. **Discovery**: New node contacts seed nodes to discover cluster
-2. **Node ID Assignment**: Receives unique ID (highest known + 1)
-3. **Configuration Update**: Leader proposes ConfChange to add node as voter
-4. **Snapshot Transfer**: Leader sends Raft snapshot containing:
-   - Active workflow states
-   - Checkpoint queues for in-flight workflows (late follower catch-up)
-   - Cluster configuration
-5. **Sync**: New node applies snapshot and starts executing workflows
+**What happens:**
+1. Node contacts seed nodes for discovery
+2. Receives unique node ID
+3. Leader proposes ConfChange to add node
+4. Raft sends snapshot with active workflow states
+5. Node starts executing workflows
 
-**Raft's Native Snapshot Mechanism:**
-- No custom state transfer protocol needed
-- Works for **any** workflow state, regardless of size
-- Handles network failures with automatic retries
-- Consistent snapshots (point-in-time cluster state)
-
-### The Catch-Up Problem (Solved)
-
-**Challenge**: What if a node joins while workflows are running with lots of checkpoints?
-
-**Solution: Checkpoint Queues + Owner/Wait Pattern**
-
-```rust
-// Workflow running on nodes 1, 2, 3:
-for i in 0..1000 {
-    counter.set(i).await?;  // Creates 1000 checkpoints
-}
-
-// Node 4 joins after 500 iterations:
-// - Receives snapshot with checkpoint queues containing values 0-500
-// - Starts executing at iteration 0
-// - Pops from queue instead of waiting for owner: instant catch-up!
-// - Joins live execution at iteration 500+
-```
-
-**Technical Details:**
-- **Checkpoint History**: Owner tracks all checkpoints with log indices
-- **Queue Reconstruction**: Snapshot includes queues for active workflows
-- **FIFO Ordering**: Deterministic execution ensures queue order matches execution order
-- **Lazy Consumption**: Values only popped when workflow execution reaches that point
-- **Owner-Only Cleanup**: Owner cleans its own queued values to prevent self-consumption
-
-**Result**: New nodes can join a cluster with running workflows and seamlessly catch up without blocking the cluster or missing state.
+---
 
 ## Workflow Versioning
 
-Workflows evolve over time - you add features, fix bugs, change behavior. Raftoral handles this through **explicit versioning** with a migration path for long-running workflows.
-
-### The Problem
-
-```rust
-// Version 1 (deployed in production with running workflows)
-runtime.register_workflow_closure("process_order", 1, |input, ctx| async {
-    let status = ReplicatedVar::with_value("status", &ctx, "processing").await?;
-    // ...original logic...
-});
-
-// Later: You want to add fraud detection
-// But some workflows started with v1 and are still running!
-```
-
-### The Solution: Side-by-Side Versions
-
-**Best Practice**: Register both old and new versions during rollout:
+Register multiple versions side-by-side for safe rollouts:
 
 ```rust
 // Version 1 - Keep running for in-flight workflows
 runtime.register_workflow_closure("process_order", 1, |input, ctx| async {
-    let status = ReplicatedVar::with_value("status", &ctx, "processing").await?;
+    let status = checkpoint!(ctx, "status", "processing");
     // ...original logic...
-    Ok(OrderOutput { status: status.get() })
+    Ok(output)
 }).await?;
 
 // Version 2 - New workflows use this
 runtime.register_workflow_closure("process_order", 2, |input, ctx| async {
-    let status = ReplicatedVar::with_value("status", &ctx, "processing").await?;
+    let status = checkpoint!(ctx, "status", "processing");
 
     // NEW: Fraud detection
-    let fraud_check = ReplicatedVar::with_computation("fraud_check", &ctx, || async {
+    let fraud_check = checkpoint_compute!(ctx, "fraud", || async {
         fraud_service::check(input.order_id).await
-    }).await?;
+    });
 
     if !*fraud_check {
         status.set("fraud_detected").await?;
-        return Ok(OrderOutput { status: status.get() });
+        return Ok(output);
     }
 
     // ...rest of logic...
-    Ok(OrderOutput { status: status.get() })
+    Ok(output)
 }).await?;
 ```
 
-**Deployment Strategy:**
+**Deployment strategy**: Deploy both versions → wait for v1 to complete → remove v1
 
-1. **Phase 1 - Deploy with Both Versions**:
-   ```bash
-   # All nodes run with v1 and v2 registered
-   # New workflows use v2, old workflows continue with v1
-   ```
-
-2. **Phase 2 - Wait for v1 Workflows to Complete**:
-   ```bash
-   # Monitor running workflows
-   # Wait for all v1 instances to finish naturally
-   ```
-
-3. **Phase 3 - Remove v1**:
-   ```rust
-   // Only register v2 in new deployments
-   runtime.register_workflow_closure("process_order", 2, /* ... */).await?;
-   ```
-
-**Why Explicit Versioning:**
-- ✅ **Safe Rollouts**: Old workflows unaffected by new code
-- ✅ **Clear Intent**: Version numbers make upgrade paths obvious
-- ✅ **Gradual Migration**: No "big bang" deployments required
-- ✅ **Rollback Support**: Can revert to old version if issues arise
+---
 
 ## Running Examples
 
@@ -464,37 +491,7 @@ cargo test
 ./scripts/test_two_node_cluster.sh
 ```
 
-## Advanced Configuration
-
-### In-Memory Network (Testing)
-
-```rust
-use raftoral::raft::generic::{InProcessNetwork, InProcessNetworkSender, TransportLayer};
-use raftoral::workflow::WorkflowRuntime;
-
-// Create shared network
-let network = Arc::new(InProcessNetwork::new());
-
-// Create transport for node 1
-let (tx1, rx1) = mpsc::channel(100);
-network.register_node(1, tx1.clone()).await;
-
-let transport1 = Arc::new(TransportLayer::new(Arc::new(InProcessNetworkSender::new(
-    network.clone(),
-))));
-
-let config1 = RaftNodeConfig {
-    node_id: 1,
-    cluster_id: 1,
-    ..Default::default()
-};
-
-let (runtime1, node1) = WorkflowRuntime::new(config1, transport1, rx1, logger)?;
-
-// Execute workflows in-memory (no network)
-let workflow = runtime1.start_workflow("wf-1", "my_workflow", 1, input).await?;
-let result = workflow.wait_for_completion().await?;
-```
+---
 
 ## Technical Details
 
@@ -502,81 +499,110 @@ let result = workflow.wait_for_completion().await?;
 - **Command Processing**: 30-171µs (microseconds)
 - **Event-Driven**: Zero polling overhead
 - **Owner/Wait Pattern**: 50-75% reduction in Raft proposals
-- **Optimized For**: Orchestration-heavy workflows (not high-frequency trading)
+- **Multi-Cluster**: 10x reduction in checkpoint replication (50 nodes → 5-node clusters)
 
 ### Requirements
 - **Rust**: 1.70 or later
 - **Deterministic Execution**: Same input → same operation sequence on all nodes
 - **Serializable State**: Types must implement `Serialize + Deserialize`
-- **Type Safety**: Full compile-time checking
+- **Long-Running Services**: Not suitable for FaaS/Lambda (workflows need continuous execution)
+
+### Storage
+- **RocksDB**: Persistent storage (enabled by default, `persistent-storage` feature)
+- **Node Identity**: Persisted across restarts
+- **Crash Recovery**: RocksDB WAL ensures durability
 
 ### Current Limitations
-- In-memory storage only (persistent storage planned)
-- No built-in compensation/rollback (implement in workflow logic)
 - Workflow functions must be registered identically on all nodes
+- No built-in compensation/rollback (implement in workflow logic)
+
+---
+
+## Comparison with Other Systems
+
+**See our detailed comparison**: [Raftoral vs. Temporal vs. DBOS](docs/COMPARISON.md)
+
+**Quick Summary**:
+
+| Feature | Raftoral | Temporal | Vercel Workflows |
+|---------|----------|----------|------------------|
+| **Infrastructure** | Embedded (your nodes) | Separate cluster | Serverless (Vercel) |
+| **Type Safety** | Rust compile-time | TypeScript runtime | TypeScript |
+| **Deployment** | Self-hosted | Self-hosted | Vercel only |
+| **Scaling** | Multi-cluster Raft | Activity workers | Automatic (managed) |
+| **State Storage** | Raft consensus | External DB | Managed (Vercel) |
+| **Cost** | Compute only | Compute + DB + queues | Per-workflow pricing |
+
+---
 
 ## File Organization
 
 ```
 src/
 ├── raft/generic/
-│   ├── node.rs                # RaftNode with raft-rs integration
-│   ├── proposal_router.rs     # ProposalRouter for command submission
-│   ├── transport.rs           # Transport abstraction (Layer 2-3)
+│   ├── node.rs              # RaftNode with raft-rs integration
+│   ├── proposal_router.rs   # Command submission & leader routing
+│   ├── transport.rs         # Protocol-agnostic transport
+│   ├── cluster_router.rs    # Multi-cluster message routing
 │   ├── server/
-│   │   ├── in_process.rs      # InProcessNetwork for testing
-│   │   └── grpc.rs            # gRPC transport implementation
-│   ├── message.rs             # Message types & CommandExecutor trait
-│   ├── errors.rs              # Error types
-│   ├── cluster_router.rs      # Multi-cluster message routing
-│   └── integration_tests.rs   # Two-node KV cluster tests
+│   │   ├── in_process.rs    # In-memory testing
+│   │   └── network.rs       # gRPC/HTTP network transport
+│   └── rocksdb_storage.rs   # Persistent Raft log storage
+├── management/
+│   ├── runtime.rs           # Management cluster runtime
+│   └── state_machine.rs     # Topology management logic
 ├── workflow/
-│   ├── mod.rs                 # Public API exports
-│   ├── runtime.rs             # WorkflowRuntime with owner/wait pattern
-│   ├── state_machine.rs       # WorkflowStateMachine & commands
-│   ├── context.rs             # WorkflowContext & WorkflowRun
-│   ├── registry.rs            # Type-safe workflow storage
-│   ├── replicated_var.rs      # ReplicatedVar with with_value/with_computation
-│   ├── event.rs               # WorkflowEvent definitions
-│   ├── error.rs               # Error types
-│   └── ownership.rs           # Workflow ownership tracking
-├── nodemanager/
-│   ├── mod.rs                 # NodeManager (dual-cluster coordination)
-│   ├── node_manager.rs        # Owns management + execution clusters
-│   ├── management_command.rs  # Management cluster commands
-│   └── management_executor.rs # Management state & execution
+│   ├── runtime.rs           # Workflow execution runtime
+│   ├── state_machine.rs     # Workflow state management
+│   ├── context.rs           # WorkflowContext & execution
+│   ├── replicated_var.rs    # checkpoint! and checkpoint_compute!
+│   └── registry.rs          # Type-safe workflow storage
 ├── grpc/
-│   └── server.rs              # gRPC service implementation
-└── lib.rs                     # Public API exports
-
-examples/
-├── typed_workflow_example.rs  # Complete workflow example
-└── ...
+│   ├── server.rs            # gRPC server implementation
+│   ├── client.rs            # gRPC client (MessageSender)
+│   └── bootstrap.rs         # Node discovery
+├── http/
+│   ├── server.rs            # HTTP/REST server (alternative)
+│   ├── client.rs            # HTTP client
+│   └── bootstrap.rs         # HTTP-based discovery
+├── full_node/
+│   └── mod.rs               # Complete node stack (management + execution)
+└── lib.rs                   # Public API exports
 
 docs/
-├── SCALABILITY_ARCHITECTURE.md  # Multi-cluster architecture details
-└── COMPARISON.md                # Raftoral vs Temporal vs DBOS
+├── SCALABILITY_ARCHITECTURE.md  # Multi-cluster details
+├── COMPARISON.md                # Raftoral vs Temporal vs DBOS
+└── V2_ARCHITECTURE.md           # Layer architecture reference
 ```
+
+---
 
 ## Contributing
 
 Contributions welcome! Areas of interest:
 - Multi-node fault injection testing
-- Persistent storage backend integration
-- Advanced workflow patterns
 - Performance benchmarking
+- Advanced workflow patterns
 - Documentation improvements
+- WebAssembly support (experimental HTTP client)
+
+---
 
 ## Author
 
 **Ori Shalev** - [ori.shalev@gmail.com](mailto:ori.shalev@gmail.com)
 
+---
+
 ## License
 
 MIT License. See [LICENSE](LICENSE) for details.
 
+---
+
 ## Acknowledgments
 
 - Built on [raft-rs](https://github.com/tikv/raft-rs) for Raft consensus
-- Inspired by [Temporal](https://temporal.io/) workflow orchestration
+- Inspired by [Temporal](https://temporal.io/) and [Vercel Workflows](https://useworkflow.dev/)
 - Uses [Tokio](https://tokio.rs/) for async runtime
+- Storage via [RocksDB](https://rocksdb.org/)
