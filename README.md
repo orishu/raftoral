@@ -82,6 +82,8 @@ This architecture enables:
 - 3+ nodes for production fault tolerance (Raft quorum requirement)
 - Rust 1.70+
 
+> **⚡ Ready to start?** Jump to the [Quick Start](#quick-start) section below or see the [complete setup guide](docs/QUICKSTART.md).
+
 ---
 
 ## Architecture Overview
@@ -242,6 +244,12 @@ For large deployments, Raftoral's dual-layer architecture prevents checkpoint re
 ---
 
 ## Quick Start
+
+> **📚 Full Getting Started Guide**: See [docs/QUICKSTART.md](docs/QUICKSTART.md) for complete setup instructions including:
+> - Starting clusters with gRPC or HTTP transport
+> - Running workflows via command-line tools
+> - Multi-node cluster deployment
+> - Production configuration with persistent storage
 
 ### Bootstrap a Cluster
 
@@ -405,6 +413,8 @@ If you're familiar with Temporal, here's the mapping:
 
 ## Dynamic Cluster Management
 
+> **💡 Tip**: See [docs/QUICKSTART.md](docs/QUICKSTART.md) for complete CLI reference and deployment examples.
+
 ### Start With Any Size
 
 ```bash
@@ -480,6 +490,8 @@ runtime.register_workflow_closure("process_order", 2, |input, ctx| async {
 
 ## Running Examples
 
+> **🚀 Quick Test**: See [docs/QUICKSTART.md](docs/QUICKSTART.md) for ready-to-use scripts to start a cluster and run workflows via gRPC or HTTP.
+
 ```bash
 # Simple workflow example
 cargo run --example typed_workflow_example
@@ -487,8 +499,12 @@ cargo run --example typed_workflow_example
 # Run tests
 cargo test
 
-# Two-node cluster test
+# Two-node cluster test with workflow execution
 ./scripts/test_two_node_cluster.sh
+
+# Run ping_pong workflow on a running cluster
+./scripts/run_ping_pong.sh 127.0.0.1:7001          # gRPC
+./scripts/run_ping_pong_http.sh 127.0.0.1:7001    # HTTP
 ```
 
 ---
@@ -570,6 +586,7 @@ src/
 └── lib.rs                   # Public API exports
 
 docs/
+├── QUICKSTART.md                # Getting started guide (start here!)
 ├── SCALABILITY_ARCHITECTURE.md  # Multi-cluster details
 ├── COMPARISON.md                # Raftoral vs Temporal vs DBOS
 └── V2_ARCHITECTURE.md           # Layer architecture reference
