@@ -663,6 +663,14 @@ where
         self.sub_clusters.lock().await.get(cluster_id).cloned()
     }
 
+    /// Get all available sub-cluster IDs
+    ///
+    /// # Returns
+    /// * `Vec<u32>` - List of all sub-cluster IDs currently managed on this node
+    pub async fn get_available_sub_clusters(&self) -> Vec<u32> {
+        self.sub_clusters.lock().await.keys().copied().collect()
+    }
+
     /// Check if a node is a voter in the management cluster
     ///
     /// # Arguments

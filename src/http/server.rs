@@ -3,13 +3,13 @@
 use crate::grpc::proto::GenericMessage;
 use crate::http::messages::{
     HealthResponse, JsonGenericMessage, JsonRunWorkflowRequest, JsonRunWorkflowResponse,
-    PeerInfo, RegisterNodeRequest, RegisterNodeResponse,
+    JsonWorkflowResultResponse, PeerInfo, RegisterNodeRequest, RegisterNodeResponse,
 };
 use crate::management::ManagementRuntime;
 use crate::raft::generic::{ClusterRouter, Transport};
 use crate::workflow::{WorkflowRegistry, WorkflowRuntime};
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -73,6 +73,7 @@ impl HttpServer {
             .route("/raft/message", post(handle_raft_message))
             // Workflow endpoints
             .route("/workflow/execute", post(handle_workflow_execute))
+            .route("/workflow/wait", get(handle_workflow_wait))
             // Discovery endpoints
             .route("/discovery/register", post(handle_register_node))
             .route("/discovery/peers", get(handle_get_peers))
@@ -135,18 +136,255 @@ async fn handle_workflow_execute(
     State(server): State<HttpServer>,
     Json(req): Json<JsonRunWorkflowRequest>,
 ) -> Response {
-    debug!(server.logger, "Workflow execute request";
+    info!(server.logger, "Workflow execute request";
         "name" => &req.name,
         "version" => req.version
     );
 
-    // TODO: Integrate with workflow execution
-    // For now, return a placeholder response
-    let response = JsonRunWorkflowResponse {
-        workflow_id: format!("wf-{}-{}", req.name, uuid::Uuid::new_v4()),
-        success: true,
+    // Generate workflow ID
+    let workflow_id = uuid::Uuid::new_v4();
+
+    // Get available execution clusters from management runtime
+    let available_clusters = server.management_runtime.get_available_sub_clusters().await;
+
+    if available_clusters.is_empty() {
+        error!(server.logger, "No execution clusters available on this node");
+        let response = JsonRunWorkflowResponse {
+            workflow_id: String::new(),
+            success: false,
+            execution_cluster_id: None,
+            result: None,
+            error: Some("No execution clusters available on this node".to_string()),
+        };
+        return Json(response).into_response();
+    }
+
+    // Select a random execution cluster for load balancing
+    use rand::Rng;
+    let cluster_idx = rand::thread_rng().gen_range(0..available_clusters.len());
+    let cluster_id = available_clusters[cluster_idx];
+
+    debug!(server.logger, "Selected execution cluster";
+        "cluster_id" => cluster_id,
+        "available_clusters" => available_clusters.len()
+    );
+
+    // Get the workflow runtime for this cluster
+    let workflow_runtime = match server
+        .management_runtime
+        .get_sub_cluster_runtime(&cluster_id)
+        .await
+    {
+        Some(runtime) => runtime,
+        None => {
+            error!(server.logger, "Execution cluster not available";
+                "cluster_id" => cluster_id
+            );
+            let response = JsonRunWorkflowResponse {
+                workflow_id: String::new(),
+                success: false,
+                execution_cluster_id: None,
+                result: None,
+                error: Some(format!(
+                    "Execution cluster {} not available on this node",
+                    cluster_id
+                )),
+            };
+            return Json(response).into_response();
+        }
+    };
+
+    // Parse input JSON to serde_json::Value
+    let input_value: serde_json::Value = match serde_json::from_str(&req.input) {
+        Ok(value) => value,
+        Err(e) => {
+            error!(server.logger, "Invalid input JSON"; "error" => %e);
+            let response = JsonRunWorkflowResponse {
+                workflow_id: String::new(),
+                success: false,
+                execution_cluster_id: None,
+                result: None,
+                error: Some(format!("Invalid input JSON: {}", e)),
+            };
+            return Json(response).into_response();
+        }
+    };
+
+    // Start the workflow asynchronously
+    match workflow_runtime
+        .start_workflow::<serde_json::Value, serde_json::Value>(
+            workflow_id.to_string(),
+            req.name.clone(),
+            req.version,
+            input_value,
+        )
+        .await
+    {
+        Ok(_) => {
+            info!(server.logger, "Workflow started";
+                "workflow_id" => %workflow_id,
+                "cluster_id" => cluster_id
+            );
+
+            let response = JsonRunWorkflowResponse {
+                workflow_id: workflow_id.to_string(),
+                success: true,
+                execution_cluster_id: Some(cluster_id.to_string()),
+                result: None,
+                error: None,
+            };
+
+            Json(response).into_response()
+        }
+        Err(e) => {
+            error!(server.logger, "Failed to start workflow";
+                "error" => %e,
+                "workflow_type" => &req.name
+            );
+
+            let response = JsonRunWorkflowResponse {
+                workflow_id: String::new(),
+                success: false,
+                execution_cluster_id: None,
+                result: None,
+                error: Some(e.to_string()),
+            };
+
+            Json(response).into_response()
+        }
+    }
+}
+
+/// Query parameters for workflow wait endpoint
+#[derive(Debug, serde::Deserialize)]
+struct WorkflowWaitQuery {
+    workflow_id: String,
+    execution_cluster_id: String,
+    #[serde(default = "default_timeout")]
+    timeout_seconds: u32,
+}
+
+fn default_timeout() -> u32 {
+    60
+}
+
+/// Handle workflow wait/result request
+async fn handle_workflow_wait(
+    State(server): State<HttpServer>,
+    Query(params): Query<WorkflowWaitQuery>,
+) -> Response {
+    info!(server.logger, "Workflow wait request";
+        "workflow_id" => &params.workflow_id,
+        "execution_cluster_id" => &params.execution_cluster_id,
+        "timeout_seconds" => params.timeout_seconds
+    );
+
+    // Parse workflow ID (validation)
+    if let Err(e) = uuid::Uuid::parse_str(&params.workflow_id) {
+        error!(server.logger, "Invalid workflow_id"; "error" => %e);
+        let response = JsonWorkflowResultResponse {
+            success: false,
+            result: None,
+            error: Some(format!("Invalid workflow_id: {}", e)),
+        };
+        return (StatusCode::BAD_REQUEST, Json(response)).into_response();
+    }
+
+    // Parse execution cluster ID
+    let execution_cluster_id = match params.execution_cluster_id.parse::<u32>() {
+        Ok(id) => id,
+        Err(e) => {
+            error!(server.logger, "Invalid execution_cluster_id"; "error" => %e);
+            let response = JsonWorkflowResultResponse {
+                success: false,
+                result: None,
+                error: Some(format!("Invalid execution_cluster_id: {}", e)),
+            };
+            return (StatusCode::BAD_REQUEST, Json(response)).into_response();
+        }
+    };
+
+    // Get the workflow runtime for this cluster
+    let workflow_runtime = match server
+        .management_runtime
+        .get_sub_cluster_runtime(&execution_cluster_id)
+        .await
+    {
+        Some(runtime) => runtime,
+        None => {
+            error!(server.logger, "Execution cluster not available";
+                "cluster_id" => execution_cluster_id
+            );
+            let response = JsonWorkflowResultResponse {
+                success: false,
+                result: None,
+                error: Some(format!(
+                    "Execution cluster {} not available on this node",
+                    execution_cluster_id
+                )),
+            };
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(response)).into_response();
+        }
+    };
+
+    // Determine timeout (default 60 seconds if 0 or not specified)
+    let timeout_seconds = if params.timeout_seconds == 0 {
+        60
+    } else {
+        params.timeout_seconds
+    };
+    let poll_interval = std::time::Duration::from_millis(100); // Poll every 100ms
+    let max_polls = (timeout_seconds as u64 * 1000) / poll_interval.as_millis() as u64;
+
+    // Poll for workflow completion
+    for poll_count in 0..max_polls {
+        // Check if workflow result is available
+        if let Some(result_bytes) = workflow_runtime.get_result(&params.workflow_id).await {
+            // Convert result bytes to JSON string
+            let result_json = match String::from_utf8(result_bytes) {
+                Ok(json) => json,
+                Err(e) => {
+                    error!(server.logger, "Failed to decode workflow result"; "error" => %e);
+                    let response = JsonWorkflowResultResponse {
+                        success: false,
+                        result: None,
+                        error: Some(format!("Failed to decode workflow result: {}", e)),
+                    };
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(response)).into_response();
+                }
+            };
+
+            info!(server.logger, "Workflow completed";
+                "workflow_id" => &params.workflow_id,
+                "poll_count" => poll_count
+            );
+
+            let response = JsonWorkflowResultResponse {
+                success: true,
+                result: Some(result_json),
+                error: None,
+            };
+
+            return Json(response).into_response();
+        }
+
+        // Still running or not yet completed, sleep and retry
+        tokio::time::sleep(poll_interval).await;
+    }
+
+    // Timeout reached
+    error!(server.logger, "Timeout waiting for workflow completion";
+        "workflow_id" => &params.workflow_id,
+        "timeout_seconds" => timeout_seconds
+    );
+
+    let response = JsonWorkflowResultResponse {
+        success: false,
         result: None,
-        error: None,
+        error: Some(format!(
+            "Timeout waiting for workflow completion ({}s)",
+            timeout_seconds
+        )),
     };
 
     Json(response).into_response()

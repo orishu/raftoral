@@ -65,6 +65,7 @@ impl From<JsonRunWorkflowRequest> for proto::RunWorkflowRequest {
 pub struct JsonRunWorkflowResponse {
     pub workflow_id: String,
     pub success: bool,
+    pub execution_cluster_id: Option<String>,
     pub result: Option<String>,
     pub error: Option<String>,
 }
@@ -74,6 +75,11 @@ impl From<proto::RunWorkflowAsyncResponse> for JsonRunWorkflowResponse {
         Self {
             workflow_id: resp.workflow_id,
             success: resp.success,
+            execution_cluster_id: if resp.execution_cluster_id.is_empty() {
+                None
+            } else {
+                Some(resp.execution_cluster_id)
+            },
             result: None,
             error: if resp.error.is_empty() { None } else { Some(resp.error) },
         }
@@ -85,7 +91,7 @@ impl From<JsonRunWorkflowResponse> for proto::RunWorkflowAsyncResponse {
         Self {
             success: resp.success,
             workflow_id: resp.workflow_id,
-            execution_cluster_id: String::new(), // Will be filled by server
+            execution_cluster_id: resp.execution_cluster_id.unwrap_or_default(),
             error: resp.error.unwrap_or_default(),
         }
     }
@@ -118,6 +124,38 @@ pub struct HealthResponse {
     pub status: String,
     pub node_id: u64,
     pub is_leader: bool,
+}
+
+/// Workflow wait/result response (JSON-friendly)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonWorkflowResultResponse {
+    pub success: bool,
+    pub result: Option<String>,
+    pub error: Option<String>,
+}
+
+impl From<proto::RunWorkflowResponse> for JsonWorkflowResultResponse {
+    fn from(resp: proto::RunWorkflowResponse) -> Self {
+        Self {
+            success: resp.success,
+            result: if resp.result_json.is_empty() {
+                None
+            } else {
+                Some(resp.result_json)
+            },
+            error: if resp.error.is_empty() { None } else { Some(resp.error) },
+        }
+    }
+}
+
+impl From<JsonWorkflowResultResponse> for proto::RunWorkflowResponse {
+    fn from(resp: JsonWorkflowResultResponse) -> Self {
+        Self {
+            success: resp.success,
+            result_json: resp.result.unwrap_or_default(),
+            error: resp.error.unwrap_or_default(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -177,6 +215,7 @@ mod tests {
         let json_resp = JsonRunWorkflowResponse {
             workflow_id: "wf-123".to_string(),
             success: true,
+            execution_cluster_id: Some("1".to_string()),
             result: Some("result data".to_string()),
             error: None,
         };
@@ -186,6 +225,7 @@ mod tests {
 
         assert_eq!(proto_resp.workflow_id, "wf-123");
         assert!(proto_resp.success);
+        assert_eq!(proto_resp.execution_cluster_id, "1");
         assert_eq!(proto_resp.error, "");
 
         // Convert back
@@ -193,6 +233,43 @@ mod tests {
 
         assert_eq!(json_resp2.workflow_id, "wf-123");
         assert!(json_resp2.success);
+        assert_eq!(json_resp2.execution_cluster_id, Some("1".to_string()));
         assert_eq!(json_resp2.error, None);
+    }
+
+    #[test]
+    fn test_workflow_result_response_conversion() {
+        // Test successful result
+        let json_resp = JsonWorkflowResultResponse {
+            success: true,
+            result: Some(r#"{"output": "pong"}"#.to_string()),
+            error: None,
+        };
+
+        // Convert to proto
+        let proto_resp: proto::RunWorkflowResponse = json_resp.clone().into();
+
+        assert!(proto_resp.success);
+        assert_eq!(proto_resp.result_json, r#"{"output": "pong"}"#);
+        assert_eq!(proto_resp.error, "");
+
+        // Convert back
+        let json_resp2: JsonWorkflowResultResponse = proto_resp.into();
+
+        assert!(json_resp2.success);
+        assert_eq!(json_resp2.result, Some(r#"{"output": "pong"}"#.to_string()));
+        assert_eq!(json_resp2.error, None);
+
+        // Test error result
+        let error_resp = JsonWorkflowResultResponse {
+            success: false,
+            result: None,
+            error: Some("Workflow failed".to_string()),
+        };
+
+        let proto_error: proto::RunWorkflowResponse = error_resp.clone().into();
+        assert!(!proto_error.success);
+        assert_eq!(proto_error.result_json, "");
+        assert_eq!(proto_error.error, "Workflow failed");
     }
 }
