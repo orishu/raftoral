@@ -30,6 +30,7 @@ prost = "^0.14"
 # Native (non-WASM) dependencies with full networking support
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "^1.47.1", features = ["full"] }
+tokio-stream = { version = "^0.1", features = ["sync"] }
 uuid = { version = "^1.0", features = ["v4", "serde"] }
 # gRPC dependencies
 protobuf = "^4.33.1-release"

@@ -15,7 +15,6 @@ pub use workflow_service::WorkflowManagementService;
 use crate::grpc::{GrpcMessageSender, GrpcServer};
 use crate::management::ManagementRuntime;
 use crate::raft::generic::{ClusterRouter, RaftNode, RaftNodeConfig, Transport, TransportLayer};
-use crate::workflow::WorkflowRuntime;
 use slog::{Logger, info};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
@@ -25,11 +24,17 @@ use tonic::transport::Server;
 /// A complete Raft node with all layers from gRPC to ManagementRuntime
 ///
 /// The FullNode manages a management cluster (cluster_id=0) that tracks metadata
-/// about workflow execution clusters. When sub-clusters are created via the management
-/// runtime, FullNode automatically creates and manages WorkflowRuntime instances.
-pub struct FullNode {
-    /// Management runtime (Layer 7) - manages WorkflowRuntime sub-clusters
-    runtime: Arc<ManagementRuntime<WorkflowRuntime>>,
+/// about sub-clusters. When sub-clusters are created via the management runtime,
+/// FullNode automatically creates and manages sub-cluster runtime instances.
+///
+/// The type parameter R specifies the sub-cluster runtime type (e.g., WorkflowRuntime
+/// for standalone mode, or WorkflowProxyRuntime for sidecar mode).
+pub struct FullNode<R>
+where
+    R: crate::management::SubClusterRuntime,
+{
+    /// Management runtime (Layer 7) - manages R sub-clusters
+    runtime: Arc<ManagementRuntime<R>>,
 
     /// Raft node handle
     node: Arc<Mutex<RaftNode<crate::management::ManagementStateMachine>>>,
@@ -37,8 +42,8 @@ pub struct FullNode {
     /// Server handle (generic over transport type)
     server_handle: Option<JoinHandle<()>>,
 
-    /// Shared workflow registry (accessible before execution clusters are created)
-    workflow_registry: Arc<Mutex<crate::workflow::WorkflowRegistry>>,
+    /// Shared configuration for sub-cluster runtimes
+    shared_config: Arc<Mutex<R::SharedConfig>>,
 
     /// Node address
     address: String,
@@ -47,7 +52,51 @@ pub struct FullNode {
     logger: Logger,
 }
 
-impl FullNode {
+// Generic impl block for all FullNode types
+impl<R> FullNode<R>
+where
+    R: crate::management::SubClusterRuntime,
+{
+    /// Get a reference to the management runtime
+    pub fn runtime(&self) -> &Arc<ManagementRuntime<R>> {
+        &self.runtime
+    }
+
+    /// Get a reference to the shared configuration for sub-cluster runtimes
+    ///
+    /// This allows accessing the shared configuration before execution clusters are created.
+    /// All sub-cluster runtime instances share this configuration.
+    pub fn shared_config(&self) -> &Arc<Mutex<R::SharedConfig>> {
+        &self.shared_config
+    }
+
+    /// Get the node address
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    /// Get the node ID
+    pub fn node_id(&self) -> u64 {
+        self.runtime.node_id()
+    }
+
+    /// Check if this node is the leader
+    pub async fn is_leader(&self) -> bool {
+        self.runtime.is_leader().await
+    }
+
+    /// Shutdown the node
+    pub async fn shutdown(mut self) {
+        info!(self.logger, "Shutting down FullNode");
+
+        if let Some(handle) = self.server_handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+// Workflow-specific impl block for FullNode<WorkflowRuntime>
+impl FullNode<crate::workflow::WorkflowRuntime> {
     /// Create and start a new full node in bootstrap mode (single-node cluster)
     ///
     /// # Arguments
@@ -80,7 +129,7 @@ impl FullNode {
         cluster_router.register_cluster(0, mailbox_tx).await;
 
         // Create shared workflow registry
-        let registry = Arc::new(Mutex::new(crate::workflow::WorkflowRegistry::new()));
+        let shared_config = Arc::new(Mutex::new(crate::workflow::WorkflowRegistry::new()));
 
         // Layers 3-7: Create management runtime (includes RaftNode, EventBus, ProposalRouter)
         let config = RaftNodeConfig {
@@ -96,7 +145,7 @@ impl FullNode {
             transport.clone(),
             mailbox_rx,
             cluster_router.clone(),
-            registry.clone(),
+            shared_config.clone(),
             logger.clone(),
         )?;
 
@@ -180,7 +229,7 @@ impl FullNode {
             runtime,
             node,
             server_handle: Some(server_handle),
-            workflow_registry: registry,
+            shared_config,
             address,
             logger,
         })
@@ -247,8 +296,9 @@ impl FullNode {
             .first()
             .map(|p| p.should_join_as_voter)
             .unwrap_or(true); // Default to voter if no info available
+
         // Create shared workflow registry
-        let registry = Arc::new(Mutex::new(crate::workflow::WorkflowRegistry::new()));
+        let shared_config = Arc::new(Mutex::new(crate::workflow::WorkflowRegistry::new()));
 
         // Layers 3-7: Create management runtime in joining mode
         let config = RaftNodeConfig {
@@ -277,7 +327,7 @@ impl FullNode {
                 mailbox_rx,
                 existing_voters,
                 cluster_router.clone(),
-                registry.clone(),
+                shared_config.clone(),
                 logger.clone(),
             )?
         } else {
@@ -295,7 +345,7 @@ impl FullNode {
                 mailbox_rx,
                 existing_voters,
                 cluster_router.clone(),
-                registry.clone(),
+                shared_config.clone(),
                 logger.clone(),
             )?
         };
@@ -362,7 +412,7 @@ impl FullNode {
             runtime: runtime.clone(),
             node,
             server_handle: Some(server_handle),
-            workflow_registry: registry,
+            shared_config,
             address: address.clone(),
             logger: logger.clone(),
         };
@@ -438,7 +488,7 @@ impl FullNode {
         cluster_router.register_cluster(0, mailbox_tx).await;
 
         // Create shared workflow registry
-        let registry = Arc::new(Mutex::new(crate::workflow::WorkflowRegistry::new()));
+        let shared_config = Arc::new(Mutex::new(crate::workflow::WorkflowRegistry::new()));
 
         // Layers 3-7: Create management runtime (includes RaftNode, EventBus, ProposalRouter)
         let config = RaftNodeConfig {
@@ -454,7 +504,7 @@ impl FullNode {
             transport.clone(),
             mailbox_rx,
             cluster_router.clone(),
-            registry.clone(),
+            shared_config.clone(),
             logger.clone(),
         )?;
 
@@ -504,7 +554,7 @@ impl FullNode {
             cluster_router.clone(),
             transport.clone(),
             runtime.clone(),
-            registry.clone(),
+            shared_config.clone(),
             logger.clone(),
         );
 
@@ -522,7 +572,7 @@ impl FullNode {
             runtime,
             node,
             server_handle: Some(server_handle),
-            workflow_registry: registry,
+            shared_config,
             address,
             logger,
         })
@@ -602,7 +652,7 @@ impl FullNode {
         );
 
         // Create shared workflow registry
-        let registry = Arc::new(Mutex::new(crate::workflow::WorkflowRegistry::new()));
+        let shared_config = Arc::new(Mutex::new(crate::workflow::WorkflowRegistry::new()));
 
         // Layers 3-7: Create management runtime
         let config = RaftNodeConfig {
@@ -618,7 +668,7 @@ impl FullNode {
             transport.clone(),
             mailbox_rx,
             cluster_router.clone(),
-            registry.clone(),
+            shared_config.clone(),
             logger.clone(),
         )?;
 
@@ -643,7 +693,7 @@ impl FullNode {
             cluster_router.clone(),
             transport.clone(),
             runtime.clone(),
-            registry.clone(),
+            shared_config.clone(),
             logger.clone(),
         );
 
@@ -661,7 +711,7 @@ impl FullNode {
             runtime: runtime.clone(),
             node,
             server_handle: Some(server_handle),
-            workflow_registry: registry,
+            shared_config,
             address: address.clone(),
             logger: logger.clone(),
         };
@@ -687,41 +737,12 @@ impl FullNode {
         Ok(full_node)
     }
 
-    /// Get a reference to the management runtime
-    pub fn runtime(&self) -> &Arc<ManagementRuntime<WorkflowRuntime>> {
-        &self.runtime
-    }
-
-    /// Get a reference to the shared workflow registry
+    /// Get a reference to the shared workflow registry (WorkflowRuntime-specific convenience method)
     ///
     /// This allows registering workflows before execution clusters are created.
     /// All WorkflowRuntime instances share this registry.
     pub fn workflow_registry(&self) -> &Arc<Mutex<crate::workflow::WorkflowRegistry>> {
-        &self.workflow_registry
-    }
-
-    /// Get the node address
-    pub fn address(&self) -> &str {
-        &self.address
-    }
-
-    /// Get the node ID
-    pub fn node_id(&self) -> u64 {
-        self.runtime.node_id()
-    }
-
-    /// Check if this node is the leader
-    pub async fn is_leader(&self) -> bool {
-        self.runtime.is_leader().await
-    }
-
-    /// Shutdown the node
-    pub async fn shutdown(mut self) {
-        info!(self.logger, "Shutting down FullNode");
-
-        if let Some(handle) = self.server_handle.take() {
-            handle.abort();
-        }
+        &self.shared_config
     }
 }
 

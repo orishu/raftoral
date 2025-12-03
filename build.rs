@@ -4,10 +4,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tonic_prost_build::configure()
         .file_descriptor_set_path(&descriptor_path)
-        .compile_protos(&["proto/raftoral.proto"], &["proto"])?;
+        .compile_protos(&["proto/raftoral.proto", "proto/sidecar.proto"], &["proto"])?;
 
-    // Tell cargo to rerun if the proto file changes
+    // Tell cargo to rerun if the proto files change
     println!("cargo:rerun-if-changed=proto/raftoral.proto");
+    println!("cargo:rerun-if-changed=proto/sidecar.proto");
 
     Ok(())
 }

@@ -1,0 +1,82 @@
+syntax = "proto3";
+
+package raftoral.sidecar;
+
+// Bidirectional streaming service for app ↔ sidecar communication
+service RaftoralSidecar {
+  // Bidirectional stream for workflow coordination
+  // App sends AppMessage, receives SidecarMessage
+  rpc WorkflowStream(stream AppMessage) returns (stream SidecarMessage);
+}
+
+// ============================================================================
+// Messages from App → Sidecar
+// ============================================================================
+
+message AppMessage {
+  oneof message {
+    CheckpointProposal checkpoint_proposal = 1;
+    WorkflowResult workflow_result = 2;
+    HeartbeatRequest heartbeat = 3;
+  }
+}
+
+// App proposes checkpoint value (owner node only)
+message CheckpointProposal {
+  string workflow_id = 1;
+  string checkpoint_name = 2;
+  bytes value = 3;  // Serialized checkpoint value
+}
+
+// Workflow execution result (success or error)
+message WorkflowResult {
+  string workflow_id = 1;
+  bool success = 2;
+  bytes result = 3;  // Serialized result (if success=true)
+  string error = 4;  // Error message (if success=false)
+}
+
+// Heartbeat to keep connection alive
+message HeartbeatRequest {
+  uint64 timestamp = 1;
+}
+
+// ============================================================================
+// Messages from Sidecar → App
+// ============================================================================
+
+message SidecarMessage {
+  oneof message {
+    ExecuteWorkflowRequest execute_workflow = 1;
+    CheckpointEvent checkpoint_event = 2;
+    WorkflowCancellation workflow_cancellation = 3;
+    HeartbeatResponse heartbeat_response = 4;
+  }
+}
+
+// Sidecar tells app to start workflow execution
+message ExecuteWorkflowRequest {
+  string workflow_id = 1;
+  string workflow_name = 2;
+  uint32 version = 3;
+  bytes input = 4;  // Serialized input
+  bool is_owner = 5;  // True if this node is the workflow owner
+}
+
+// Sidecar notifies app of checkpoint (from Raft consensus)
+message CheckpointEvent {
+  string workflow_id = 1;
+  string checkpoint_name = 2;
+  bytes value = 3;  // Serialized checkpoint value from Raft
+}
+
+// Sidecar requests workflow cancellation
+message WorkflowCancellation {
+  string workflow_id = 1;
+  string reason = 2;
+}
+
+// Heartbeat response
+message HeartbeatResponse {
+  uint64 timestamp = 1;
+}

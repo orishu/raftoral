@@ -1,9 +1,11 @@
 pub mod raft;
 pub mod grpc;  // gRPC implementation for generic architecture
 pub mod http;  // HTTP implementation for generic architecture (WASM-compatible)
+pub mod sidecar;  // Sidecar server for app ↔ sidecar communication
 pub mod kv;  // KV runtime for generic architecture
 pub mod management;  // Management runtime for generic architecture
-pub mod workflow;  // Workflow execution runtime for generic architecture
+pub mod workflow;  // Workflow execution runtime for generic architecture (embedded/standalone mode)
+pub mod workflow_proxy_runtime;  // Workflow proxy runtime for sidecar mode
 pub mod full_node;  // Complete node stack (Layer 0-7)
 pub mod config;  // Configuration for Raftoral nodes
 
