@@ -7,11 +7,9 @@ use crate::grpc::proto::{
     raft_service_server::{RaftService, RaftServiceServer},
     AddNodeRequest, AddNodeResponse, GenericMessage, MessageResponse,
 };
-use crate::management::ManagementRuntime;
+use crate::management::{ManagementRuntime, SubClusterRuntime};
 use crate::raft::generic::{ClusterRouter, Transport};
-use crate::workflow::WorkflowRuntime;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tonic::{transport::Server, Request, Response, Status};
 
 /// gRPC server implementation for generic architecture
@@ -19,7 +17,10 @@ use tonic::{transport::Server, Request, Response, Status};
 /// This server receives GenericMessage via gRPC and routes them to
 /// the appropriate cluster via ClusterRouter.
 #[derive(Clone)]
-pub struct GrpcServer {
+pub struct GrpcServer<R>
+where
+    R: SubClusterRuntime,
+{
     /// ClusterRouter for routing messages to the correct cluster
     cluster_router: Arc<ClusterRouter>,
 
@@ -33,10 +34,13 @@ pub struct GrpcServer {
     transport: Arc<dyn Transport>,
 
     /// Management runtime for cluster operations (e.g., adding nodes)
-    management_runtime: Arc<ManagementRuntime<WorkflowRuntime>>,
+    management_runtime: Arc<ManagementRuntime<R>>,
 }
 
-impl GrpcServer {
+impl<R> GrpcServer<R>
+where
+    R: SubClusterRuntime,
+{
     /// Create a new GrpcServer
     ///
     /// # Arguments
@@ -50,7 +54,7 @@ impl GrpcServer {
         node_id: u64,
         node_address: String,
         transport: Arc<dyn Transport>,
-        management_runtime: Arc<ManagementRuntime<WorkflowRuntime>>,
+        management_runtime: Arc<ManagementRuntime<R>>,
     ) -> Self {
         Self {
             cluster_router,
@@ -85,7 +89,10 @@ impl GrpcServer {
 }
 
 #[tonic::async_trait]
-impl RaftService for GrpcServer {
+impl<R> RaftService for GrpcServer<R>
+where
+    R: SubClusterRuntime,
+{
     async fn send_message(
         &self,
         request: Request<GenericMessage>,

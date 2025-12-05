@@ -3,7 +3,8 @@
 //! Provides bidirectional streaming gRPC server for app ↔ sidecar communication.
 
 use super::proto::raftoral_sidecar_server::{RaftoralSidecar, RaftoralSidecarServer};
-use super::proto::{AppMessage, SidecarMessage};
+use super::proto::{AppMessage, ExecuteWorkflowRequest as ProtoExecuteWorkflowRequest, SidecarMessage};
+use crate::workflow_proxy_runtime::{ExecutionRequest, ExecutionResult};
 use slog::{debug, error, info, Logger};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -22,6 +23,10 @@ pub struct SidecarServer {
     logger: Logger,
     /// Active streams (app_id → sender channel)
     streams: Arc<Mutex<std::collections::HashMap<String, mpsc::Sender<SidecarMessage>>>>,
+    /// Receiver for execution requests from WorkflowProxyRuntime
+    execution_request_rx: Option<mpsc::Receiver<ExecutionRequest>>,
+    /// Sender for execution results to WorkflowProxyRuntime
+    execution_result_tx: Option<mpsc::Sender<ExecutionResult>>,
 }
 
 impl SidecarServer {
@@ -31,11 +36,23 @@ impl SidecarServer {
             address,
             logger,
             streams: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            execution_request_rx: None,
+            execution_result_tx: None,
         }
     }
 
+    /// Set the channels for communication with WorkflowProxyRuntime
+    pub fn set_proxy_channels(
+        &mut self,
+        execution_request_rx: mpsc::Receiver<ExecutionRequest>,
+        execution_result_tx: mpsc::Sender<ExecutionResult>,
+    ) {
+        self.execution_request_rx = Some(execution_request_rx);
+        self.execution_result_tx = Some(execution_result_tx);
+    }
+
     /// Start the sidecar server
-    pub async fn start(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn start(mut self) -> Result<(), Box<dyn std::error::Error>> {
         let addr = self.address.parse()?;
 
         info!(self.logger, "Starting sidecar server"; "address" => %addr);
@@ -43,7 +60,21 @@ impl SidecarServer {
         let service = SidecarServiceImpl {
             logger: self.logger.clone(),
             streams: self.streams.clone(),
+            execution_result_tx: self.execution_result_tx.clone(),
         };
+
+        // Start execution request forwarder task if channels are set
+        if let Some(mut exec_req_rx) = self.execution_request_rx.take() {
+            let streams = self.streams.clone();
+            let logger = self.logger.clone();
+            tokio::spawn(async move {
+                info!(logger, "Execution request forwarder started");
+                while let Some(request) = exec_req_rx.recv().await {
+                    Self::forward_execution_request(request, &streams, &logger).await;
+                }
+                info!(logger, "Execution request forwarder stopped");
+            });
+        }
 
         Server::builder()
             .add_service(RaftoralSidecarServer::new(service))
@@ -52,12 +83,59 @@ impl SidecarServer {
 
         Ok(())
     }
+
+    /// Forward an execution request to a connected app
+    async fn forward_execution_request(
+        request: ExecutionRequest,
+        streams: &Arc<Mutex<std::collections::HashMap<String, mpsc::Sender<SidecarMessage>>>>,
+        logger: &Logger,
+    ) {
+        // For now, broadcast to all connected apps
+        // TODO: Implement smarter routing based on workflow name or app capabilities
+        let streams_guard = streams.lock().await;
+
+        if streams_guard.is_empty() {
+            error!(logger, "No connected apps to execute workflow";
+                "workflow_id" => &request.workflow_id,
+                "workflow_name" => &request.workflow_name
+            );
+            return;
+        }
+
+        let message = SidecarMessage {
+            message: Some(super::proto::sidecar_message::Message::ExecuteWorkflow(
+                ProtoExecuteWorkflowRequest {
+                    workflow_id: request.workflow_id.clone(),
+                    workflow_name: request.workflow_name,
+                    version: request.version,
+                    input: request.input,
+                    is_owner: request.is_owner,
+                },
+            )),
+        };
+
+        // Send to all connected apps (for now - TODO: smarter routing)
+        for (stream_id, tx) in streams_guard.iter() {
+            if let Err(e) = tx.send(message.clone()).await {
+                error!(logger, "Failed to send execution request to app";
+                    "stream_id" => stream_id,
+                    "error" => %e
+                );
+            } else {
+                debug!(logger, "Execution request sent to app";
+                    "stream_id" => stream_id,
+                    "workflow_id" => &request.workflow_id
+                );
+            }
+        }
+    }
 }
 
 /// Internal service implementation
 struct SidecarServiceImpl {
     logger: Logger,
     streams: Arc<Mutex<std::collections::HashMap<String, mpsc::Sender<SidecarMessage>>>>,
+    execution_result_tx: Option<mpsc::Sender<ExecutionResult>>,
 }
 
 #[tonic::async_trait]
@@ -94,6 +172,7 @@ impl RaftoralSidecar for SidecarServiceImpl {
         let logger = self.logger.clone();
         let streams = self.streams.clone();
         let stream_id_clone = stream_id.clone();
+        let execution_result_tx = self.execution_result_tx.clone();
 
         // Spawn task to handle incoming messages from app
         tokio::spawn(async move {
@@ -119,7 +198,31 @@ impl RaftoralSidecar for SidecarServiceImpl {
                                         "workflow_id" => &result.workflow_id,
                                         "success" => result.success
                                     );
-                                    // TODO: Handle workflow completion
+
+                                    // Forward result to WorkflowProxyRuntime
+                                    if let Some(ref tx) = execution_result_tx {
+                                        let execution_result = ExecutionResult {
+                                            workflow_id: result.workflow_id.clone(),
+                                            success: result.success,
+                                            result: result.result,
+                                            error: result.error,
+                                        };
+
+                                        if let Err(e) = tx.send(execution_result).await {
+                                            error!(logger, "Failed to forward workflow result to proxy runtime";
+                                                "workflow_id" => &result.workflow_id,
+                                                "error" => %e
+                                            );
+                                        } else {
+                                            debug!(logger, "Workflow result forwarded to proxy runtime";
+                                                "workflow_id" => &result.workflow_id
+                                            );
+                                        }
+                                    } else {
+                                        error!(logger, "No execution_result_tx available to forward workflow result";
+                                            "workflow_id" => &result.workflow_id
+                                        );
+                                    }
                                 }
                                 super::proto::app_message::Message::Heartbeat(hb) => {
                                     debug!(logger, "Received heartbeat";

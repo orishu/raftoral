@@ -70,6 +70,7 @@ persistent-storage = ["rocksdb"]
 [dev-dependencies]
 port_check = "^0.3.0"
 tempfile = "3.8"
+raftoral-client = { path = "raftoral-client" }
 
 [build-dependencies]
 tonic-prost-build = "^0.14"
